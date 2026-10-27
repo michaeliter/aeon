@@ -336,7 +336,7 @@ mod tests {
         let path = dir.join("metadata.txt");
         fs::write(
             &path,
-            "VERSION_DATA=r232\nRED_DIST_BAC_DICT={\"p__\": 0.35, \"c__\": 0.49}\nRED_DIST_ARC_DICT={\"p__\": 0.27}\n",
+            "VERSION_DATA=r232\nRED_DIST_BAC_DICT={\"p__\": 0.35, \"c__\": 0.49}\nRED_DIST_ARC_DICT={\"p__\": 0.27, \"c__\":0.42852344844350987}\n",
         )
         .unwrap();
         let (version, bac, arc) = read_metadata(&path).unwrap();
@@ -344,5 +344,7 @@ mod tests {
         assert_eq!(version, "r232");
         assert_eq!(bac["c__"], 0.49);
         assert_eq!(arc["p__"], 0.27);
+        // Needs correctly rounded parsing to print back as Python does.
+        assert_eq!(arc["c__"].to_string(), "0.42852344844350987");
     }
 }

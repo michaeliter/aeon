@@ -6,6 +6,7 @@ pub(crate) mod external;
 pub(crate) mod genes;
 pub(crate) mod log;
 pub(crate) mod markers;
+pub(crate) mod placement;
 pub(crate) mod refdata;
 pub(crate) mod refdb;
 pub(crate) mod summary;
@@ -28,7 +29,11 @@ use crate::classify::markers::{
     genome_domain, marker_hmms, multihit_warning, read_mask, read_proteins, read_reference_msa,
     search_markers, write_filtered, write_marker_info, write_markers_summary, write_msa_gz,
 };
-use crate::classify::refdata::{marker_set_for_taxonomy, standardise_taxonomy};
+use crate::classify::placement::{
+    Placement, classify_tree, program_version, run_pplacer, write_pplacer_classification,
+    write_red_dictionary,
+};
+use crate::classify::refdata::{marker_set_for_taxonomy, standardise_taxonomy, strip_db_prefix};
 use crate::classify::refdb::ClassifyDb;
 use crate::classify::summary::{
     AniScreenRow, RelatedReference, SummaryRow, format_related_references, py_round,
@@ -60,7 +65,8 @@ pub(crate) struct ClassifyOptions {
     pub(crate) pyrodigal: String,
     pub(crate) diamond: String,
     pub(crate) min_perc_aa: f64,
-    pub(crate) hmmer_dir: Option<String>,
+    pub(crate) bin_dir: Option<String>,
+    pub(crate) full_tree: bool,
     pub(crate) threads: usize,
 }
 
@@ -154,7 +160,7 @@ struct AaiResult {
 #[derive(Debug)]
 enum MarkerOutcome {
     /// In the masked user MSA, ready for placement.
-    Aligned { alignment: String, msa_percent: f64 },
+    Aligned { msa_percent: f64 },
     /// No single-copy marker of either set.
     NoMarkers,
     /// Too few amino acids in the masked MSA; carries GTDB-Tk's reason.
@@ -166,6 +172,8 @@ struct MarkerResult {
     outcome: MarkerOutcome,
     /// Domain-questionable and multiple-hit warnings.
     warnings: Vec<String>,
+    /// Set once pplacer has placed an aligned genome.
+    placement: Option<Placement>,
 }
 
 impl QueryResult<'_> {
@@ -263,6 +271,7 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
     call_query_genes(&mut results, options, &out_dir, &log)?;
     run_aai_tier(&mut results, &db, options, &out_dir, &log)?;
     run_marker_tier(&mut results, &db, options, &out_dir, &log)?;
+    run_placement_tier(&mut results, &db, options, &out_dir, &log)?;
 
     write_identify_files(&results, &out_dir, &options.prefix)?;
     let mut rows: BTreeMap<&'static str, Vec<SummaryRow>> = BTreeMap::new();
@@ -458,6 +467,156 @@ fn run_aai_tier(
     write_aai_summary(results, db, out_dir, &options.prefix)
 }
 
+/// An external program from `--bin-dir`, or from PATH.
+fn tool(options: &ClassifyOptions, program: &str) -> Result<PathBuf, Box<dyn Error>> {
+    match &options.bin_dir {
+        Some(dir) => find_program(&Path::new(dir).join(program).to_string_lossy()),
+        None => find_program(program),
+    }
+}
+
+/// GTDB-Tk's `classify` step for aligned genomes: pplacer into the reference
+/// tree, then RED and topology (full-tree mode).
+fn run_placement_tier(
+    results: &mut [QueryResult],
+    db: &ClassifyDb,
+    options: &ClassifyOptions,
+    out_dir: &Path,
+    log: &ClassifyLog,
+) -> Result<(), Box<dyn Error>> {
+    let Some(root) = db.data.root.clone() else {
+        return Ok(());
+    };
+    for set in MARKER_SETS {
+        let pending = results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| {
+                result.markers.as_ref().is_some_and(|markers| {
+                    markers.marker_set == set
+                        && matches!(markers.outcome, MarkerOutcome::Aligned { .. })
+                })
+            })
+            .map(|(index, result)| (result.genome.id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        if pending.is_empty() {
+            continue;
+        }
+        if set == "bac120" && !options.full_tree {
+            log.warn(
+                "Split-tree placement of bacterial genomes is not implemented yet; using the full bac120 tree as with --full_tree",
+            );
+        }
+        let (pplacer, guppy) = (tool(options, "pplacer")?, tool(options, "guppy")?);
+        let classify_dir = out_dir.join("classify");
+        let intermediate = classify_dir.join("intermediate_results");
+        let pplacer_dir = intermediate.join("pplacer");
+        fs::create_dir_all(&pplacer_dir)?;
+        log.info(format!(
+            "Placing {} {} genomes into reference tree with pplacer using {} CPUs (be patient).",
+            thousands(pending.len()),
+            domain_adjective(set),
+            options.threads.clamp(1, 64)
+        ));
+        log.info(format!("pplacer version: {}", program_version(&pplacer)));
+        let tree_path = classify_dir.join(format!("{}.{set}.classify.tree", options.prefix));
+        run_pplacer(
+            &pplacer,
+            &guppy,
+            &root
+                .join("pplacer")
+                .join(format!("gtdb_{}_{set}.refpkg", db.data.version)),
+            &out_dir
+                .join("align")
+                .join(format!("{}.{set}.user_msa.fasta.gz", options.prefix)),
+            &pplacer_dir.join(format!("pplacer.{set}.json")),
+            &pplacer_dir.join(format!("pplacer.{set}.out")),
+            &tree_path,
+            options.threads,
+        )?;
+        let red_dict = if set == "ar53" {
+            &db.data.red_dist_arc
+        } else {
+            &db.data.red_dist_bac
+        };
+        write_red_dictionary(
+            &intermediate.join(format!("{}.{set}.red_dictionary.tsv", options.prefix)),
+            red_dict,
+        )?;
+        log.info("Calculating RED values based on reference tree.");
+        let users = pending.keys().cloned().collect::<HashSet<_>>();
+        let placements = classify_tree(
+            &tree_path,
+            &root
+                .join("mrca_red")
+                .join(format!("gtdbtk_{}_{set}.tsv", db.data.version)),
+            set,
+            &users,
+            &db.data,
+            red_dict,
+        )?;
+        write_pplacer_classification(
+            &intermediate.join(format!(
+                "{}.{set}.classification_pplacer.tsv",
+                options.prefix
+            )),
+            &placements,
+        )?;
+        log.info("Traversing tree to determine classification method.");
+        let missing = pending.len() - placements.len();
+        if missing > 0 {
+            log.warn(format!(
+                "{missing} out of {} have not been properly placed by pplacer. This is a known issue with pplacer but we do not have a solution currently.",
+                pending.len()
+            ));
+        }
+        for (genome, placement) in placements {
+            let index = pending[&genome];
+            add_placement_ani(&mut results[index], &placement, db)?;
+            if let Some(markers) = results[index].markers.as_mut() {
+                markers.placement = Some(placement);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// GTDB-Tk compares a placed genome that has ANI hits with every reference,
+/// so its placement reference always has an ANI if one exists. aeon's hits
+/// come from candidate search, so measure the placement reference directly
+/// when it is missing.
+fn add_placement_ani(
+    result: &mut QueryResult,
+    placement: &Placement,
+    db: &ClassifyDb,
+) -> Result<(), Box<dyn Error>> {
+    let Some(reference) = &placement.reference else {
+        return Ok(());
+    };
+    if ani::reportable(&result.hits).next().is_none() {
+        return Ok(());
+    }
+    let accession = strip_db_prefix(reference);
+    let Some(index) = db.nt_accessions.iter().position(|id| id == accession) else {
+        return Ok(());
+    };
+    if result
+        .hits
+        .iter()
+        .any(|hit| hit.reference as usize == index)
+    {
+        return Ok(());
+    }
+    let hits = refine_candidates(
+        std::slice::from_ref(&result.genome.path),
+        &[vec![index as u32]],
+        &db.nt_paths,
+    )?;
+    result.hits.extend(hits.into_iter().flatten());
+    ani::sort_hits(&mut result.hits);
+    Ok(())
+}
+
 /// GTDB-Tk's `identify` and `align` steps for genomes neither ANI nor AAI
 /// resolved: marker search, copy number, domain call, and the masked
 /// concatenated alignment.
@@ -487,11 +646,7 @@ fn run_marker_tier(
         ));
         return Ok(());
     };
-    let hmmer = |program: &str| match &options.hmmer_dir {
-        Some(dir) => find_program(&Path::new(dir).join(program).to_string_lossy()),
-        None => find_program(program),
-    };
-    let (hmmsearch, hmmalign) = (hmmer("hmmsearch")?, hmmer("hmmalign")?);
+    let (hmmsearch, hmmalign) = (tool(options, "hmmsearch")?, tool(options, "hmmalign")?);
 
     log.info(format!(
         "Identifying markers in {} genomes with {} threads.",
@@ -652,14 +807,8 @@ fn run_marker_tier(
         for (id, masked) in &pruned {
             outcomes.insert(id.clone(), MarkerOutcome::Filtered(filtered_reason(masked)));
         }
-        for (id, (alignment, msa_percent)) in kept {
-            outcomes.insert(
-                id,
-                MarkerOutcome::Aligned {
-                    alignment,
-                    msa_percent,
-                },
-            );
+        for (id, (_, msa_percent)) in kept {
+            outcomes.insert(id, MarkerOutcome::Aligned { msa_percent });
         }
     }
     let no_markers = outcomes
@@ -682,6 +831,7 @@ fn run_marker_tier(
             marker_set: set,
             outcome,
             warnings,
+            placement: None,
         });
     }
     Ok(())
@@ -809,7 +959,7 @@ fn link_summary(out_dir: &Path, name: &str) -> std::io::Result<()> {
 }
 
 fn related(hits: &[AniHit], db: &ClassifyDb, min_af: f64) -> Vec<RelatedReference> {
-    hits.iter()
+    ani::reportable(hits)
         .filter(|hit| hit.af >= min_af)
         .map(|hit| RelatedReference {
             genome_id: db.nt_accessions[hit.reference as usize].clone(),
@@ -880,7 +1030,7 @@ fn summary_row(
                     return ("bac120", row);
                 }
                 (Some(Some(genes)), Some(markers), _) => {
-                    return marker_summary_row(row, genes, markers);
+                    return marker_summary_row(row, genes, markers, &result.hits, db);
                 }
                 (Some(Some(genes)), None, Some(aai)) => {
                     return aai_summary_row(row, genes, aai, marker_set, db, options);
@@ -956,6 +1106,8 @@ fn marker_summary_row(
     mut row: SummaryRow,
     genes: &GeneCalls,
     markers: &MarkerResult,
+    hits: &[AniHit],
+    db: &ClassifyDb,
 ) -> (&'static str, SummaryRow) {
     match &markers.outcome {
         MarkerOutcome::NoMarkers => {
@@ -968,11 +1120,39 @@ fn marker_summary_row(
             row.warnings.push(reason.clone());
             (markers.marker_set, row)
         }
-        MarkerOutcome::Aligned { msa_percent, .. } => {
-            row.classification = Some(unclassified(markers.marker_set, true));
+        MarkerOutcome::Aligned { msa_percent } => {
             row.translation_table = Some(genes.translation_table);
             row.msa_percent = Some(*msa_percent);
             row.warnings.extend(markers.warnings.iter().cloned());
+            let Some(placement) = &markers.placement else {
+                row.classification = Some(unclassified(markers.marker_set, true));
+                return (markers.marker_set, row);
+            };
+            row.classification = Some(placement.classification.clone());
+            row.pplacer_taxonomy = Some(placement.pplacer_taxonomy.clone());
+            row.red_value = Some(placement.red_value);
+            row.classification_method = Some(placement.method.into());
+            // GTDB-Tk reports the placement reference for genomes with ANI hits.
+            if ani::reportable(hits).next().is_some() {
+                row.classification_method =
+                    Some("taxonomic classification defined by topology and ANI".into());
+                if let Some(reference) = &placement.reference {
+                    let accession = strip_db_prefix(reference).to_owned();
+                    row.closest_placement_radius = db.data.radius_of(&accession);
+                    row.closest_placement_taxonomy = db
+                        .data
+                        .taxonomy_of(&accession)
+                        .map(|taxonomy| taxonomy.join(";"));
+                    if let Some(hit) = hits
+                        .iter()
+                        .find(|hit| db.nt_accessions[hit.reference as usize] == accession)
+                    {
+                        row.closest_placement_ani = Some(hit.ani);
+                        row.closest_placement_af = Some(hit.af);
+                    }
+                    row.closest_placement_reference = Some(accession);
+                }
+            }
             (markers.marker_set, row)
         }
     }

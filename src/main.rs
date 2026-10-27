@@ -487,10 +487,18 @@ fn build_cli() -> Command {
                         .help("Leave out genomes with amino acids in fewer than this percentage of masked MSA columns"),
                 )
                 .arg(
-                    Arg::new("hmmer_dir")
-                        .long("hmmer-dir")
+                    Arg::new("full_tree")
+                        .short('f')
+                        .long("full_tree")
+                        .visible_alias("full-tree")
+                        .action(ArgAction::SetTrue)
+                        .help("Place bacterial genomes in the unsplit bac120 tree"),
+                )
+                .arg(
+                    Arg::new("bin_dir")
+                        .long("bin-dir")
                         .value_name("DIR")
-                        .help("Directory holding hmmsearch and hmmalign (default: search PATH)"),
+                        .help("Directory holding hmmsearch, hmmalign, pplacer and guppy (default: search PATH)"),
                 )
                 .arg(
                     Arg::new("candidates")
@@ -619,7 +627,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             pyrodigal: args.get_one::<String>("pyrodigal").unwrap().clone(),
             diamond: args.get_one::<String>("diamond").unwrap().clone(),
             min_perc_aa: *args.get_one("min_perc_aa").unwrap(),
-            hmmer_dir: args.get_one::<String>("hmmer_dir").cloned(),
+            bin_dir: args.get_one::<String>("bin_dir").cloned(),
+            full_tree: args.get_flag("full_tree"),
             threads: requested_threads(args),
         })?,
         _ => unreachable!(),

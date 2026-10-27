@@ -85,17 +85,17 @@ impl ClassifyDb {
                 )
             })?,
         )?;
-        let mut data = GtdbtkData::from_files(
-            &manifest.gtdb_release,
-            &[dir.join(TAXONOMY_FILE)],
-            &dir.join(RADII_FILE),
-        )?;
-        if let Some(root) = &manifest.gtdbtk_data {
-            let package = GtdbtkData::load(root)?;
-            data.root = package.root;
-            data.red_dist_bac = package.red_dist_bac;
-            data.red_dist_arc = package.red_dist_arc;
-        }
+        // A GTDB-Tk package's tables cover every genome in its reference
+        // trees, which tier 3 needs; the database's own copies cover only
+        // the indexed references.
+        let data = match &manifest.gtdbtk_data {
+            Some(root) => GtdbtkData::load(root)?,
+            None => GtdbtkData::from_files(
+                &manifest.gtdb_release,
+                &[dir.join(TAXONOMY_FILE)],
+                &dir.join(RADII_FILE),
+            )?,
+        };
         let nt_prefix = nt_prefix(&dir);
         let nt_paths = read_list_file(&genomes_path(&nt_prefix))?;
         let nt_accessions = nt_paths

@@ -15,6 +15,15 @@ const MAX_BATCH_REFERENCES: usize = 256;
 /// Lowest ANI radius used by GTDB; references can have a raised radius.
 pub(crate) const MIN_SPECIES_RADIUS: f64 = 95.0;
 
+/// skani, which GTDB-Tk uses, screens out pairs below about 80% ANI, so
+/// GTDB-Tk never reports such hits; TurboANI can return genome ANI just
+/// below 80 from fragments above it.
+pub(crate) const MIN_REPORTED_ANI: f64 = 80.0;
+
+pub(crate) fn reportable(hits: &[AniHit]) -> impl Iterator<Item = &AniHit> {
+    hits.iter().filter(|hit| hit.ani >= MIN_REPORTED_ANI)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct AniHit {
     /// Reference vector ID in the nucleotide index.
