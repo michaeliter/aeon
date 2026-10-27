@@ -130,7 +130,7 @@ pub(crate) fn sort_hits(hits: &mut [AniHit]) {
 
 /// Group queries so that each group needs at most `limit` distinct references
 /// (a single query with more candidates forms its own group).
-fn reference_batches(candidates: &[Vec<u32>], limit: usize) -> Vec<Vec<usize>> {
+pub(crate) fn reference_batches(candidates: &[Vec<u32>], limit: usize) -> Vec<Vec<usize>> {
     let mut batches = Vec::new();
     let mut batch = Vec::new();
     let mut references = HashSet::new();

@@ -1,18 +1,26 @@
 //! GTDB-Tk-compatible genome classification: ANI screen, AAI, then marker placement.
 
+pub(crate) mod aai;
 pub(crate) mod ani;
+pub(crate) mod external;
+pub(crate) mod genes;
 pub(crate) mod log;
 pub(crate) mod refdata;
 pub(crate) mod refdb;
 pub(crate) mod summary;
 
+use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::classify::aai::{AaiDecision, AaiHit, compute_aai};
 use crate::classify::ani::{AniDecision, AniHit, MIN_SPECIES_RADIUS, decide, refine_candidates};
+use crate::classify::external::find_program;
+use crate::classify::genes::{GeneCalls, call_genes};
 use crate::classify::log::ClassifyLog;
 use crate::classify::refdata::{marker_set_for_taxonomy, standardise_taxonomy};
 use crate::classify::refdb::ClassifyDb;
@@ -40,6 +48,12 @@ pub(crate) struct ClassifyOptions {
     pub(crate) candidates: usize,
     pub(crate) beam_width: usize,
     pub(crate) genus_ani: f64,
+    pub(crate) genus_aai: f64,
+    pub(crate) family_aai: f64,
+    pub(crate) aai_top: usize,
+    pub(crate) pyrodigal: String,
+    pub(crate) diamond: String,
+    pub(crate) threads: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,11 +125,20 @@ fn file_stem(path: &str) -> String {
     name.to_owned()
 }
 
-/// Everything known about one query after the ANI tier.
-struct AniResult<'a> {
+/// Everything known about one query after the ANI tier and, when the ANI
+/// tier left it unresolved, the AAI tier.
+struct QueryResult<'a> {
     genome: &'a QueryGenome,
     hits: Vec<AniHit>,
     decision: AniDecision,
+    aai: Option<AaiResult>,
+}
+
+struct AaiResult {
+    /// `None` when no genes could be called.
+    genes: Option<GeneCalls>,
+    hits: Vec<AaiHit>,
+    decision: AaiDecision,
 }
 
 pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn Error>> {
@@ -155,7 +178,7 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
     let results = queries
         .iter()
         .zip(hits)
-        .map(|(genome, hits)| AniResult {
+        .map(|(genome, hits)| QueryResult {
             decision: decide(
                 &hits,
                 &db.nt_accessions,
@@ -165,6 +188,7 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
             ),
             genome,
             hits,
+            aai: None,
         })
         .collect::<Vec<_>>();
     for result in &results {
@@ -190,7 +214,10 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
     log.info(format!(
         "{species} genome(s) have been classified using the ANI pre-screening step."
     ));
+    let mut results = results;
+    run_aai_tier(&mut results, &db, options, &out_dir, &log)?;
 
+    write_identify_files(&results, &out_dir, &options.prefix)?;
     let mut rows: BTreeMap<&'static str, Vec<SummaryRow>> = BTreeMap::new();
     let mut ani_rows: BTreeMap<&'static str, Vec<AniScreenRow>> = BTreeMap::new();
     for result in &results {
@@ -236,6 +263,216 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// Call genes for genomes the ANI tier left unresolved, then classify them
+/// by AAI against candidate reference proteomes.
+fn run_aai_tier(
+    results: &mut [QueryResult],
+    db: &ClassifyDb,
+    options: &ClassifyOptions,
+    out_dir: &Path,
+    log: &ClassifyLog,
+) -> Result<(), Box<dyn Error>> {
+    let pending = results
+        .iter()
+        .enumerate()
+        .filter(|(_, result)| result.decision == AniDecision::Unresolved)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let Some((aa_params, aa_paths)) = &db.aa else {
+        log.warn(format!(
+            "{} genome(s) need the AAI tier, but the database has no protein index; rebuild it with --call-genes or --protein-list",
+            pending.len()
+        ));
+        return Ok(());
+    };
+    let pyrodigal = find_program(&options.pyrodigal)?;
+    let diamond = find_program(&options.diamond)?;
+
+    log.info(format!(
+        "Calling genes with pyrodigal for {} genome(s) not resolved by ANI",
+        pending.len()
+    ));
+    let marker_dir = out_dir
+        .join("identify")
+        .join("intermediate_results")
+        .join("marker_genes");
+    let genes = pending
+        .par_iter()
+        .map(|&index| {
+            let genome = results[index].genome;
+            call_genes(&pyrodigal, &genome.path, &genome.id, &marker_dir)
+                .map_err(|error| format!("gene calling failed for {}: {error}", genome.id))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let called = pending
+        .iter()
+        .zip(&genes)
+        .filter_map(|(&index, calls)| calls.as_ref().map(|calls| (index, calls)))
+        .collect::<Vec<_>>();
+    log.info(format!(
+        "Running AAI search with DiskANN candidate search and DIAMOND for {} genome(s)",
+        called.len()
+    ));
+    let proteome_paths = called
+        .iter()
+        .map(|(_, calls)| calls.protein_faa.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let vectors = sketch_from_params(&proteome_paths, aa_params);
+    let candidates = search_vectors(
+        &db.aa_prefix(),
+        aa_paths.len(),
+        &vectors,
+        options.candidates,
+        options.beam_width,
+    )?
+    .into_iter()
+    .map(|neighbors| neighbors.into_iter().map(|(id, _)| id).collect::<Vec<_>>())
+    .collect::<Vec<_>>();
+    let proteomes = called
+        .iter()
+        .map(|(_, calls)| calls.protein_faa.as_path())
+        .collect::<Vec<_>>();
+    let aai_hits = compute_aai(
+        &diamond,
+        &out_dir
+            .join("classify")
+            .join("aai")
+            .join("intermediate_results"),
+        &proteomes,
+        &candidates,
+        aa_paths,
+        options.threads,
+    )?;
+
+    let mut hits_by_index = called
+        .iter()
+        .map(|(index, _)| *index)
+        .zip(aai_hits)
+        .collect::<BTreeMap<_, _>>();
+    let mut resolved = 0;
+    for (&index, calls) in pending.iter().zip(genes) {
+        let hits = hits_by_index.remove(&index).unwrap_or_default();
+        let decision = aai::decide(
+            &hits,
+            &db.nt_accessions,
+            &db.data,
+            options.genus_aai,
+            options.family_aai,
+            options.aai_top,
+        );
+        if decision != AaiDecision::Unresolved {
+            resolved += 1;
+        }
+        ::log::debug!(
+            "aai genome={} decision={:?} hits={}",
+            results[index].genome.id,
+            decision,
+            hits.iter()
+                .map(|hit| format!(
+                    "{}:{:.2}/{}",
+                    db.nt_accessions[hit.reference as usize], hit.aai, hit.reciprocal_hits
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        results[index].aai = Some(AaiResult {
+            genes: calls,
+            hits,
+            decision,
+        });
+    }
+    log.info(format!(
+        "{resolved} genome(s) have been classified using AAI."
+    ));
+    write_aai_summary(results, db, out_dir, &options.prefix)
+}
+
+/// `classify/aai/{prefix}.aai_summary.tsv`: every AAI hit per genome.
+fn write_aai_summary(
+    results: &[QueryResult],
+    db: &ClassifyDb,
+    out_dir: &Path,
+    prefix: &str,
+) -> Result<(), Box<dyn Error>> {
+    let dir = out_dir.join("classify").join("aai");
+    fs::create_dir_all(&dir)?;
+    let mut output = BufWriter::new(File::create(dir.join(format!("{prefix}.aai_summary.tsv")))?);
+    writeln!(
+        output,
+        "user_genome\treference_genome\taai\treciprocal_best_hits\treference_taxonomy"
+    )?;
+    let mut sorted = results.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| left.genome.id.cmp(&right.genome.id));
+    for result in sorted {
+        let Some(aai) = &result.aai else { continue };
+        for hit in &aai.hits {
+            let accession = &db.nt_accessions[hit.reference as usize];
+            writeln!(
+                output,
+                "{}\t{}\t{}\t{}\t{}",
+                result.genome.id,
+                accession,
+                py_round(hit.aai, 2),
+                hit.reciprocal_hits,
+                db.data
+                    .taxonomy_of(accession)
+                    .map_or_else(|| "N/A".to_owned(), |taxonomy| taxonomy.join(";"))
+            )?;
+        }
+    }
+    output.flush()?;
+    Ok(())
+}
+
+/// GTDB-Tk's `identify/{prefix}.translation_table_summary.tsv` and
+/// `identify/{prefix}.failed_genomes.tsv` for genomes that went through gene calling.
+fn write_identify_files(
+    results: &[QueryResult],
+    out_dir: &Path,
+    prefix: &str,
+) -> Result<(), Box<dyn Error>> {
+    let called = results
+        .iter()
+        .filter_map(|result| result.aai.as_ref().map(|aai| (result.genome, aai)))
+        .collect::<Vec<_>>();
+    if called.is_empty() {
+        return Ok(());
+    }
+    let dir = out_dir.join("identify");
+    fs::create_dir_all(&dir)?;
+    let mut tables = BTreeMap::new();
+    let mut failed = BTreeMap::new();
+    for (genome, aai) in called {
+        match &aai.genes {
+            Some(genes) => {
+                tables.insert(genome.id.as_str(), genes.translation_table);
+            }
+            None => {
+                failed.insert(genome.id.as_str(), "No genes were called by Prodigal");
+            }
+        }
+    }
+    let mut output = BufWriter::new(File::create(
+        dir.join(format!("{prefix}.translation_table_summary.tsv")),
+    )?);
+    for (id, table) in tables {
+        writeln!(output, "{id}\t{table}")?;
+    }
+    output.flush()?;
+    let mut output = BufWriter::new(File::create(
+        dir.join(format!("{prefix}.failed_genomes.tsv")),
+    )?);
+    for (id, reason) in failed {
+        writeln!(output, "{id}\t{reason}")?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
 /// GTDB-Tk symlinks `{out_dir}/{prefix}.{ms}.summary.tsv` to the copy in `classify/`.
 fn link_summary(out_dir: &Path, name: &str) -> std::io::Result<()> {
     let link = out_dir.join(name);
@@ -268,7 +505,7 @@ fn related(hits: &[AniHit], db: &ClassifyDb, min_af: f64) -> Vec<RelatedReferenc
 /// Build the summary row and its marker set for one ANI-tier result,
 /// following GTDB-Tk 2.8's field conventions.
 fn summary_row(
-    result: &AniResult,
+    result: &QueryResult,
     db: &ClassifyDb,
     options: &ClassifyOptions,
 ) -> (&'static str, SummaryRow) {
@@ -316,15 +553,73 @@ fn summary_row(
             ));
         }
         AniDecision::Unresolved => {
-            row.classification = Some(match marker_set {
-                "ar53" if best_taxonomy.is_some() => "Unclassified Archaea".into(),
-                _ if best_taxonomy.is_some() => "Unclassified Bacteria".into(),
-                _ => "Unclassified".into(),
-            });
+            if let Some(aai) = &result.aai {
+                row.other_related_references = format_related_references(&related, &[], &db.data);
+                row.warnings = radius_warnings(&result.hits, db, options.min_af);
+                return aai_summary_row(row, aai, marker_set, db, options);
+            }
+            row.classification = Some(unclassified(marker_set, best_taxonomy.is_some()));
         }
     }
     row.other_related_references = format_related_references(&related, &[], &db.data);
     row.warnings = radius_warnings(&result.hits, db, options.min_af);
+    (marker_set, row)
+}
+
+fn unclassified(marker_set: &str, domain_known: bool) -> String {
+    match marker_set {
+        "ar53" if domain_known => "Unclassified Archaea".into(),
+        _ if domain_known => "Unclassified Bacteria".into(),
+        _ => "Unclassified".into(),
+    }
+}
+
+/// Fill in the AAI-tier fields of a row the ANI tier could not resolve.
+fn aai_summary_row(
+    mut row: SummaryRow,
+    aai: &AaiResult,
+    ani_marker_set: &'static str,
+    db: &ClassifyDb,
+    options: &ClassifyOptions,
+) -> (&'static str, SummaryRow) {
+    let Some(genes) = &aai.genes else {
+        row.classification = Some("Unclassified".into());
+        row.warnings.push("No genes were called by Prodigal".into());
+        return (ani_marker_set, row);
+    };
+    row.translation_table = Some(genes.translation_table);
+    let best_taxonomy = aai.hits.first().and_then(|hit| {
+        db.data
+            .taxonomy_of(&db.nt_accessions[hit.reference as usize])
+    });
+    let marker_set = best_taxonomy.map_or(ani_marker_set, marker_set_for_taxonomy);
+    let (taxonomy, rank, threshold, supporting, considered) = match &aai.decision {
+        AaiDecision::Genus {
+            taxonomy,
+            supporting,
+            considered,
+        } => (taxonomy, "genus", options.genus_aai, supporting, considered),
+        AaiDecision::Family {
+            taxonomy,
+            supporting,
+            considered,
+        } => (
+            taxonomy,
+            "family",
+            options.family_aai,
+            supporting,
+            considered,
+        ),
+        AaiDecision::Unresolved => {
+            row.classification = Some(unclassified(marker_set, best_taxonomy.is_some()));
+            return (marker_set, row);
+        }
+    };
+    row.classification = Some(standardise_taxonomy(taxonomy, None));
+    row.classification_method = Some("taxonomic classification defined by AAI".into());
+    row.note = Some(format!(
+        "{rank} assigned by AAI consensus ({supporting}/{considered} references >= {threshold}%)"
+    ));
     (marker_set, row)
 }
 

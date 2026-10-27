@@ -10,17 +10,22 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::classify::genes::call_genes;
 use crate::classify::refdata::{
     GtdbtkData, accession_from_path, canonical_gid, read_sp_clusters_radii, read_taxonomy,
 };
 use crate::database::build_database;
 use crate::metadata::{PrefixParams, genomes_path, load_params};
-use crate::utils::read_list_file;
+use crate::utils::{read_list_file, write_genome_list};
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MANIFEST_FILE: &str = "manifest.json";
 const TAXONOMY_FILE: &str = "taxonomy.tsv";
 const RADII_FILE: &str = "radii.tsv";
 const NT_PREFIX: &str = "nt";
+const AA_PREFIX: &str = "aa";
+const PROTEIN_DIR: &str = "proteins";
 
 /// Where reference taxonomy and species radii come from.
 pub(crate) enum TaxonomySource {
@@ -34,12 +39,25 @@ pub(crate) enum TaxonomySource {
     },
 }
 
+/// Where reference proteomes for the AAI tier come from.
+pub(crate) enum ProteinSource {
+    /// No amino-acid index; classify stops after the ANI tier.
+    None,
+    /// Precomputed proteomes (e.g. GTDB `protein_faa_reps`), named by accession.
+    List(String),
+    /// Call genes for every reference genome with pyrodigal.
+    CallGenes(PathBuf),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Manifest {
     pub(crate) aeon_version: String,
     pub(crate) gtdb_release: String,
     pub(crate) gtdbtk_data: Option<String>,
     pub(crate) references: usize,
+    /// Whether `aa.*` holds an amino-acid index aligned with `nt.*` vector IDs.
+    #[serde(default)]
+    pub(crate) proteins: bool,
 }
 
 /// An opened classify database.
@@ -52,6 +70,8 @@ pub(crate) struct ClassifyDb {
     pub(crate) nt_paths: Vec<String>,
     /// GTDB accessions (`GCF_000005845.2`) aligned with `nt_paths`.
     pub(crate) nt_accessions: Vec<String>,
+    /// Amino-acid sketch parameters and proteome paths, aligned with `nt_paths`.
+    pub(crate) aa: Option<(PrefixParams, Vec<String>)>,
 }
 
 impl ClassifyDb {
@@ -82,8 +102,19 @@ impl ClassifyDb {
             .iter()
             .map(|path| accession_from_path(path))
             .collect();
+        let aa = if manifest.proteins {
+            let aa_prefix = dir.join(AA_PREFIX).to_string_lossy().into_owned();
+            let paths = read_list_file(&genomes_path(&aa_prefix))?;
+            if paths.len() != nt_paths.len() {
+                return Err("amino-acid and nucleotide indexes have different sizes".into());
+            }
+            Some((load_params(&aa_prefix)?, paths))
+        } else {
+            None
+        };
         Ok(Self {
             nt_params: load_params(&nt_prefix)?,
+            aa,
             dir,
             manifest,
             data,
@@ -95,6 +126,10 @@ impl ClassifyDb {
     pub(crate) fn nt_prefix(&self) -> String {
         nt_prefix(&self.dir)
     }
+
+    pub(crate) fn aa_prefix(&self) -> String {
+        self.dir.join(AA_PREFIX).to_string_lossy().into_owned()
+    }
 }
 
 fn nt_prefix(dir: &Path) -> String {
@@ -105,7 +140,9 @@ pub(crate) fn build_classify_db(
     db_dir: &str,
     genome_list: &str,
     source: TaxonomySource,
+    proteins: ProteinSource,
     nt_params: PrefixParams,
+    aa_params: PrefixParams,
 ) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let genomes = read_list_file(genome_list)?;
@@ -149,11 +186,29 @@ pub(crate) fn build_classify_db(
     fs::create_dir_all(db)?;
     write_reference_tables(db, &accessions, &data)?;
     build_database(&nt_prefix(db), genome_list, nt_params)?;
+    let proteomes = match proteins {
+        ProteinSource::None => None,
+        ProteinSource::List(list) => Some(match_proteomes(&accessions, &read_list_file(&list)?)?),
+        ProteinSource::CallGenes(pyrodigal) => {
+            Some(call_reference_genes(&pyrodigal, &genomes, &accessions, db)?)
+        }
+    };
+    if let Some(proteomes) = &proteomes {
+        let list = db.join("aa_proteomes.txt");
+        write_genome_list(&list.to_string_lossy(), proteomes)?;
+        build_database(
+            &db.join(AA_PREFIX).to_string_lossy(),
+            &list.to_string_lossy(),
+            aa_params,
+        )?;
+        fs::remove_file(list)?;
+    }
     let manifest = Manifest {
         aeon_version: env!("CARGO_PKG_VERSION").into(),
         gtdb_release: data.version.clone(),
         gtdbtk_data,
         references: genomes.len(),
+        proteins: proteomes.is_some(),
     };
     fs::write(
         db.join(MANIFEST_FILE),
@@ -166,6 +221,62 @@ pub(crate) fn build_classify_db(
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// Order proteome files to match the reference genomes by accession.
+fn match_proteomes(
+    accessions: &[String],
+    proteomes: &[String],
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let by_accession = proteomes
+        .iter()
+        .map(|path| (canonical_gid(&accession_from_path(path)), path))
+        .collect::<HashMap<_, _>>();
+    accessions
+        .iter()
+        .map(|accession| {
+            by_accession
+                .get(&canonical_gid(accession))
+                .map(|path| (*path).clone())
+                .ok_or_else(|| format!("no proteome in the protein list for {accession}").into())
+        })
+        .collect()
+}
+
+/// Call genes for every reference and keep only the proteomes.
+fn call_reference_genes(
+    pyrodigal: &Path,
+    genomes: &[String],
+    accessions: &[String],
+    db: &Path,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let started = Instant::now();
+    let protein_dir = db.join(PROTEIN_DIR);
+    let done = AtomicUsize::new(0);
+    let proteomes = genomes
+        .par_iter()
+        .zip(accessions)
+        .map(|(genome, accession)| -> Result<String, String> {
+            let calls = call_genes(pyrodigal, genome, accession, &protein_dir)
+                .map_err(|error| format!("gene calling failed for {genome}: {error}"))?
+                .ok_or_else(|| format!("reference genome has no sequence: {genome}"))?;
+            let genome_dir = protein_dir.join(accession);
+            for suffix in ["_protein.fna", "_protein.gff"] {
+                let _ = fs::remove_file(genome_dir.join(format!("{accession}{suffix}")));
+            }
+            let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if finished % 100 == 0 {
+                eprintln!("Called genes for {finished}/{} references", genomes.len());
+            }
+            Ok(calls.protein_faa.to_string_lossy().into_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    eprintln!(
+        "Called genes for {} references in {:.3}s",
+        genomes.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(proteomes)
 }
 
 /// Every reference must be a GTDB species representative with a taxonomy

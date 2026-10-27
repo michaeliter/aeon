@@ -6,7 +6,7 @@ mod utils;
 
 use std::error::Error;
 
-use crate::classify::refdb::{TaxonomySource, build_classify_db};
+use crate::classify::refdb::{ProteinSource, TaxonomySource, build_classify_db};
 use crate::classify::{ClassifyOptions, QueryInput, classify_genomes};
 use crate::database::{build_database, search_database, update_database};
 use crate::metadata::PrefixParams;
@@ -34,12 +34,24 @@ fn threads_arg() -> Arg {
         .help("Worker threads [default: all logical CPUs]")
 }
 
-fn nt_index_params(args: &clap::ArgMatches) -> PrefixParams {
+fn pyrodigal_arg() -> Arg {
+    Arg::new("pyrodigal")
+        .long("pyrodigal")
+        .default_value("pyrodigal")
+        .value_name("PATH")
+        .help("pyrodigal executable used for gene calling")
+}
+
+fn classify_index_params(args: &clap::ArgMatches, seq_type: &str) -> PrefixParams {
+    let (kmer_size, sketch_size) = match seq_type {
+        "aa" => ("aa_kmer_size", "aa_sketch_size"),
+        _ => ("kmer_size", "sketch_size"),
+    };
     PrefixParams {
-        kmer_size: *args.get_one("kmer_size").unwrap(),
-        sketch_size: *args.get_one("sketch_size").unwrap(),
+        kmer_size: *args.get_one(kmer_size).unwrap(),
+        sketch_size: *args.get_one(sketch_size).unwrap(),
         densification: 0,
-        seq_type: "dna".into(),
+        seq_type: seq_type.into(),
         max_degree: *args.get_one("max_degree").unwrap(),
         build_beam_width: *args.get_one("build_beam_width").unwrap(),
         alpha: 1.2,
@@ -302,6 +314,20 @@ fn build_cli() -> Command {
                         .help("GTDB release name recorded with --taxonomy, e.g. r232"),
                 )
                 .arg(
+                    Arg::new("protein_list")
+                        .long("protein-list")
+                        .value_name("FILE")
+                        .conflicts_with("call_genes")
+                        .help("Text file with one reference proteome path per line, named by accession (e.g. GTDB protein_faa_reps)"),
+                )
+                .arg(
+                    Arg::new("call_genes")
+                        .long("call-genes")
+                        .action(ArgAction::SetTrue)
+                        .help("Call reference genes with pyrodigal to build the AAI protein index"),
+                )
+                .arg(pyrodigal_arg())
+                .arg(
                     Arg::new("kmer_size")
                         .long("kmer-size")
                         .short('k')
@@ -309,6 +335,22 @@ fn build_cli() -> Command {
                         .value_name("K")
                         .value_parser(clap::value_parser!(usize))
                         .help("Nucleotide k-mer length"),
+                )
+                .arg(
+                    Arg::new("aa_kmer_size")
+                        .long("aa-kmer-size")
+                        .default_value("7")
+                        .value_name("K")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Amino-acid k-mer length for the protein index"),
+                )
+                .arg(
+                    Arg::new("aa_sketch_size")
+                        .long("aa-sketch-size")
+                        .default_value("12000")
+                        .value_name("N")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Number of u16 values in each protein MinHash sketch"),
                 )
                 .arg(
                     Arg::new("sketch_size")
@@ -340,7 +382,7 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("classify")
                 .about("Classify genomes against GTDB with GTDB-Tk-compatible output")
-                .long_about("Classify genomes in a cascade. DiskANN sketch search proposes the closest GTDB representatives and TurboANI computes their exact ANI. A genome within the closest reference's ANI radius (AF >= --min_af) receives that species, as in the GTDB-Tk ANI screen; one at or above --genus-ani to a strict majority of one genus receives that genus. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, classify/, and {prefix}.log.")
+                .long_about("Classify genomes in a cascade. DiskANN sketch search proposes the closest GTDB representatives and TurboANI computes their exact ANI. A genome within the closest reference's ANI radius (AF >= --min_af) receives that species, as in the GTDB-Tk ANI screen; one at or above --genus-ani to a strict majority of one genus receives that genus. Remaining genomes have genes called with pyrodigal; protein sketch search proposes candidate reference proteomes and DIAMOND reciprocal best hits give AAI, assigning a genus (--genus-aai) or family (--family-aai) by majority among the --aai-top closest references. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, classify/, and {prefix}.log.")
                 .arg(
                     Arg::new("db")
                         .long("db")
@@ -402,6 +444,38 @@ fn build_cli() -> Command {
                         .value_name("PERCENT")
                         .value_parser(clap::value_parser!(f64))
                         .help("ANI needed for genus consensus; more distant genomes are left for the AAI tier"),
+                )
+                .arg(
+                    Arg::new("genus_aai")
+                        .long("genus-aai")
+                        .default_value("65")
+                        .value_name("PERCENT")
+                        .value_parser(clap::value_parser!(f64))
+                        .help("AAI needed for genus consensus"),
+                )
+                .arg(
+                    Arg::new("family_aai")
+                        .long("family-aai")
+                        .default_value("52")
+                        .value_name("PERCENT")
+                        .value_parser(clap::value_parser!(f64))
+                        .help("AAI needed for family consensus"),
+                )
+                .arg(
+                    Arg::new("aai_top")
+                        .long("aai-top")
+                        .default_value("10")
+                        .value_name("N")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Closest references by AAI that vote on genus and family"),
+                )
+                .arg(pyrodigal_arg())
+                .arg(
+                    Arg::new("diamond")
+                        .long("diamond")
+                        .default_value("diamond")
+                        .value_name("PATH")
+                        .help("DIAMOND executable used for AAI"),
                 )
                 .arg(
                     Arg::new("candidates")
@@ -497,7 +571,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                     sp_clusters: args.get_one::<String>("sp_clusters").unwrap().clone(),
                 },
             },
-            nt_index_params(args),
+            if args.get_flag("call_genes") {
+                ProteinSource::CallGenes(classify::external::find_program(
+                    args.get_one::<String>("pyrodigal").unwrap(),
+                )?)
+            } else if let Some(list) = args.get_one::<String>("protein_list") {
+                ProteinSource::List(list.clone())
+            } else {
+                ProteinSource::None
+            },
+            classify_index_params(args, "dna"),
+            classify_index_params(args, "aa"),
         )?,
         "classify" => classify_genomes(&ClassifyOptions {
             db: args.get_one::<String>("db").unwrap().clone(),
@@ -514,6 +598,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             candidates: *args.get_one("candidates").unwrap(),
             beam_width: *args.get_one("beam_width").unwrap(),
             genus_ani: *args.get_one("genus_ani").unwrap(),
+            genus_aai: *args.get_one("genus_aai").unwrap(),
+            family_aai: *args.get_one("family_aai").unwrap(),
+            aai_top: *args.get_one("aai_top").unwrap(),
+            pyrodigal: args.get_one::<String>("pyrodigal").unwrap().clone(),
+            diamond: args.get_one::<String>("diamond").unwrap().clone(),
+            threads: requested_threads(args),
         })?,
         _ => unreachable!(),
     }
