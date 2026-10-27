@@ -5,6 +5,7 @@ pub(crate) mod ani;
 pub(crate) mod external;
 pub(crate) mod genes;
 pub(crate) mod log;
+pub(crate) mod markers;
 pub(crate) mod refdata;
 pub(crate) mod refdb;
 pub(crate) mod summary;
@@ -22,6 +23,11 @@ use crate::classify::ani::{AniDecision, AniHit, MIN_SPECIES_RADIUS, decide, refi
 use crate::classify::external::find_program;
 use crate::classify::genes::{GeneCalls, call_genes};
 use crate::classify::log::ClassifyLog;
+use crate::classify::markers::{
+    CopyNumber, MARKER_SETS, PfamInfo, align_markers, apply_mask, copy_number, filtered_reason,
+    genome_domain, marker_hmms, multihit_warning, read_mask, read_proteins, read_reference_msa,
+    search_markers, write_filtered, write_marker_info, write_markers_summary, write_msa_gz,
+};
 use crate::classify::refdata::{marker_set_for_taxonomy, standardise_taxonomy};
 use crate::classify::refdb::ClassifyDb;
 use crate::classify::summary::{
@@ -53,6 +59,8 @@ pub(crate) struct ClassifyOptions {
     pub(crate) aai_top: usize,
     pub(crate) pyrodigal: String,
     pub(crate) diamond: String,
+    pub(crate) min_perc_aa: f64,
+    pub(crate) hmmer_dir: Option<String>,
     pub(crate) threads: usize,
 }
 
@@ -125,20 +133,55 @@ fn file_stem(path: &str) -> String {
     name.to_owned()
 }
 
-/// Everything known about one query after the ANI tier and, when the ANI
-/// tier left it unresolved, the AAI tier.
+/// Everything known about one query after each tier it reached.
 struct QueryResult<'a> {
     genome: &'a QueryGenome,
     hits: Vec<AniHit>,
     decision: AniDecision,
+    /// Gene calls for genomes the ANI tier left unresolved; the inner
+    /// `None` means pyrodigal called no genes.
+    genes: Option<Option<GeneCalls>>,
     aai: Option<AaiResult>,
+    markers: Option<MarkerResult>,
 }
 
 struct AaiResult {
-    /// `None` when no genes could be called.
-    genes: Option<GeneCalls>,
     hits: Vec<AaiHit>,
     decision: AaiDecision,
+}
+
+/// Where the marker pipeline left a genome.
+#[derive(Debug)]
+enum MarkerOutcome {
+    /// In the masked user MSA, ready for placement.
+    Aligned { alignment: String, msa_percent: f64 },
+    /// No single-copy marker of either set.
+    NoMarkers,
+    /// Too few amino acids in the masked MSA; carries GTDB-Tk's reason.
+    Filtered(String),
+}
+
+struct MarkerResult {
+    marker_set: &'static str,
+    outcome: MarkerOutcome,
+    /// Domain-questionable and multiple-hit warnings.
+    warnings: Vec<String>,
+}
+
+impl QueryResult<'_> {
+    fn called_genes(&self) -> Option<&GeneCalls> {
+        self.genes.as_ref().and_then(Option::as_ref)
+    }
+
+    /// Unresolved by ANI and, where it ran, by AAI.
+    fn needs_markers(&self) -> bool {
+        self.decision == AniDecision::Unresolved
+            && self.called_genes().is_some()
+            && self
+                .aai
+                .as_ref()
+                .is_none_or(|aai| aai.decision == AaiDecision::Unresolved)
+    }
 }
 
 pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn Error>> {
@@ -188,7 +231,9 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
             ),
             genome,
             hits,
+            genes: None,
             aai: None,
+            markers: None,
         })
         .collect::<Vec<_>>();
     for result in &results {
@@ -215,7 +260,9 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
         "{species} genome(s) have been classified using the ANI pre-screening step."
     ));
     let mut results = results;
+    call_query_genes(&mut results, options, &out_dir, &log)?;
     run_aai_tier(&mut results, &db, options, &out_dir, &log)?;
+    run_marker_tier(&mut results, &db, options, &out_dir, &log)?;
 
     write_identify_files(&results, &out_dir, &options.prefix)?;
     let mut rows: BTreeMap<&'static str, Vec<SummaryRow>> = BTreeMap::new();
@@ -263,11 +310,16 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// Call genes for genomes the ANI tier left unresolved, then classify them
-/// by AAI against candidate reference proteomes.
-fn run_aai_tier(
+fn marker_genes_dir(out_dir: &Path) -> PathBuf {
+    out_dir
+        .join("identify")
+        .join("intermediate_results")
+        .join("marker_genes")
+}
+
+/// Call genes with pyrodigal for genomes the ANI tier left unresolved.
+fn call_query_genes(
     results: &mut [QueryResult],
-    db: &ClassifyDb,
     options: &ClassifyOptions,
     out_dir: &Path,
     log: &ClassifyLog,
@@ -281,24 +333,12 @@ fn run_aai_tier(
     if pending.is_empty() {
         return Ok(());
     }
-    let Some((aa_params, aa_paths)) = &db.aa else {
-        log.warn(format!(
-            "{} genome(s) need the AAI tier, but the database has no protein index; rebuild it with --call-genes or --protein-list",
-            pending.len()
-        ));
-        return Ok(());
-    };
     let pyrodigal = find_program(&options.pyrodigal)?;
-    let diamond = find_program(&options.diamond)?;
-
     log.info(format!(
         "Calling genes with pyrodigal for {} genome(s) not resolved by ANI",
         pending.len()
     ));
-    let marker_dir = out_dir
-        .join("identify")
-        .join("intermediate_results")
-        .join("marker_genes");
+    let marker_dir = marker_genes_dir(out_dir);
     let genes = pending
         .par_iter()
         .map(|&index| {
@@ -307,19 +347,49 @@ fn run_aai_tier(
                 .map_err(|error| format!("gene calling failed for {}: {error}", genome.id))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    for (index, calls) in pending.into_iter().zip(genes) {
+        results[index].genes = Some(calls);
+    }
+    Ok(())
+}
 
-    let called = pending
+/// Classify genomes the ANI tier left unresolved by AAI against candidate
+/// reference proteomes.
+fn run_aai_tier(
+    results: &mut [QueryResult],
+    db: &ClassifyDb,
+    options: &ClassifyOptions,
+    out_dir: &Path,
+    log: &ClassifyLog,
+) -> Result<(), Box<dyn Error>> {
+    let called = results
         .iter()
-        .zip(&genes)
-        .filter_map(|(&index, calls)| calls.as_ref().map(|calls| (index, calls)))
+        .enumerate()
+        .filter(|(_, result)| result.decision == AniDecision::Unresolved)
+        .filter_map(|(index, result)| {
+            result
+                .called_genes()
+                .map(|calls| (index, calls.protein_faa.clone()))
+        })
         .collect::<Vec<_>>();
+    if called.is_empty() {
+        return Ok(());
+    }
+    let Some((aa_params, aa_paths)) = &db.aa else {
+        log.warn(format!(
+            "{} genome(s) need the AAI tier, but the database has no protein index; rebuild it with --call-genes or --protein-list",
+            called.len()
+        ));
+        return Ok(());
+    };
+    let diamond = find_program(&options.diamond)?;
     log.info(format!(
         "Running AAI search with DiskANN candidate search and DIAMOND for {} genome(s)",
         called.len()
     ));
     let proteome_paths = called
         .iter()
-        .map(|(_, calls)| calls.protein_faa.to_string_lossy().into_owned())
+        .map(|(_, faa)| faa.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     let vectors = sketch_from_params(&proteome_paths, aa_params);
     let candidates = search_vectors(
@@ -334,7 +404,7 @@ fn run_aai_tier(
     .collect::<Vec<_>>();
     let proteomes = called
         .iter()
-        .map(|(_, calls)| calls.protein_faa.as_path())
+        .map(|(_, faa)| faa.as_path())
         .collect::<Vec<_>>();
     let aai_hits = compute_aai(
         &diamond,
@@ -354,7 +424,8 @@ fn run_aai_tier(
         .zip(aai_hits)
         .collect::<BTreeMap<_, _>>();
     let mut resolved = 0;
-    for (&index, calls) in pending.iter().zip(genes) {
+    let indices = called.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+    for index in indices {
         let hits = hits_by_index.remove(&index).unwrap_or_default();
         let decision = aai::decide(
             &hits,
@@ -379,16 +450,262 @@ fn run_aai_tier(
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        results[index].aai = Some(AaiResult {
-            genes: calls,
-            hits,
-            decision,
-        });
+        results[index].aai = Some(AaiResult { hits, decision });
     }
     log.info(format!(
         "{resolved} genome(s) have been classified using AAI."
     ));
     write_aai_summary(results, db, out_dir, &options.prefix)
+}
+
+/// GTDB-Tk's `identify` and `align` steps for genomes neither ANI nor AAI
+/// resolved: marker search, copy number, domain call, and the masked
+/// concatenated alignment.
+fn run_marker_tier(
+    results: &mut [QueryResult],
+    db: &ClassifyDb,
+    options: &ClassifyOptions,
+    out_dir: &Path,
+    log: &ClassifyLog,
+) -> Result<(), Box<dyn Error>> {
+    let pending = results
+        .iter()
+        .enumerate()
+        .filter(|(_, result)| result.needs_markers())
+        .map(|(index, result)| {
+            let faa = result.called_genes().expect("genes").protein_faa.clone();
+            (index, result.genome.id.clone(), faa)
+        })
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let Some(root) = db.data.root.clone() else {
+        log.warn(format!(
+            "{} genome(s) need the marker tier, but the database was not built from a GTDB-Tk data package (--gtdbtk-data)",
+            pending.len()
+        ));
+        return Ok(());
+    };
+    let hmmer = |program: &str| match &options.hmmer_dir {
+        Some(dir) => find_program(&Path::new(dir).join(program).to_string_lossy()),
+        None => find_program(program),
+    };
+    let (hmmsearch, hmmalign) = (hmmer("hmmsearch")?, hmmer("hmmalign")?);
+
+    log.info(format!(
+        "Identifying markers in {} genomes with {} threads.",
+        thousands(pending.len()),
+        options.threads
+    ));
+    let pfam_info = PfamInfo::load(&root)?;
+    let marker_dir = marker_genes_dir(out_dir);
+    let searched = pending
+        .par_iter()
+        .map(|(index, id, faa)| {
+            let (pfam, tigrfam) =
+                search_markers(&hmmsearch, &root, &pfam_info, id, faa, &marker_dir.join(id))
+                    .map_err(|error| format!("marker search failed for {id}: {error}"))?;
+            let proteins = read_proteins(faa).map_err(|error| format!("{id}: {error}"))?;
+            let copies = MARKER_SETS.map(|set| copy_number(set, &proteins, &pfam, &tigrfam));
+            Ok::<_, String>((*index, id.clone(), copies))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut summaries: BTreeMap<&str, BTreeMap<String, CopyNumber>> = BTreeMap::new();
+    for (_, id, copies) in &searched {
+        for (set, copies) in MARKER_SETS.iter().zip(copies) {
+            summaries
+                .entry(set)
+                .or_default()
+                .insert(id.clone(), copies.clone());
+        }
+    }
+    let identify_dir = out_dir.join("identify");
+    for (set, genomes) in &summaries {
+        write_markers_summary(
+            &identify_dir.join(format!("{}.{set}.markers_summary.tsv", options.prefix)),
+            genomes,
+        )?;
+    }
+    log.info("Done.");
+
+    let align_dir = out_dir.join("align");
+    let align_tmp = align_dir.join("intermediate_results");
+    fs::create_dir_all(&align_tmp)?;
+    let mut hmms = BTreeMap::new();
+    for set in MARKER_SETS {
+        let set_hmms = marker_hmms(&root, set)?;
+        write_marker_info(
+            &align_tmp.join(format!("{}.{set}.marker_info.tsv", options.prefix)),
+            &set_hmms,
+        )?;
+        hmms.insert(set, set_hmms);
+    }
+    let mut domains = BTreeMap::new();
+    for (index, id, copies) in &searched {
+        let [ar53, bac120] = copies;
+        let (set, questionable) =
+            genome_domain(bac120.single_copy_count(), ar53.single_copy_count());
+        let mut warnings = Vec::new();
+        if let Some((bacterial, archaeal)) = questionable {
+            warnings.push(format!(
+                "Genome domain questionable ( {}% Bacterial, {}% Archaeal)",
+                summary::py_float(bacterial),
+                summary::py_float(archaeal)
+            ));
+        }
+        let domain_copies = if set == "bac120" { bac120 } else { ar53 };
+        warnings.extend(multihit_warning(domain_copies, set));
+        domains.insert(id.clone(), (*index, set, domain_copies.clone(), warnings));
+    }
+
+    log.info(format!(
+        "Aligning markers in {} genomes with {} CPUs.",
+        thousands(searched.len()),
+        options.threads
+    ));
+    let mut outcomes: BTreeMap<String, MarkerOutcome> = BTreeMap::new();
+    for set in MARKER_SETS {
+        let genomes = domains
+            .iter()
+            .filter(|(_, (_, domain, _, _))| *domain == set)
+            .map(|(id, (_, _, copies, _))| (id.clone(), copies.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if genomes.is_empty() {
+            continue;
+        }
+        let domain_name = domain_adjective(set);
+        log.info(format!(
+            "Processing {} genomes identified as {domain_name}.",
+            thousands(genomes.len())
+        ));
+        let user = align_markers(&hmmalign, &hmms[set], &genomes, &align_tmp.join("hmmalign"))?;
+        fs::remove_dir_all(align_tmp.join("hmmalign"))?;
+        for id in genomes.keys().filter(|id| !user.contains_key(*id)) {
+            outcomes.insert(id.clone(), MarkerOutcome::NoMarkers);
+        }
+        if user.is_empty() {
+            log.warn(format!("Identified 0 single copy {domain_name} hits."));
+            continue;
+        }
+        let mask = read_mask(&db.data, &root, set)?;
+        let unmasked_length = user.values().next().map_or(0, String::len);
+        let (mut kept, mut pruned) = (BTreeMap::new(), BTreeMap::new());
+        for (id, alignment) in user {
+            let (masked, valid, msa_percent) = apply_mask(&alignment, &mask)?;
+            if valid < options.min_perc_aa / 100.0 {
+                pruned.insert(id, masked);
+            } else {
+                kept.insert(id, (masked, msa_percent));
+            }
+        }
+        log.info(format!(
+            "Masked {domain_name} alignment from {} to {} AAs.",
+            thousands(unmasked_length),
+            thousands(mask.iter().filter(|keep| **keep).count())
+        ));
+        if options.min_perc_aa > 0.0 {
+            log.info(format!(
+                "{} {domain_name} user genomes have amino acids in <{:.1}% of columns in filtered MSA.",
+                thousands(pruned.len()),
+                options.min_perc_aa
+            ));
+        }
+        write_filtered(
+            &align_dir.join(format!("{}.{set}.filtered.tsv", options.prefix)),
+            &pruned,
+        )?;
+
+        let user_msa = kept
+            .iter()
+            .map(|(id, (masked, _))| (id.clone(), masked.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut msa = user_msa.clone();
+        for (id, alignment) in read_reference_msa(&root, &db.data.version, set)? {
+            msa.insert(id, apply_mask(&alignment, &mask)?.0);
+        }
+        log.info(format!(
+            "Creating concatenated alignment for {} {domain_name} GTDB and user genomes.",
+            thousands(msa.len())
+        ));
+        write_msa_gz(
+            &align_dir.join(format!("{}.{set}.msa.fasta.gz", options.prefix)),
+            &msa,
+            &db.data,
+        )?;
+        drop(msa);
+        if !user_msa.is_empty() {
+            log.info(format!(
+                "Creating concatenated alignment for {} {domain_name} user genomes.",
+                thousands(user_msa.len())
+            ));
+            write_msa_gz(
+                &align_dir.join(format!("{}.{set}.user_msa.fasta.gz", options.prefix)),
+                &user_msa,
+                &db.data,
+            )?;
+        } else {
+            log.info(format!(
+                "All {domain_name} user genomes have been filtered out."
+            ));
+        }
+        for (id, masked) in &pruned {
+            outcomes.insert(id.clone(), MarkerOutcome::Filtered(filtered_reason(masked)));
+        }
+        for (id, (alignment, msa_percent)) in kept {
+            outcomes.insert(
+                id,
+                MarkerOutcome::Aligned {
+                    alignment,
+                    msa_percent,
+                },
+            );
+        }
+    }
+    let no_markers = outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, MarkerOutcome::NoMarkers))
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    if !no_markers.is_empty() {
+        let mut output = BufWriter::new(File::create(
+            align_tmp.join(format!("{}.align.failed.tsv", options.prefix)),
+        )?);
+        for id in no_markers {
+            writeln!(output, "{id}\tNo bacterial or archaeal marker")?;
+        }
+        output.flush()?;
+    }
+    for (id, (index, set, _, warnings)) in domains {
+        let outcome = outcomes.remove(&id).unwrap_or(MarkerOutcome::NoMarkers);
+        results[index].markers = Some(MarkerResult {
+            marker_set: set,
+            outcome,
+            warnings,
+        });
+    }
+    Ok(())
+}
+
+fn domain_adjective(marker_set: &str) -> &'static str {
+    if marker_set == "ar53" {
+        "archaeal"
+    } else {
+        "bacterial"
+    }
+}
+
+/// Python's `{:,}` formatting.
+fn thousands(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 /// `classify/aai/{prefix}.aai_summary.tsv`: every AAI hit per genome.
@@ -437,7 +754,7 @@ fn write_identify_files(
 ) -> Result<(), Box<dyn Error>> {
     let called = results
         .iter()
-        .filter_map(|result| result.aai.as_ref().map(|aai| (result.genome, aai)))
+        .filter_map(|result| result.genes.as_ref().map(|genes| (result.genome, genes)))
         .collect::<Vec<_>>();
     if called.is_empty() {
         return Ok(());
@@ -446,8 +763,8 @@ fn write_identify_files(
     fs::create_dir_all(&dir)?;
     let mut tables = BTreeMap::new();
     let mut failed = BTreeMap::new();
-    for (genome, aai) in called {
-        match &aai.genes {
+    for (genome, genes) in called {
+        match genes {
             Some(genes) => {
                 tables.insert(genome.id.as_str(), genes.translation_table);
             }
@@ -553,12 +870,26 @@ fn summary_row(
             ));
         }
         AniDecision::Unresolved => {
-            if let Some(aai) = &result.aai {
-                row.other_related_references = format_related_references(&related, &[], &db.data);
-                row.warnings = radius_warnings(&result.hits, db, options.min_af);
-                return aai_summary_row(row, aai, marker_set, db, options);
+            row.other_related_references = format_related_references(&related, &[], &db.data);
+            row.warnings = radius_warnings(&result.hits, db, options.min_af);
+            match (&result.genes, &result.markers, &result.aai) {
+                // GTDB-Tk reports genomes without genes in the bac120 summary.
+                (Some(None), _, _) => {
+                    row.classification = Some("Unclassified".into());
+                    row.warnings.push("No genes were called by Prodigal".into());
+                    return ("bac120", row);
+                }
+                (Some(Some(genes)), Some(markers), _) => {
+                    return marker_summary_row(row, genes, markers);
+                }
+                (Some(Some(genes)), None, Some(aai)) => {
+                    return aai_summary_row(row, genes, aai, marker_set, db, options);
+                }
+                _ => {
+                    row.classification = Some(unclassified(marker_set, best_taxonomy.is_some()));
+                    return (marker_set, row);
+                }
             }
-            row.classification = Some(unclassified(marker_set, best_taxonomy.is_some()));
         }
     }
     row.other_related_references = format_related_references(&related, &[], &db.data);
@@ -577,16 +908,12 @@ fn unclassified(marker_set: &str, domain_known: bool) -> String {
 /// Fill in the AAI-tier fields of a row the ANI tier could not resolve.
 fn aai_summary_row(
     mut row: SummaryRow,
+    genes: &GeneCalls,
     aai: &AaiResult,
     ani_marker_set: &'static str,
     db: &ClassifyDb,
     options: &ClassifyOptions,
 ) -> (&'static str, SummaryRow) {
-    let Some(genes) = &aai.genes else {
-        row.classification = Some("Unclassified".into());
-        row.warnings.push("No genes were called by Prodigal".into());
-        return (ani_marker_set, row);
-    };
     row.translation_table = Some(genes.translation_table);
     let best_taxonomy = aai.hits.first().and_then(|hit| {
         db.data
@@ -621,6 +948,34 @@ fn aai_summary_row(
         "{rank} assigned by AAI consensus ({supporting}/{considered} references >= {threshold}%)"
     ));
     (marker_set, row)
+}
+
+/// Fill in the marker-tier fields, following GTDB-Tk's rows for genomes
+/// without markers, filtered from the MSA, or (until placement) aligned.
+fn marker_summary_row(
+    mut row: SummaryRow,
+    genes: &GeneCalls,
+    markers: &MarkerResult,
+) -> (&'static str, SummaryRow) {
+    match &markers.outcome {
+        MarkerOutcome::NoMarkers => {
+            row.classification = Some("Unclassified".into());
+            row.warnings.push("No bacterial or archaeal marker".into());
+            ("bac120", row)
+        }
+        MarkerOutcome::Filtered(reason) => {
+            row.classification = Some(unclassified(markers.marker_set, true));
+            row.warnings.push(reason.clone());
+            (markers.marker_set, row)
+        }
+        MarkerOutcome::Aligned { msa_percent, .. } => {
+            row.classification = Some(unclassified(markers.marker_set, true));
+            row.translation_table = Some(genes.translation_table);
+            row.msa_percent = Some(*msa_percent);
+            row.warnings.extend(markers.warnings.iter().cloned());
+            (markers.marker_set, row)
+        }
+    }
 }
 
 /// GTDB-Tk's warnings for near misses that did not receive a species call.

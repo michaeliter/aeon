@@ -382,7 +382,7 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("classify")
                 .about("Classify genomes against GTDB with GTDB-Tk-compatible output")
-                .long_about("Classify genomes in a cascade. DiskANN sketch search proposes the closest GTDB representatives and TurboANI computes their exact ANI. A genome within the closest reference's ANI radius (AF >= --min_af) receives that species, as in the GTDB-Tk ANI screen; one at or above --genus-ani to a strict majority of one genus receives that genus. Remaining genomes have genes called with pyrodigal; protein sketch search proposes candidate reference proteomes and DIAMOND reciprocal best hits give AAI, assigning a genus (--genus-aai) or family (--family-aai) by majority among the --aai-top closest references. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, classify/, and {prefix}.log.")
+                .long_about("Classify genomes in a cascade. DiskANN sketch search proposes the closest GTDB representatives and TurboANI computes their exact ANI. A genome within the closest reference's ANI radius (AF >= --min_af) receives that species, as in the GTDB-Tk ANI screen; one at or above --genus-ani to a strict majority of one genus receives that genus. Remaining genomes have genes called with pyrodigal; protein sketch search proposes candidate reference proteomes and DIAMOND reciprocal best hits give AAI, assigning a genus (--genus-aai) or family (--family-aai) by majority among the --aai-top closest references. Genomes still unresolved go through GTDB-Tk's marker pipeline: hmmsearch finds the bac120/ar53 markers, the copy-number profile picks the domain, and hmmalign builds the masked concatenated alignment (requires a classify-db built from a GTDB-Tk data package). Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, classify/, and {prefix}.log.")
                 .arg(
                     Arg::new("db")
                         .long("db")
@@ -476,6 +476,21 @@ fn build_cli() -> Command {
                         .default_value("diamond")
                         .value_name("PATH")
                         .help("DIAMOND executable used for AAI"),
+                )
+                .arg(
+                    Arg::new("min_perc_aa")
+                        .long("min_perc_aa")
+                        .visible_alias("min-perc-aa")
+                        .default_value("10")
+                        .value_name("PERCENT")
+                        .value_parser(clap::value_parser!(f64))
+                        .help("Leave out genomes with amino acids in fewer than this percentage of masked MSA columns"),
+                )
+                .arg(
+                    Arg::new("hmmer_dir")
+                        .long("hmmer-dir")
+                        .value_name("DIR")
+                        .help("Directory holding hmmsearch and hmmalign (default: search PATH)"),
                 )
                 .arg(
                     Arg::new("candidates")
@@ -603,6 +618,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             aai_top: *args.get_one("aai_top").unwrap(),
             pyrodigal: args.get_one::<String>("pyrodigal").unwrap().clone(),
             diamond: args.get_one::<String>("diamond").unwrap().clone(),
+            min_perc_aa: *args.get_one("min_perc_aa").unwrap(),
+            hmmer_dir: args.get_one::<String>("hmmer_dir").cloned(),
             threads: requested_threads(args),
         })?,
         _ => unreachable!(),

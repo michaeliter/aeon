@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::classify::external::run;
-use crate::classify::summary::py_float;
+use crate::classify::summary::py_round;
 
 /// Genomes shorter than this use Prodigal's metagenomic mode.
 const MIN_SINGLE_MODE_BASES: usize = 100_000;
@@ -35,7 +35,7 @@ pub(crate) fn best_translation_table(coding_density_4: f64, coding_density_11: f
 
 /// Call genes for one genome into `out_dir/{genome_id}/`, writing
 /// `{id}_protein.faa`, `{id}_protein.fna`, `{id}_protein.gff`, and
-/// `{id}_translation_table.tsv` like GTDB-Tk's `identify` step.
+/// `prodigal_translation_table.tsv` like GTDB-Tk's `identify` step.
 /// Returns `None` for a genome without sequence.
 pub(crate) fn call_genes(
     pyrodigal: &Path,
@@ -100,12 +100,13 @@ pub(crate) fn call_genes(
         }
     }
     fs::remove_file(&input)?;
+    // GTDB-Tk records coding densities as percentages rounded to 2 places.
     fs::write(
-        final_path("_translation_table.tsv"),
+        genome_dir.join("prodigal_translation_table.tsv"),
         format!(
             "best_translation_table\t{table}\ncoding_density_4\t{}\ncoding_density_11\t{}\n",
-            py_float(coding_density_4),
-            py_float(coding_density_11)
+            py_round(coding_density_4 * 100.0, 2),
+            py_round(coding_density_11 * 100.0, 2)
         ),
     )?;
     let protein_faa = final_path("_protein.faa");
