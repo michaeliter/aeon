@@ -6,6 +6,8 @@ mod utils;
 
 use std::error::Error;
 
+use crate::classify::refdb::{TaxonomySource, build_classify_db};
+use crate::classify::{ClassifyOptions, QueryInput, classify_genomes};
 use crate::database::{build_database, search_database, update_database};
 use crate::metadata::PrefixParams;
 use crate::utils::{init_rayon_global, read_list_file, requested_threads};
@@ -28,7 +30,25 @@ fn threads_arg() -> Arg {
         .short('t')
         .value_name("N")
         .value_parser(clap::value_parser!(usize))
+        .visible_alias("cpus")
         .help("Worker threads [default: all logical CPUs]")
+}
+
+fn nt_index_params(args: &clap::ArgMatches) -> PrefixParams {
+    PrefixParams {
+        kmer_size: *args.get_one("kmer_size").unwrap(),
+        sketch_size: *args.get_one("sketch_size").unwrap(),
+        densification: 0,
+        seq_type: "dna".into(),
+        max_degree: *args.get_one("max_degree").unwrap(),
+        build_beam_width: *args.get_one("build_beam_width").unwrap(),
+        alpha: 1.2,
+        extra_seeds: 1,
+        sketch_elem_size: 2,
+        sketch_elem_type: "u16".into(),
+        distance: "anndists::dist::DistHamming".into(),
+        hash_seed: 1337,
+    }
 }
 
 fn update_beam_arg() -> Arg {
@@ -233,6 +253,174 @@ fn build_cli() -> Command {
                 )
                 .arg(threads_arg()),
         )
+        .subcommand(
+            Command::new("classify-db")
+                .about("Build a GTDB reference database for aeon classify")
+                .long_about("Sketch GTDB species-representative genomes into a static DiskANN index and store the GTDB taxonomy and species ANI radii needed by aeon classify. Taxonomy comes from a GTDB-Tk reference data package, or from GTDB release taxonomy and sp_clusters files. Reference files must be named by accession (e.g. GCF_000005845.2_genomic.fna.gz) and must stay at their listed paths, because classify computes exact ANI against them.")
+                .arg(
+                    Arg::new("db")
+                        .long("db")
+                        .required(true)
+                        .value_name("DIR")
+                        .help("Output database directory"),
+                )
+                .arg(
+                    Arg::new("genome_list")
+                        .long("genome-list")
+                        .short('r')
+                        .required(true)
+                        .value_name("FILE")
+                        .help("Text file with one GTDB representative genome FASTA path per line"),
+                )
+                .arg(
+                    Arg::new("gtdbtk_data")
+                        .long("gtdbtk-data")
+                        .value_name("DIR")
+                        .env("GTDBTK_DATA_PATH")
+                        .conflicts_with_all(["taxonomy", "sp_clusters"])
+                        .help("GTDB-Tk reference data package; required later for marker-based placement"),
+                )
+                .arg(
+                    Arg::new("taxonomy")
+                        .long("taxonomy")
+                        .value_name("FILE")
+                        .action(ArgAction::Append)
+                        .requires_all(["sp_clusters", "release"])
+                        .help("GTDB release taxonomy file(s), e.g. bac120_taxonomy_r232.tsv.gz (repeatable)"),
+                )
+                .arg(
+                    Arg::new("sp_clusters")
+                        .long("sp-clusters")
+                        .value_name("FILE")
+                        .requires("taxonomy")
+                        .help("GTDB release sp_clusters_r*.tsv providing species ANI radii"),
+                )
+                .arg(
+                    Arg::new("release")
+                        .long("release")
+                        .value_name("NAME")
+                        .help("GTDB release name recorded with --taxonomy, e.g. r232"),
+                )
+                .arg(
+                    Arg::new("kmer_size")
+                        .long("kmer-size")
+                        .short('k')
+                        .default_value("16")
+                        .value_name("K")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Nucleotide k-mer length"),
+                )
+                .arg(
+                    Arg::new("sketch_size")
+                        .long("sketch-size")
+                        .short('s')
+                        .default_value("12000")
+                        .value_name("N")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Number of u16 values in each MinHash sketch"),
+                )
+                .arg(
+                    Arg::new("max_degree")
+                        .long("max-degree")
+                        .default_value("64")
+                        .value_name("R")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Maximum Vamana out-degree"),
+                )
+                .arg(
+                    Arg::new("build_beam_width")
+                        .long("build-beam-width")
+                        .default_value("256")
+                        .value_name("L")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Construction beam"),
+                )
+                .arg(threads_arg()),
+        )
+        .subcommand(
+            Command::new("classify")
+                .about("Classify genomes against GTDB with GTDB-Tk-compatible output")
+                .long_about("Classify genomes in a cascade. DiskANN sketch search proposes the closest GTDB representatives and TurboANI computes their exact ANI. A genome within the closest reference's ANI radius (AF >= --min_af) receives that species, as in the GTDB-Tk ANI screen; one at or above --genus-ani to a strict majority of one genus receives that genus. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, classify/, and {prefix}.log.")
+                .arg(
+                    Arg::new("db")
+                        .long("db")
+                        .required(true)
+                        .value_name("DIR")
+                        .help("Database directory built by aeon classify-db"),
+                )
+                .arg(
+                    Arg::new("genome_dir")
+                        .long("genome_dir")
+                        .visible_alias("genome-dir")
+                        .value_name("DIR")
+                        .required_unless_present("batchfile")
+                        .conflicts_with("batchfile")
+                        .help("Directory containing genome FASTA files"),
+                )
+                .arg(
+                    Arg::new("extension")
+                        .long("extension")
+                        .short('x')
+                        .default_value("fna")
+                        .value_name("EXT")
+                        .help("Extension of genome files in --genome_dir (e.g. fna, fna.gz)"),
+                )
+                .arg(
+                    Arg::new("batchfile")
+                        .long("batchfile")
+                        .value_name("FILE")
+                        .help("Tab-separated file of genome paths with optional genome IDs"),
+                )
+                .arg(
+                    Arg::new("out_dir")
+                        .long("out_dir")
+                        .visible_alias("out-dir")
+                        .required(true)
+                        .value_name("DIR")
+                        .help("Output directory"),
+                )
+                .arg(
+                    Arg::new("prefix")
+                        .long("prefix")
+                        .default_value("gtdbtk")
+                        .value_name("PREFIX")
+                        .help("Prefix of all output files"),
+                )
+                .arg(
+                    Arg::new("min_af")
+                        .long("min_af")
+                        .visible_alias("min-af")
+                        .default_value("0.5")
+                        .value_name("FLOAT")
+                        .value_parser(clap::value_parser!(f64))
+                        .help("Minimum alignment fraction for a species assignment"),
+                )
+                .arg(
+                    Arg::new("genus_ani")
+                        .long("genus-ani")
+                        .default_value("80")
+                        .value_name("PERCENT")
+                        .value_parser(clap::value_parser!(f64))
+                        .help("ANI needed for genus consensus; more distant genomes are left for the AAI tier"),
+                )
+                .arg(
+                    Arg::new("candidates")
+                        .long("candidates")
+                        .default_value("10")
+                        .value_name("N")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Sketch-search candidates re-scored with exact ANI per genome"),
+                )
+                .arg(
+                    Arg::new("beam_width")
+                        .long("beam-width")
+                        .default_value("512")
+                        .value_name("N")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("DiskANN search beam"),
+                )
+                .arg(threads_arg()),
+        )
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -292,6 +480,41 @@ fn main() -> Result<(), Box<dyn Error>> {
             *args.get_one::<usize>("beam_width").unwrap(),
             args.get_one::<String>("output").map(String::as_str),
         )?,
+        "classify-db" => build_classify_db(
+            args.get_one::<String>("db").unwrap(),
+            args.get_one::<String>("genome_list").unwrap(),
+            match args.get_one::<String>("gtdbtk_data") {
+                Some(root) if !args.contains_id("taxonomy") => {
+                    TaxonomySource::GtdbtkPackage(root.clone())
+                }
+                _ => TaxonomySource::ReleaseFiles {
+                    taxonomy: args
+                        .get_many::<String>("taxonomy")
+                        .ok_or("provide --gtdbtk-data, or --taxonomy with --sp-clusters")?
+                        .cloned()
+                        .collect(),
+                    release: args.get_one::<String>("release").unwrap().clone(),
+                    sp_clusters: args.get_one::<String>("sp_clusters").unwrap().clone(),
+                },
+            },
+            nt_index_params(args),
+        )?,
+        "classify" => classify_genomes(&ClassifyOptions {
+            db: args.get_one::<String>("db").unwrap().clone(),
+            input: match args.get_one::<String>("batchfile") {
+                Some(batchfile) => QueryInput::Batchfile(batchfile.clone()),
+                None => QueryInput::GenomeDir {
+                    dir: args.get_one::<String>("genome_dir").unwrap().clone(),
+                    extension: args.get_one::<String>("extension").unwrap().clone(),
+                },
+            },
+            out_dir: args.get_one::<String>("out_dir").unwrap().clone(),
+            prefix: args.get_one::<String>("prefix").unwrap().clone(),
+            min_af: *args.get_one("min_af").unwrap(),
+            candidates: *args.get_one("candidates").unwrap(),
+            beam_width: *args.get_one("beam_width").unwrap(),
+            genus_ani: *args.get_one("genus_ani").unwrap(),
+        })?,
         _ => unreachable!(),
     }
     Ok(())

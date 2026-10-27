@@ -1,10 +1,11 @@
 //! Readers for the GTDB-Tk reference data package (GTDBTK_DATA_PATH layout).
 
+use flate2::read::MultiGzDecoder;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 pub(crate) const RANK_PREFIXES: [&str; 7] = ["d__", "p__", "c__", "o__", "f__", "g__", "s__"];
@@ -99,9 +100,11 @@ pub(crate) struct Radius {
     pub(crate) ani: f64,
 }
 
+/// Reference taxonomy and species radii, plus the GTDB-Tk package root when
+/// one is available (needed for marker-based placement).
 #[derive(Debug, Default)]
 pub(crate) struct GtdbtkData {
-    pub(crate) root: PathBuf,
+    pub(crate) root: Option<PathBuf>,
     pub(crate) version: String,
     /// Seven-rank taxonomy keyed by canonical genome ID.
     pub(crate) taxonomy: HashMap<String, Vec<String>>,
@@ -119,10 +122,28 @@ impl GtdbtkData {
         Ok(Self {
             taxonomy: read_taxonomy(&root.join("taxonomy").join("gtdb_taxonomy.tsv"))?,
             radii: read_radii(&root.join("radii").join("gtdb_radii.tsv"))?,
-            root,
+            root: Some(root),
             version,
             red_dist_bac,
             red_dist_arc,
+        })
+    }
+
+    /// Load only the taxonomy and radii, e.g. from an aeon classify database.
+    pub(crate) fn from_files(
+        version: &str,
+        taxonomy_paths: &[PathBuf],
+        radii_path: &Path,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut taxonomy = HashMap::new();
+        for path in taxonomy_paths {
+            taxonomy.extend(read_taxonomy(path)?);
+        }
+        Ok(Self {
+            version: version.to_owned(),
+            taxonomy,
+            radii: read_radii(radii_path)?,
+            ..Self::default()
         })
     }
 
@@ -133,18 +154,20 @@ impl GtdbtkData {
     pub(crate) fn radius_of(&self, gid: &str) -> Option<f64> {
         self.radii.get(&canonical_gid(gid)).map(|radius| radius.ani)
     }
-
-    pub(crate) fn path(&self, relative: &str) -> PathBuf {
-        self.root.join(relative)
-    }
 }
 
-fn read_lines(
+/// Lines of a plain or gzip-compressed text file.
+pub(crate) fn read_lines(
     path: &Path,
 ) -> Result<impl Iterator<Item = std::io::Result<String>>, Box<dyn Error>> {
-    let file = File::open(path)
-        .map_err(|error| format!("cannot open GTDB-Tk file {}: {error}", path.display()))?;
-    Ok(BufReader::new(file).lines())
+    let file =
+        File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let reader: Box<dyn Read> = if path.extension().is_some_and(|extension| extension == "gz") {
+        Box::new(MultiGzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+    Ok(BufReader::new(reader).lines())
 }
 
 pub(crate) fn read_taxonomy(path: &Path) -> Result<HashMap<String, Vec<String>>, Box<dyn Error>> {
@@ -183,6 +206,31 @@ pub(crate) fn read_radii(path: &Path) -> Result<HashMap<String, Radius>, Box<dyn
             Radius {
                 species: species.to_owned(),
                 ani: ani.parse()?,
+            },
+        );
+    }
+    Ok(radii)
+}
+
+/// Species radii from a GTDB release `sp_clusters_r*.tsv` file (columns:
+/// representative genome, species, taxonomy, ANI circumscription radius, ...).
+pub(crate) fn read_sp_clusters_radii(
+    path: &Path,
+) -> Result<HashMap<String, Radius>, Box<dyn Error>> {
+    let mut radii = HashMap::new();
+    for line in read_lines(path)?.skip(1) {
+        let line = line?;
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 4 {
+            continue;
+        }
+        radii.insert(
+            canonical_gid(fields[0]),
+            Radius {
+                species: fields[1].to_owned(),
+                ani: fields[3].parse().map_err(|error| {
+                    format!("bad radius in {}: {line}: {error}", path.display())
+                })?,
             },
         );
     }
