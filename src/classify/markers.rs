@@ -974,15 +974,21 @@ pub(crate) fn read_reference_msa(
     release: &str,
     marker_set: &str,
 ) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
-    let path = root
-        .join("msa")
-        .join(format!("gtdb_{release}_{marker_set}.faa"));
+    read_msa(
+        &root
+            .join("msa")
+            .join(format!("gtdb_{release}_{marker_set}.faa")),
+    )
+}
+
+/// An aligned FASTA file, plain or gzipped, keyed by sequence ID.
+pub(crate) fn read_msa(path: &Path) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
     let mut msa = BTreeMap::new();
     // Test packages may ship an empty MSA, which needletail rejects.
-    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() == 0) {
+    if fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0) {
         return Ok(msa);
     }
-    let mut reader = parse_fastx_file(&path)
+    let mut reader = parse_fastx_file(path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     while let Some(record) = reader.next() {
         let record = record?;

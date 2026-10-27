@@ -9,10 +9,12 @@ pub(crate) mod markers;
 pub(crate) mod placement;
 pub(crate) mod refdata;
 pub(crate) mod refdb;
+pub(crate) mod split;
 pub(crate) mod summary;
 
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -26,8 +28,9 @@ use crate::classify::genes::{GeneCalls, call_genes};
 use crate::classify::log::ClassifyLog;
 use crate::classify::markers::{
     CopyNumber, MARKER_SETS, PfamInfo, align_markers, apply_mask, copy_number, filtered_reason,
-    genome_domain, marker_hmms, multihit_warning, read_mask, read_proteins, read_reference_msa,
-    search_markers, write_filtered, write_marker_info, write_markers_summary, write_msa_gz,
+    genome_domain, marker_hmms, multihit_warning, read_mask, read_msa, read_proteins,
+    read_reference_msa, search_markers, write_filtered, write_marker_info, write_markers_summary,
+    write_msa_gz,
 };
 use crate::classify::placement::{
     Placement, classify_tree, program_version, run_pplacer, write_pplacer_classification,
@@ -35,6 +38,10 @@ use crate::classify::placement::{
 };
 use crate::classify::refdata::{marker_set_for_taxonomy, standardise_taxonomy, strip_db_prefix};
 use crate::classify::refdb::ClassifyDb;
+use crate::classify::split::{
+    backbone_placement, class_tree, classify_backbone, phyla_of_classes, read_tree_mapping,
+    reconcile, write_backbone_classification, write_tree_mapping,
+};
 use crate::classify::summary::{
     AniScreenRow, RelatedReference, SummaryRow, format_related_references, py_round,
     write_ani_summary, write_summary,
@@ -476,7 +483,8 @@ fn tool(options: &ClassifyOptions, program: &str) -> Result<PathBuf, Box<dyn Err
 }
 
 /// GTDB-Tk's `classify` step for aligned genomes: pplacer into the reference
-/// tree, then RED and topology (full-tree mode).
+/// tree, then RED and topology. Bacteria go through the backbone and
+/// class-level trees unless `--full_tree` is set.
 fn run_placement_tier(
     results: &mut [QueryResult],
     db: &ClassifyDb,
@@ -502,74 +510,33 @@ fn run_placement_tier(
         if pending.is_empty() {
             continue;
         }
-        if set == "bac120" && !options.full_tree {
-            log.warn(
-                "Split-tree placement of bacterial genomes is not implemented yet; using the full bac120 tree as with --full_tree",
-            );
-        }
-        let (pplacer, guppy) = (tool(options, "pplacer")?, tool(options, "guppy")?);
-        let classify_dir = out_dir.join("classify");
-        let intermediate = classify_dir.join("intermediate_results");
-        let pplacer_dir = intermediate.join("pplacer");
-        fs::create_dir_all(&pplacer_dir)?;
-        log.info(format!(
-            "Placing {} {} genomes into reference tree with pplacer using {} CPUs (be patient).",
-            thousands(pending.len()),
-            domain_adjective(set),
-            options.threads.clamp(1, 64)
-        ));
-        log.info(format!("pplacer version: {}", program_version(&pplacer)));
-        let tree_path = classify_dir.join(format!("{}.{set}.classify.tree", options.prefix));
-        run_pplacer(
-            &pplacer,
-            &guppy,
-            &root
-                .join("pplacer")
-                .join(format!("gtdb_{}_{set}.refpkg", db.data.version)),
-            &out_dir
-                .join("align")
-                .join(format!("{}.{set}.user_msa.fasta.gz", options.prefix)),
-            &pplacer_dir.join(format!("pplacer.{set}.json")),
-            &pplacer_dir.join(format!("pplacer.{set}.out")),
-            &tree_path,
-            options.threads,
-        )?;
-        let red_dict = if set == "ar53" {
-            &db.data.red_dist_arc
-        } else {
-            &db.data.red_dist_bac
+        let placer = Placer {
+            pplacer: tool(options, "pplacer")?,
+            guppy: tool(options, "guppy")?,
+            root: &root,
+            db,
+            options,
+            out_dir,
+            log,
+            red_dict: if set == "ar53" {
+                &db.data.red_dist_arc
+            } else {
+                &db.data.red_dist_bac
+            },
         };
+        fs::create_dir_all(placer.pplacer_dir())?;
         write_red_dictionary(
-            &intermediate.join(format!("{}.{set}.red_dictionary.tsv", options.prefix)),
-            red_dict,
+            &placer
+                .intermediate()
+                .join(format!("{}.{set}.red_dictionary.tsv", options.prefix)),
+            placer.red_dict,
         )?;
-        log.info("Calculating RED values based on reference tree.");
         let users = pending.keys().cloned().collect::<HashSet<_>>();
-        let placements = classify_tree(
-            &tree_path,
-            &root
-                .join("mrca_red")
-                .join(format!("gtdbtk_{}_{set}.tsv", db.data.version)),
-            set,
-            &users,
-            &db.data,
-            red_dict,
-        )?;
-        write_pplacer_classification(
-            &intermediate.join(format!(
-                "{}.{set}.classification_pplacer.tsv",
-                options.prefix
-            )),
-            &placements,
-        )?;
-        log.info("Traversing tree to determine classification method.");
-        let missing = pending.len() - placements.len();
-        if missing > 0 {
-            log.warn(format!(
-                "{missing} out of {} have not been properly placed by pplacer. This is a known issue with pplacer but we do not have a solution currently.",
-                pending.len()
-            ));
-        }
+        let placements = if set == "bac120" && !options.full_tree {
+            placer.place_split(&users)?
+        } else {
+            placer.place_full_tree(set, &users)?
+        };
         for (genome, placement) in placements {
             let index = pending[&genome];
             add_placement_ani(&mut results[index], &placement, db)?;
@@ -579,6 +546,291 @@ fn run_placement_tier(
         }
     }
     Ok(())
+}
+
+/// Runs pplacer for one marker set and classifies its placements.
+struct Placer<'a> {
+    pplacer: PathBuf,
+    guppy: PathBuf,
+    root: &'a Path,
+    db: &'a ClassifyDb,
+    options: &'a ClassifyOptions,
+    out_dir: &'a Path,
+    log: &'a ClassifyLog,
+    red_dict: &'a HashMap<String, f64>,
+}
+
+impl Placer<'_> {
+    fn classify_dir(&self) -> PathBuf {
+        self.out_dir.join("classify")
+    }
+
+    fn intermediate(&self) -> PathBuf {
+        self.classify_dir().join("intermediate_results")
+    }
+
+    fn pplacer_dir(&self) -> PathBuf {
+        self.intermediate().join("pplacer")
+    }
+
+    fn user_msa(&self, set: &str) -> PathBuf {
+        self.out_dir
+            .join("align")
+            .join(format!("{}.{set}.user_msa.fasta.gz", self.options.prefix))
+    }
+
+    fn threads(&self) -> usize {
+        self.options.threads.clamp(1, 64)
+    }
+
+    fn run(
+        &self,
+        refpkg: &Path,
+        msa: &Path,
+        json_out: &Path,
+        pplacer_out: &Path,
+        tree_out: &Path,
+    ) -> Result<(), Box<dyn Error>> {
+        run_pplacer(
+            &self.pplacer,
+            &self.guppy,
+            refpkg,
+            msa,
+            json_out,
+            pplacer_out,
+            tree_out,
+            self.options.threads,
+        )?;
+        self.log
+            .info("Calculating RED values based on reference tree.");
+        Ok(())
+    }
+
+    fn warn_unplaced(&self, expected: usize, placed: usize) {
+        if expected > placed {
+            self.log.warn(format!(
+                "{} out of {expected} have not been properly placed by pplacer. This is a known issue with pplacer but we do not have a solution currently.",
+                expected - placed
+            ));
+        }
+    }
+
+    /// The whole reference tree of `set` (GTDB-Tk's full-tree mode).
+    fn place_full_tree(
+        &self,
+        set: &str,
+        users: &HashSet<String>,
+    ) -> Result<BTreeMap<String, Placement>, Box<dyn Error>> {
+        let prefix = &self.options.prefix;
+        self.log.info(format!(
+            "Placing {} {} genomes into reference tree with pplacer using {} CPUs (be patient).",
+            thousands(users.len()),
+            domain_adjective(set),
+            self.threads()
+        ));
+        self.log.info(format!(
+            "pplacer version: {}",
+            program_version(&self.pplacer)
+        ));
+        let tree_path = self
+            .classify_dir()
+            .join(format!("{prefix}.{set}.classify.tree"));
+        self.run(
+            &self
+                .root
+                .join("pplacer")
+                .join(format!("gtdb_{}_{set}.refpkg", self.db.data.version)),
+            &self.user_msa(set),
+            &self.pplacer_dir().join(format!("pplacer.{set}.json")),
+            &self.pplacer_dir().join(format!("pplacer.{set}.out")),
+            &tree_path,
+        )?;
+        let placements = classify_tree(
+            &tree_path,
+            &self
+                .root
+                .join("mrca_red")
+                .join(format!("gtdbtk_{}_{set}.tsv", self.db.data.version)),
+            set,
+            users,
+            &self.db.data,
+            self.red_dict,
+        )?;
+        write_pplacer_classification(
+            &self
+                .intermediate()
+                .join(format!("{prefix}.{set}.classification_pplacer.tsv")),
+            &placements,
+        )?;
+        self.log
+            .info("Traversing tree to determine classification method.");
+        self.warn_unplaced(users.len(), placements.len());
+        Ok(placements)
+    }
+
+    /// GTDB-Tk's split-tree mode for bacteria: the backbone tree assigns a
+    /// class, the class picks a class-level tree, and rules 1-6 reconcile
+    /// the two placements.
+    fn place_split(
+        &self,
+        users: &HashSet<String>,
+    ) -> Result<BTreeMap<String, Placement>, Box<dyn Error>> {
+        let prefix = &self.options.prefix;
+        let split = self.root.join("split");
+        let class_level = split.join("class_level");
+        self.log.info(format!(
+            "Placing {} bacterial genomes into backbone reference tree with pplacer using {} CPUs (be patient).",
+            thousands(users.len()),
+            self.threads()
+        ));
+        self.log.info(format!(
+            "pplacer version: {}",
+            program_version(&self.pplacer)
+        ));
+        let backbone_tree = self
+            .classify_dir()
+            .join(format!("{prefix}.backbone.bac120.classify.tree"));
+        self.run(
+            &split
+                .join("backbone")
+                .join("pplacer")
+                .join("gtdbtk_package_backbone.refpkg"),
+            &self.user_msa("bac120"),
+            &self.pplacer_dir().join("pplacer.backbone.bac120.json"),
+            &self.pplacer_dir().join("pplacer.backbone.bac120.out"),
+            &backbone_tree,
+        )?;
+        let backbone = classify_backbone(
+            &backbone_tree,
+            &split
+                .join("backbone")
+                .join("red")
+                .join("backbone_red_value.tsv"),
+            users,
+            &self.db.data,
+            self.red_dict,
+        )?;
+        write_backbone_classification(
+            &self.intermediate().join(format!(
+                "{prefix}.bac120.backbone.classification_pplacer.tsv"
+            )),
+            &backbone,
+        )?;
+        self.warn_unplaced(users.len(), backbone.len());
+
+        let mapping = read_tree_mapping(&class_level.join("tree_mapping.tsv"))?;
+        let mut placements = BTreeMap::new();
+        let mut rules = BTreeMap::new();
+        let mut trees: Vec<(&str, Vec<&str>)> = Vec::new();
+        for (genome, call) in &backbone {
+            match class_tree(call, &mapping)? {
+                Some(tree) => match trees.iter_mut().find(|(id, _)| *id == tree) {
+                    Some((_, genomes)) => genomes.push(genome),
+                    None => trees.push((tree, vec![genome])),
+                },
+                None => {
+                    placements.insert(genome.clone(), backbone_placement(call));
+                    rules.insert(genome.clone(), ("backbone".to_owned(), "Rule 1"));
+                }
+            }
+        }
+        self.log.info(format!(
+            "{} out of {} have an class assignments. Those genomes will be reclassified.",
+            trees
+                .iter()
+                .map(|(_, genomes)| genomes.len())
+                .sum::<usize>(),
+            users.len()
+        ));
+        trees.sort_by_key(|(_, genomes)| Reverse(genomes.len()));
+
+        let msa = read_msa(&self.user_msa("bac120"))?;
+        let calls = backbone
+            .iter()
+            .map(|(genome, call)| (genome.as_str(), call))
+            .collect::<HashMap<_, _>>();
+        for (index, (tree_id, genomes)) in trees.iter().enumerate() {
+            let tree_dir = self.pplacer_dir().join(format!("tree_{tree_id}"));
+            fs::create_dir_all(&tree_dir)?;
+            let sub_msa = tree_dir.join("user_msa_file.fasta");
+            let mut output = BufWriter::new(File::create(&sub_msa)?);
+            for genome in genomes {
+                writeln!(
+                    output,
+                    ">{genome}\n{}",
+                    msa.get(*genome).map_or("", String::as_str)
+                )?;
+            }
+            output.flush()?;
+            self.log.info(format!(
+                "Placing {} bacterial genomes into class-level reference tree {tree_id} ({}/{}) with pplacer using {} CPUs (be patient).",
+                thousands(genomes.len()),
+                index + 1,
+                trees.len(),
+                self.threads()
+            ));
+            let tree_path = self
+                .classify_dir()
+                .join(format!("{prefix}.bac120.classify.tree.{tree_id}.tree"));
+            self.run(
+                &class_level
+                    .join("pplacer")
+                    .join(format!("gtdbtk.package.{tree_id}.refpkg")),
+                &sub_msa,
+                &tree_dir.join("pplacer.class_level.bac120.json"),
+                &tree_dir.join("pplacer.class_level.bac120.out"),
+                &tree_path,
+            )?;
+            let tree_users = genomes.iter().map(|g| (*g).to_owned()).collect();
+            let class_placements = classify_tree(
+                &tree_path,
+                &class_level
+                    .join("red")
+                    .join(format!("red_value_{tree_id}.tsv")),
+                "bac120",
+                &tree_users,
+                &self.db.data,
+                self.red_dict,
+            )?;
+            write_pplacer_classification(
+                &self.intermediate().join(format!(
+                    "{prefix}.bac120.class_level.classification_pplacer_tree_{tree_id}.tsv"
+                )),
+                &class_placements,
+            )?;
+            self.log
+                .info("Traversing tree to determine classification method.");
+            self.warn_unplaced(genomes.len(), class_placements.len());
+            let valid_classes = mapping
+                .iter()
+                .filter(|(_, tree)| tree == tree_id)
+                .map(|(class, _)| class.clone())
+                .collect::<HashSet<_>>();
+            let valid_phyla = phyla_of_classes(&valid_classes, &self.db.data);
+            for (genome, placement) in class_placements {
+                let reconciled = reconcile(
+                    calls[genome.as_str()],
+                    placement,
+                    &valid_classes,
+                    &valid_phyla,
+                );
+                let tree = if reconciled.on_backbone {
+                    "backbone".to_owned()
+                } else {
+                    (*tree_id).to_owned()
+                };
+                rules.insert(genome.clone(), (tree, reconciled.rule));
+                placements.insert(genome, reconciled.placement);
+            }
+        }
+        write_tree_mapping(
+            &self
+                .classify_dir()
+                .join(format!("{prefix}.bac120.tree.mapping.tsv")),
+            &rules,
+        )?;
+        Ok(placements)
+    }
 }
 
 /// GTDB-Tk compares a placed genome that has ANI hits with every reference,
@@ -1131,7 +1383,16 @@ fn marker_summary_row(
             row.classification = Some(placement.classification.clone());
             row.pplacer_taxonomy = Some(placement.pplacer_taxonomy.clone());
             row.red_value = Some(placement.red_value);
-            row.classification_method = Some(placement.method.into());
+            row.note = placement.note.map(Into::into);
+            row.warnings.extend(placement.warning.map(Into::into));
+            let Some(method) = placement.method else {
+                // GTDB-Tk reports genomes the backbone tree alone classified
+                // on a fresh row, without ANI details.
+                row.other_related_references = None;
+                row.warnings = markers.warnings.clone();
+                return (markers.marker_set, row);
+            };
+            row.classification_method = Some(method.into());
             // GTDB-Tk reports the placement reference for genomes with ANI hits.
             if ani::reportable(hits).next().is_some() {
                 row.classification_method =

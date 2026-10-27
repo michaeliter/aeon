@@ -2,7 +2,8 @@
 //! relative evolutionary divergence (RED) turns the placement into a
 //! taxonomy, ported from GTDB-Tk 2.8's `classify.py` (`_assign_mrca_red`,
 //! `_get_pplacer_taxonomy`, `_get_pplacer_reference`,
-//! `_classify_red_topology` and `_get_redtax`).
+//! `_classify_red_topology` and `_get_redtax`). Split-tree reconciliation
+//! lives in `split.rs`.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -136,25 +137,25 @@ impl Tree {
         }
     }
 
-    fn is_leaf(&self, node: usize) -> bool {
+    pub(super) fn is_leaf(&self, node: usize) -> bool {
         self.nodes[node].children.is_empty()
     }
 
-    fn label(&self, node: usize) -> Option<&str> {
+    pub(super) fn label(&self, node: usize) -> Option<&str> {
         self.nodes[node].label.as_deref()
     }
 
-    fn parent(&self, node: usize) -> Option<usize> {
+    pub(super) fn parent(&self, node: usize) -> Option<usize> {
         self.nodes[node].parent
     }
 
     /// Subtree of `node` in preorder (including `node`).
-    fn subtree(&self, node: usize) -> &[usize] {
+    pub(super) fn subtree(&self, node: usize) -> &[usize] {
         &self.preorder[self.position[node]..self.subtree_end[node]]
     }
 
     /// Leaves under `node`, left to right.
-    fn leaves_under(&self, node: usize) -> impl Iterator<Item = usize> + '_ {
+    pub(super) fn leaves_under(&self, node: usize) -> impl Iterator<Item = usize> + '_ {
         self.subtree(node)
             .iter()
             .copied()
@@ -206,7 +207,7 @@ fn parse_label(label: Option<&str>) -> (Option<f64>, Option<String>) {
 
 /// An internal node's taxon decoration; dendropy keeps leaf names apart
 /// from labels, so leaves have none.
-fn taxon_of(tree: &Tree, node: usize) -> Option<String> {
+pub(super) fn taxon_of(tree: &Tree, node: usize) -> Option<String> {
     if tree.is_leaf(node) {
         return None;
     }
@@ -214,15 +215,15 @@ fn taxon_of(tree: &Tree, node: usize) -> Option<String> {
 }
 
 /// Ranks of a decoration such as `p__X;c__Y`, trimmed.
-fn split_taxa(taxon: &str) -> Vec<String> {
+pub(super) fn split_taxa(taxon: &str) -> Vec<String> {
     taxon.split(';').map(|t| t.trim().to_owned()).collect()
 }
 
-fn rank_prefix(taxon: &str) -> &str {
+pub(super) fn rank_prefix(taxon: &str) -> &str {
     taxon.get(..3).unwrap_or(taxon)
 }
 
-fn rank_index(prefix: &str) -> Option<usize> {
+pub(super) fn rank_index(prefix: &str) -> Option<usize> {
     RANK_PREFIXES.iter().position(|rank| *rank == prefix)
 }
 
@@ -358,9 +359,69 @@ pub(crate) struct Placement {
     pub(crate) pplacer_taxonomy: String,
     pub(crate) classification: String,
     pub(crate) red_value: f64,
-    pub(crate) method: &'static str,
+    /// `None` for genomes classified from the backbone tree alone, which
+    /// GTDB-Tk reports without a method.
+    pub(crate) method: Option<&'static str>,
     /// The single reference genome nearest the placement, as labelled in the tree.
     pub(crate) reference: Option<String>,
+    /// Split-tree note and warning (`classification based on placement in ...`).
+    pub(crate) note: Option<&'static str>,
+    pub(crate) warning: Option<&'static str>,
+}
+
+/// A pplacer tree with RED on its reference and placement nodes.
+pub(super) struct PlacedTree {
+    pub(super) tree: Tree,
+    pub(super) red: Vec<Option<f64>>,
+    /// Leaves that are GTDB references rather than user genomes.
+    pub(super) is_reference: Vec<bool>,
+}
+
+impl PlacedTree {
+    pub(super) fn load(
+        tree_path: &Path,
+        mrca_red: &Path,
+        users: &HashSet<String>,
+        data: &GtdbtkData,
+    ) -> Result<Self, Box<dyn Error>> {
+        let tree = Tree::parse(&fs::read_to_string(tree_path)?)?;
+        let red = assign_mrca_red(&tree, mrca_red)?;
+        let is_reference = (0..tree.nodes.len())
+            .map(|node| {
+                tree.is_leaf(node)
+                    && tree.label(node).is_some_and(|label| {
+                        !users.contains(label)
+                            && data.taxonomy_of(&label.replace('\'', "")).is_some()
+                    })
+            })
+            .collect();
+        Ok(Self {
+            tree,
+            red,
+            is_reference,
+        })
+    }
+
+    /// Placed user genomes, left to right.
+    pub(super) fn user_leaves<'a>(
+        &'a self,
+        users: &'a HashSet<String>,
+    ) -> impl Iterator<Item = (usize, &'a str)> + 'a {
+        self.tree.leaves().filter_map(move |leaf| {
+            self.tree
+                .label(leaf)
+                .filter(|label| users.contains(*label))
+                .map(|label| (leaf, label))
+        })
+    }
+
+    /// Reference leaves under `node`.
+    pub(super) fn references_under(&self, node: usize) -> Vec<usize> {
+        self.tree
+            .leaves_under(node)
+            .filter(|&n| self.is_reference[n])
+            .collect()
+    }
 }
 
 const NOVELTY: &str = "taxonomic novelty determined using RED";
@@ -375,34 +436,31 @@ pub(crate) fn classify_tree(
     data: &GtdbtkData,
     red_dict: &HashMap<String, f64>,
 ) -> Result<BTreeMap<String, Placement>, Box<dyn Error>> {
-    let tree = Tree::parse(&fs::read_to_string(tree_path)?)?;
-    let red = assign_mrca_red(&tree, mrca_red)?;
-    let is_reference = (0..tree.nodes.len())
-        .map(|node| {
-            tree.is_leaf(node)
-                && tree.label(node).is_some_and(|label| {
-                    !users.contains(label) && data.taxonomy_of(&label.replace('\'', "")).is_some()
-                })
-        })
-        .collect::<Vec<_>>();
-    let references = pplacer_references(&tree, &is_reference);
+    let placed = PlacedTree::load(tree_path, mrca_red, users, data)?;
+    let tree = &placed.tree;
+    let references = pplacer_references(tree, &placed.is_reference);
     let mut placements = BTreeMap::new();
-    for leaf in tree.leaves() {
-        let Some(label) = tree.label(leaf).filter(|label| users.contains(*label)) else {
-            continue;
-        };
-        let (classification, red_value, method) =
-            classify_red_topology(&tree, leaf, &red, &is_reference, data, red_dict)?;
+    for (leaf, label) in placed.user_leaves(users) {
+        let (classification, red_value, method) = classify_red_topology(
+            tree,
+            leaf,
+            &placed.red,
+            &placed.is_reference,
+            data,
+            red_dict,
+        )?;
         placements.insert(
             label.to_owned(),
             Placement {
-                pplacer_taxonomy: pplacer_taxonomy(&tree, leaf, marker_set),
+                pplacer_taxonomy: pplacer_taxonomy(tree, leaf, marker_set),
                 classification,
                 red_value,
-                method,
+                method: Some(method),
                 reference: references
                     .get(&leaf)
                     .and_then(|&node| tree.label(node).map(str::to_owned)),
+                note: None,
+                warning: None,
             },
         );
     }
