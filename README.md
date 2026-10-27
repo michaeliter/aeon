@@ -12,6 +12,8 @@ Aeon is a dynamic genome similarity search platform built on mmap-backed DiskANN
 
 ## Install
 
+Aeon requires nightly Rust because the `stdsimd` features of its dependencies use `portable_simd`. The included `rust-toolchain.toml` selects nightly automatically (install it with `rustup toolchain install nightly`).
+
 ```bash
 git clone https://github.com/jianshu93/aeon
 cd aeon

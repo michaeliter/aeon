@@ -1,0 +1,13 @@
+# External tools used by `aeon classify`.
+# Create with: conda env create -f environment.yml && conda activate aeon-classify
+name: aeon-classify
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - pyrodigal>=3.6
+  - diamond>=2.1
+  - hmmer>=3.4
+  - pplacer>=1.1.alpha19
+  # Only needed to validate aeon classify against GTDB-Tk.
+  - gtdbtk=2.8.0
