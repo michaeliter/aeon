@@ -255,14 +255,9 @@ pub(crate) fn search_database(
         beam
     );
     let vectors = sketch_from_params(&queries, &params);
-    let index = DiskANN::<u16, DistHamming>::open_index_with(&index_path(prefix), DistHamming)?;
-    if index.num_vectors != references.len() {
-        return Err("index and genome mapping have different lengths".into());
-    }
-    let hits = vectors
-        .par_iter()
+    let hits = search_vectors(prefix, references.len(), &vectors, k, beam)?
+        .into_iter()
         .enumerate()
-        .map(|(query, vector)| (query, index.search_with_dists(vector, k, beam)))
         .collect::<Vec<_>>();
     let output: Box<dyn Write> = match output_path {
         Some(path) => Box::new(BufWriter::new(File::create(path)?)),
@@ -282,6 +277,25 @@ pub(crate) fn search_database(
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// Search sketch vectors against the static index at `prefix`, returning the
+/// ranked `(vector_id, distance)` neighbors of each vector in input order.
+pub(crate) fn search_vectors(
+    prefix: &str,
+    reference_count: usize,
+    vectors: &[Vec<u16>],
+    k: usize,
+    beam: usize,
+) -> Result<Vec<Vec<(u32, f32)>>, Box<dyn Error>> {
+    let index = DiskANN::<u16, DistHamming>::open_index_with(&index_path(prefix), DistHamming)?;
+    if index.num_vectors != reference_count {
+        return Err("index and genome mapping have different lengths".into());
+    }
+    Ok(vectors
+        .par_iter()
+        .map(|vector| index.search_with_dists(vector, k, beam))
+        .collect())
 }
 
 fn resolve_delete_ids(genomes: &[String], names: &[String]) -> Result<Vec<u32>, Box<dyn Error>> {
@@ -391,7 +405,7 @@ fn write_search_results(
 
 /// Estimate nucleotide ANI from a MinHash-style Jaccard estimate using Mash's
 /// k-mer survival model.
-fn ani_from_jaccard(jaccard: f32, kmer_size: usize) -> f32 {
+pub(crate) fn ani_from_jaccard(jaccard: f32, kmer_size: usize) -> f32 {
     if kmer_size == 0 {
         return 0.0;
     }

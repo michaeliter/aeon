@@ -1,3 +1,4 @@
+mod classify;
 mod database;
 mod metadata;
 mod sketch;
