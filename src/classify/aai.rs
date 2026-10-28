@@ -45,6 +45,9 @@ struct ProteinHit {
     bitscore: f64,
 }
 
+/// Tagged protein ID ("{genome}|{index}") -> residues.
+type Proteins = HashMap<String, Vec<u8>>;
+
 /// AAI between each query proteome and its candidate reference proteomes,
 /// sorted by descending AAI. Each query is searched against its own
 /// candidates only, so small DIAMOND jobs run side by side with a few
@@ -64,24 +67,27 @@ pub(crate) fn compute_aai(
         .len()
         .clamp(1, (threads / THREADS_PER_JOB).max(1));
     let pool = rayon::ThreadPoolBuilder::new().num_threads(jobs).build()?;
-    let job_threads = threads.div_ceil(jobs);
     pool.install(|| {
         query_proteomes
             .par_iter()
             .zip(candidates)
             .enumerate()
             .map(|(query, (proteome, references))| {
+                // Workers split the threads evenly, the first few taking the
+                // remainder.
+                let worker = rayon::current_thread_index().unwrap_or(0);
+                let job_threads = threads / jobs + usize::from(worker < threads % jobs);
                 let dir = work_dir.join(format!("query_{query}"));
-                query_aai(
+                let result = query_aai(
                     diamond,
                     &dir,
                     proteome,
                     references,
                     reference_proteomes,
                     job_threads,
-                )
-                .map_err(|error| {
-                    let _ = fs::remove_dir_all(&dir);
+                );
+                let _ = fs::remove_dir_all(&dir);
+                result.map_err(|error| {
                     format!("AAI search for {} failed: {error}", proteome.display())
                 })
             })
@@ -110,12 +116,12 @@ fn query_aai(
     // references keep their database IDs.
     let query_fasta = dir.join("query.faa");
     let reference_fasta = dir.join("references.faa");
-    let query_lengths = write_tagged_proteins(&[(QUERY, proteome.to_path_buf())], &query_fasta)?;
+    let query_proteins = write_tagged_proteins(&[(QUERY, proteome)], &query_fasta)?;
     let reference_files = references
         .iter()
-        .map(|&id| (id, reference_proteomes[id as usize].clone().into()))
+        .map(|&id| (id, Path::new(&reference_proteomes[id as usize])))
         .collect::<Vec<_>>();
-    let reference_lengths = write_tagged_proteins(&reference_files, &reference_fasta)?;
+    let reference_proteins = write_tagged_proteins(&reference_files, &reference_fasta)?;
     let forward = blastp(
         diamond,
         dir,
@@ -123,21 +129,21 @@ fn query_aai(
         &query_fasta,
         &reference_fasta,
         threads,
-        &query_lengths,
-        &reference_lengths,
+        &query_proteins,
+        &reference_proteins,
     )?;
+    let forward_best = best_hits(&forward);
     // Reciprocity only needs the reverse best hits of reference proteins that
     // are some query protein's best hit, so only those are searched back.
-    let best_subjects = best_hits(&forward)
-        .into_values()
+    let best_subjects = forward_best
+        .values()
         .map(|hit| hit.subject.as_str())
         .collect::<HashSet<_>>();
     if best_subjects.is_empty() {
-        fs::remove_dir_all(dir)?;
         return Ok(Vec::new());
     }
     let reverse_fasta = dir.join("best_hits.faa");
-    write_selected_proteins(&reference_fasta, &best_subjects, &reverse_fasta)?;
+    write_selected_proteins(&reference_proteins, &best_subjects, &reverse_fasta)?;
     let reverse = blastp(
         diamond,
         dir,
@@ -145,20 +151,18 @@ fn query_aai(
         &reverse_fasta,
         &query_fasta,
         threads,
-        &reference_lengths,
-        &query_lengths,
+        &reference_proteins,
+        &query_proteins,
     )?;
-    let pairs = reciprocal_aai(&forward, &reverse);
+    let pairs = reciprocal_aai(&forward_best, &reverse);
     let mut hits = references
         .into_iter()
         .filter_map(|reference| {
-            pairs
-                .get(&(QUERY, reference))
-                .map(|&(aai, reciprocal_hits)| AaiHit {
-                    reference,
-                    aai,
-                    reciprocal_hits,
-                })
+            pairs.get(&reference).map(|&(aai, reciprocal_hits)| AaiHit {
+                reference,
+                aai,
+                reciprocal_hits,
+            })
         })
         .collect::<Vec<_>>();
     hits.sort_by(|left, right| {
@@ -168,19 +172,18 @@ fn query_aai(
             .then(right.reciprocal_hits.cmp(&left.reciprocal_hits))
             .then(left.reference.cmp(&right.reference))
     });
-    fs::remove_dir_all(dir)?;
     Ok(hits)
 }
 
 /// Concatenate proteomes with `{genome}|{index}` IDs, dropping stop codons.
-/// Returns protein lengths by tagged ID.
+/// Returns the written proteins.
 fn write_tagged_proteins(
-    proteomes: &[(u32, std::path::PathBuf)],
+    proteomes: &[(u32, &Path)],
     output: &Path,
-) -> Result<HashMap<String, usize>, Box<dyn Error>> {
+) -> Result<Proteins, Box<dyn Error>> {
     let mut writer = BufWriter::new(File::create(output)?);
-    let mut lengths = HashMap::new();
-    for (genome, path) in proteomes {
+    let mut proteins = HashMap::new();
+    for &(genome, path) in proteomes {
         let mut reader = parse_fastx_file(path)
             .map_err(|error| format!("invalid protein FASTA {}: {error}", path.display()))?;
         let mut index = 0usize;
@@ -197,37 +200,39 @@ fn write_tagged_proteins(
             }
             let id = format!("{genome}|{index}");
             index += 1;
-            writeln!(writer, ">{id}")?;
-            writer.write_all(&sequence)?;
-            writer.write_all(b"\n")?;
-            lengths.insert(id, sequence.len());
+            write_record(&mut writer, &id, &sequence)?;
+            proteins.insert(id, sequence);
         }
     }
     writer.flush()?;
-    Ok(lengths)
+    Ok(proteins)
 }
 
-/// Copy the proteins named in `ids` from a tagged FASTA file.
+/// Write the proteins named in `ids`, in ID order.
 fn write_selected_proteins(
-    input: &Path,
+    proteins: &Proteins,
     ids: &HashSet<&str>,
     output: &Path,
 ) -> Result<(), Box<dyn Error>> {
     let mut writer = BufWriter::new(File::create(output)?);
-    let mut reader = parse_fastx_file(input)?;
-    while let Some(record) = reader.next() {
-        let record = record?;
-        let id = String::from_utf8_lossy(record.id());
-        if ids.contains(id.as_ref()) {
-            writeln!(writer, ">{id}")?;
-            writer.write_all(&record.seq())?;
-            writer.write_all(b"\n")?;
-        }
+    let mut ids = ids.iter().copied().collect::<Vec<_>>();
+    ids.sort_unstable();
+    for id in ids {
+        write_record(&mut writer, id, &proteins[id])?;
     }
     writer.flush()?;
     Ok(())
 }
 
+fn write_record(writer: &mut impl Write, id: &str, sequence: &[u8]) -> std::io::Result<()> {
+    writeln!(writer, ">{id}")?;
+    writer.write_all(sequence)?;
+    writer.write_all(b"\n")
+}
+
+/// DIAMOND blastp of `queries` against the FASTA `subjects` (DIAMOND builds
+/// the database in memory), keeping hits that cover `MIN_ALIGNED_FRACTION`
+/// of the shorter protein.
 #[allow(clippy::too_many_arguments)]
 fn blastp(
     diamond: &Path,
@@ -236,22 +241,10 @@ fn blastp(
     queries: &Path,
     subjects: &Path,
     threads: usize,
-    query_lengths: &HashMap<String, usize>,
-    subject_lengths: &HashMap<String, usize>,
+    query_proteins: &Proteins,
+    subject_proteins: &Proteins,
 ) -> Result<Vec<ProteinHit>, Box<dyn Error>> {
-    let database = dir.join(format!("{name}.dmnd"));
     let output = dir.join(format!("{name}.tsv"));
-    run(Command::new(diamond)
-        .args([
-            "makedb",
-            "--quiet",
-            "--threads",
-            &threads.to_string(),
-            "--in",
-        ])
-        .arg(subjects)
-        .arg("-d")
-        .arg(&database))?;
     run(Command::new(diamond)
         .args(["blastp", "--quiet", "--threads", &threads.to_string()])
         .args(["--id", &MIN_IDENTITY.to_string()])
@@ -264,9 +257,10 @@ fn blastp(
         .arg("-q")
         .arg(queries)
         .arg("-d")
-        .arg(&database)
+        .arg(subjects)
         .arg("-o")
         .arg(&output))?;
+    let length = |proteins: &Proteins, id: &str| proteins.get(id).map_or(0, Vec::len);
     let mut hits = Vec::new();
     for line in BufReader::new(File::open(&output)?).lines() {
         let line = line?;
@@ -274,11 +268,7 @@ fn blastp(
         if fields.len() < 5 {
             continue;
         }
-        let shorter = query_lengths
-            .get(fields[0])
-            .copied()
-            .unwrap_or(0)
-            .min(subject_lengths.get(fields[1]).copied().unwrap_or(0));
+        let shorter = length(query_proteins, fields[0]).min(length(subject_proteins, fields[1]));
         let aligned: usize = fields[3].parse()?;
         if shorter == 0 || (aligned as f64) < MIN_ALIGNED_FRACTION * shorter as f64 {
             continue;
@@ -315,26 +305,26 @@ fn best_hits(hits: &[ProteinHit]) -> HashMap<(&str, u32), &ProteinHit> {
     best
 }
 
-/// Mean identity and count of reciprocal best hits per (query, reference).
+/// Mean identity and count of reciprocal best hits per reference, from the
+/// query's forward best hits and the reverse search.
 fn reciprocal_aai(
-    forward: &[ProteinHit],
+    forward_best: &HashMap<(&str, u32), &ProteinHit>,
     reverse: &[ProteinHit],
-) -> HashMap<(u32, u32), (f64, usize)> {
+) -> HashMap<u32, (f64, usize)> {
     let reverse_best = best_hits(reverse);
-    let mut sums: HashMap<(u32, u32), (f64, usize)> = HashMap::new();
-    for ((query_protein, reference), hit) in best_hits(forward) {
-        let query = genome_of(query_protein);
+    let mut sums: HashMap<u32, (f64, usize)> = HashMap::new();
+    for (&(query_protein, reference), hit) in forward_best {
         let reciprocal = reverse_best
-            .get(&(hit.subject.as_str(), query))
+            .get(&(hit.subject.as_str(), genome_of(query_protein)))
             .is_some_and(|back| back.subject == query_protein);
         if reciprocal {
-            let entry = sums.entry((query, reference)).or_default();
+            let entry = sums.entry(reference).or_default();
             entry.0 += hit.identity;
             entry.1 += 1;
         }
     }
     sums.into_iter()
-        .map(|(pair, (sum, count))| (pair, (sum / count as f64, count)))
+        .map(|(reference, (sum, count))| (reference, (sum / count as f64, count)))
         .collect()
 }
 
@@ -421,24 +411,24 @@ mod tests {
             hit("7|1", "0|1", 70.0, 250.0),
             hit("7|2", "0|1", 40.0, 150.0),
         ];
-        let pairs = reciprocal_aai(&forward, &reverse);
-        assert_eq!(pairs[&(0, 7)], (75.0, 2));
+        let pairs = reciprocal_aai(&best_hits(&forward), &reverse);
+        assert_eq!(pairs[&7], (75.0, 2));
     }
 
     #[test]
     fn selected_proteins_keep_tagged_ids() {
-        let dir = std::env::temp_dir().join(format!("aeon_aai_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aeon-aai-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let proteome = dir.join("ref.faa");
         fs::write(&proteome, ">a\nMKV*\n>b\n*\n>c\nMLL\n").unwrap();
         let tagged = dir.join("tagged.faa");
-        let lengths = write_tagged_proteins(&[(7, proteome)], &tagged).unwrap();
+        let proteins = write_tagged_proteins(&[(7, &proteome)], &tagged).unwrap();
         assert_eq!(
-            lengths,
-            HashMap::from([("7|0".into(), 3), ("7|1".into(), 3)])
+            fs::read_to_string(&tagged).unwrap(),
+            ">7|0\nMKV\n>7|1\nMLL\n"
         );
         let selected = dir.join("selected.faa");
-        write_selected_proteins(&tagged, &HashSet::from(["7|1"]), &selected).unwrap();
+        write_selected_proteins(&proteins, &HashSet::from(["7|1"]), &selected).unwrap();
         assert_eq!(fs::read_to_string(&selected).unwrap(), ">7|1\nMLL\n");
         fs::remove_dir_all(dir).unwrap();
     }

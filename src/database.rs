@@ -17,11 +17,10 @@ use crate::utils::{read_list_file, write_genome_list, write_idmap_tsv};
 
 pub(crate) fn build_database(
     prefix: &str,
-    reference_list: &str,
+    genomes: &[String],
     params: PrefixParams,
 ) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
-    let genomes = read_list_file(reference_list)?;
     if genomes.is_empty() {
         return Err("reference list is empty".into());
     }
@@ -37,7 +36,7 @@ pub(crate) fn build_database(
         params.build_beam_width
     );
     let mut unique = HashSet::with_capacity(genomes.len());
-    for genome in &genomes {
+    for genome in genomes {
         if !unique.insert(genome.as_str()) {
             return Err(format!("reference list contains duplicate path: {genome}").into());
         }

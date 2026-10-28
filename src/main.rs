@@ -532,7 +532,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     match command {
         "todisk" => build_database(
             args.get_one::<String>("prefix").unwrap(),
-            args.get_one::<String>("reference_list").unwrap(),
+            &read_list_file(args.get_one::<String>("reference_list").unwrap())?,
             PrefixParams {
                 kmer_size: *args.get_one("kmer_size").unwrap(),
                 sketch_size: *args.get_one("sketch_size").unwrap(),

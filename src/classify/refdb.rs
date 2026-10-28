@@ -16,7 +16,7 @@ use crate::classify::refdata::{
 };
 use crate::database::build_database;
 use crate::metadata::{PrefixParams, genomes_path, load_params};
-use crate::utils::{read_list_file, write_genome_list};
+use crate::utils::read_list_file;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -150,7 +150,10 @@ pub(crate) fn build_classify_db(
         return Err("reference genome list is empty".into());
     }
     let (data, gtdbtk_data) = match source {
-        TaxonomySource::GtdbtkPackage(root) => (GtdbtkData::load(&root)?, Some(root)),
+        TaxonomySource::GtdbtkPackage(root) => {
+            let root = std::path::absolute(root)?.to_string_lossy().into_owned();
+            (GtdbtkData::load(&root)?, Some(root))
+        }
         TaxonomySource::ReleaseFiles {
             release,
             taxonomy,
@@ -182,13 +185,10 @@ pub(crate) fn build_classify_db(
         .collect::<Vec<_>>();
     check_references(&accessions, &data)?;
 
-    let db = Path::new(db_dir);
+    let db = &std::path::absolute(db_dir)?;
     fs::create_dir_all(db)?;
     write_reference_tables(db, &accessions, &data)?;
-    let list = db.join("nt_genomes.txt");
-    write_genome_list(&list.to_string_lossy(), &genomes)?;
-    build_database(&nt_prefix(db), &list.to_string_lossy(), nt_params)?;
-    fs::remove_file(list)?;
+    build_database(&nt_prefix(db), &genomes, nt_params)?;
     let proteomes = match proteins {
         ProteinSource::None => None,
         ProteinSource::List(list) => Some(match_proteomes(
@@ -200,14 +200,7 @@ pub(crate) fn build_classify_db(
         }
     };
     if let Some(proteomes) = &proteomes {
-        let list = db.join("aa_proteomes.txt");
-        write_genome_list(&list.to_string_lossy(), proteomes)?;
-        build_database(
-            &db.join(AA_PREFIX).to_string_lossy(),
-            &list.to_string_lossy(),
-            aa_params,
-        )?;
-        fs::remove_file(list)?;
+        build_database(&db.join(AA_PREFIX).to_string_lossy(), proteomes, aa_params)?;
     }
     let manifest = Manifest {
         aeon_version: env!("CARGO_PKG_VERSION").into(),
@@ -229,8 +222,8 @@ pub(crate) fn build_classify_db(
     Ok(())
 }
 
-/// Reference paths are stored in the database, so they must not depend on
-/// the directory classify runs from.
+/// Paths stored in the database must not depend on the directory classify
+/// runs from.
 fn absolute_paths(paths: Vec<String>) -> Result<Vec<String>, Box<dyn Error>> {
     paths
         .into_iter()
@@ -266,7 +259,7 @@ fn call_reference_genes(
     db: &Path,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let started = Instant::now();
-    let protein_dir = std::path::absolute(db.join(PROTEIN_DIR))?;
+    let protein_dir = db.join(PROTEIN_DIR);
     let done = AtomicUsize::new(0);
     let proteomes = genomes
         .par_iter()
