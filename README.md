@@ -145,7 +145,7 @@ Search options:
 
 `aeon classify` assigns GTDB taxonomy and writes GTDB-Tk 2.8 `classify_wf` outputs: `{prefix}.bac120.summary.tsv`, `{prefix}.ar53.summary.tsv`, and the `identify/`, `align/` and `classify/` directories with the same file names and columns. Each genome stops at the first tier that resolves it:
 
-1. **ANI.** DiskANN sketch search proposes `--candidates` GTDB representatives and TurboANI computes their exact ANI and AF. A genome within the closest AF-passing reference's species radius gets that species, as in the GTDB-Tk ANI screen. If at least `--genus-ani` ANI to a strict majority of AF-passing references in one genus, it gets that genus.
+1. **ANI.** DiskANN sketch search proposes `--candidates` GTDB representatives and TurboANI computes their exact ANI and AF. A genome within the closest AF-passing reference's species radius gets that species, as in the GTDB-Tk ANI screen. A genome with at least `--genus-ani` ANI and `--min_af` AF to a strict majority of references in one genus gets that genus.
 2. **AAI.** pyrodigal calls genes (run as a separate program, translation table 11 or 4 as in GTDB-Tk). Protein sketch search proposes candidate reference proteomes, and DIAMOND reciprocal best hits (≥30% identity, ≥70% of the shorter protein) give AAI. The best hit's genus (`--genus-aai`), or else its family (`--family-aai`), is assigned when it is the strict majority among the `--aai-top` closest references above that threshold.
 3. **Markers.** The remaining genomes go through GTDB-Tk's pipeline, ported natively:
    - hmmsearch against the bac120/ar53 markers, with the same copy-number and domain calls;

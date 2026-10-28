@@ -145,7 +145,7 @@ pub(crate) fn build_classify_db(
     aa_params: PrefixParams,
 ) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
-    let genomes = read_list_file(genome_list)?;
+    let genomes = absolute_paths(read_list_file(genome_list)?)?;
     if genomes.is_empty() {
         return Err("reference genome list is empty".into());
     }
@@ -185,10 +185,16 @@ pub(crate) fn build_classify_db(
     let db = Path::new(db_dir);
     fs::create_dir_all(db)?;
     write_reference_tables(db, &accessions, &data)?;
-    build_database(&nt_prefix(db), genome_list, nt_params)?;
+    let list = db.join("nt_genomes.txt");
+    write_genome_list(&list.to_string_lossy(), &genomes)?;
+    build_database(&nt_prefix(db), &list.to_string_lossy(), nt_params)?;
+    fs::remove_file(list)?;
     let proteomes = match proteins {
         ProteinSource::None => None,
-        ProteinSource::List(list) => Some(match_proteomes(&accessions, &read_list_file(&list)?)?),
+        ProteinSource::List(list) => Some(match_proteomes(
+            &accessions,
+            &absolute_paths(read_list_file(&list)?)?,
+        )?),
         ProteinSource::CallGenes(pyrodigal) => {
             Some(call_reference_genes(&pyrodigal, &genomes, &accessions, db)?)
         }
@@ -223,6 +229,15 @@ pub(crate) fn build_classify_db(
     Ok(())
 }
 
+/// Reference paths are stored in the database, so they must not depend on
+/// the directory classify runs from.
+fn absolute_paths(paths: Vec<String>) -> Result<Vec<String>, Box<dyn Error>> {
+    paths
+        .into_iter()
+        .map(|path| Ok(std::path::absolute(&path)?.to_string_lossy().into_owned()))
+        .collect()
+}
+
 /// Order proteome files to match the reference genomes by accession.
 fn match_proteomes(
     accessions: &[String],
@@ -251,7 +266,6 @@ fn call_reference_genes(
     db: &Path,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let started = Instant::now();
-    // The protein list must not depend on the directory classify runs from.
     let protein_dir = std::path::absolute(db.join(PROTEIN_DIR))?;
     let done = AtomicUsize::new(0);
     let proteomes = genomes

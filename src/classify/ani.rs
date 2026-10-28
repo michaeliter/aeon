@@ -181,7 +181,7 @@ pub(crate) enum AniDecision {
 /// Apply GTDB-Tk 2.8's ANI screen to sorted hits: only the closest hit with
 /// `af >= min_af` is checked against its own radius. Failing that, assign the
 /// best hit's genus when it is also the strict-majority genus among hits with
-/// ANI at or above `genus_ani`.
+/// ANI at or above `genus_ani` and `af >= min_af`.
 pub(crate) fn decide(
     hits: &[AniHit],
     accessions: &[String],

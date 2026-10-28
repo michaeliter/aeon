@@ -382,7 +382,7 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("classify")
                 .about("Classify genomes against GTDB with GTDB-Tk-compatible output")
-                .long_about("Classify genomes in a cascade. DiskANN sketch search proposes the closest GTDB representatives and TurboANI computes their exact ANI. A genome within the closest reference's ANI radius (AF >= --min_af) receives that species, as in the GTDB-Tk ANI screen; one at or above --genus-ani to a strict majority of one genus receives that genus. Remaining genomes have genes called with pyrodigal; protein sketch search proposes candidate reference proteomes and DIAMOND reciprocal best hits give AAI, assigning a genus (--genus-aai) or family (--family-aai) by majority among the --aai-top closest references. Genomes still unresolved go through GTDB-Tk's marker pipeline: hmmsearch finds the bac120/ar53 markers, the copy-number profile picks the domain, hmmalign builds the masked concatenated alignment, and pplacer places it in the GTDB reference tree (bacteria in the backbone tree, then a class-level tree, unless --full_tree), where RED and topology decide the rank. This tier requires a classify-db built from a GTDB-Tk data package. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, classify/, and {prefix}.log.")
+                .long_about("Classify genomes in a cascade. DiskANN sketch search proposes the closest GTDB representatives and TurboANI computes their exact ANI. A genome within the closest reference's ANI radius (AF >= --min_af) receives that species, as in the GTDB-Tk ANI screen; one at or above --genus-ani (with AF >= --min_af) to a strict majority of one genus receives that genus. Remaining genomes have genes called with pyrodigal; protein sketch search proposes candidate reference proteomes and DIAMOND reciprocal best hits give AAI, assigning a genus (--genus-aai) or family (--family-aai) by majority among the --aai-top closest references. Genomes still unresolved go through GTDB-Tk's marker pipeline: hmmsearch finds the bac120/ar53 markers, the copy-number profile picks the domain, hmmalign builds the masked concatenated alignment, and pplacer places it in the GTDB reference tree (bacteria in the backbone tree, then a class-level tree, unless --full_tree), where RED and topology decide the rank. This tier requires a classify-db built from a GTDB-Tk data package. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, classify/, and {prefix}.log.")
                 .arg(
                     Arg::new("db")
                         .long("db")
@@ -435,7 +435,7 @@ fn build_cli() -> Command {
                         .default_value("0.5")
                         .value_name("FLOAT")
                         .value_parser(clap::value_parser!(f64))
-                        .help("Minimum alignment fraction for a species assignment"),
+                        .help("Minimum alignment fraction for a hit to count toward a species or ANI genus assignment"),
                 )
                 .arg(
                     Arg::new("genus_ani")
@@ -443,7 +443,7 @@ fn build_cli() -> Command {
                         .default_value("80")
                         .value_name("PERCENT")
                         .value_parser(clap::value_parser!(f64))
-                        .help("ANI needed for genus consensus; more distant genomes are left for the AAI tier"),
+                        .help("ANI needed for genus consensus among hits passing --min_af; other genomes are left for the AAI tier"),
                 )
                 .arg(
                     Arg::new("genus_aai")

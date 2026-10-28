@@ -17,6 +17,9 @@ use crate::classify::refdata::GtdbtkData;
 
 /// DIAMOND threads per query job; small searches scale poorly past a few.
 const THREADS_PER_JOB: usize = 2;
+/// Fixed DIAMOND database size (letters), roughly ten candidate proteomes, so
+/// e-values do not depend on how many references a query was searched against.
+const DBSIZE: &str = "10000000";
 /// Genome tag of the query's proteins, distinct from every reference ID.
 const QUERY: u32 = u32::MAX;
 /// Reciprocal best hits must reach this identity (%) ...
@@ -54,28 +57,33 @@ pub(crate) fn compute_aai(
     reference_proteomes: &[String],
     threads: usize,
 ) -> Result<Vec<Vec<AaiHit>>, Box<dyn Error>> {
+    assert_eq!(query_proteomes.len(), candidates.len());
     fs::create_dir_all(work_dir)?;
     let threads = threads.max(1);
     let jobs = query_proteomes
         .len()
-        .clamp(1, threads.div_ceil(THREADS_PER_JOB));
+        .clamp(1, (threads / THREADS_PER_JOB).max(1));
     let pool = rayon::ThreadPoolBuilder::new().num_threads(jobs).build()?;
-    let job_threads = (threads / jobs).max(1);
+    let job_threads = threads.div_ceil(jobs);
     pool.install(|| {
         query_proteomes
             .par_iter()
             .zip(candidates)
             .enumerate()
             .map(|(query, (proteome, references))| {
+                let dir = work_dir.join(format!("query_{query}"));
                 query_aai(
                     diamond,
-                    &work_dir.join(format!("query_{query}")),
+                    &dir,
                     proteome,
                     references,
                     reference_proteomes,
                     job_threads,
                 )
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    let _ = fs::remove_dir_all(&dir);
+                    format!("AAI search for {} failed: {error}", proteome.display())
+                })
             })
             .collect::<Result<Vec<_>, _>>()
     })
@@ -247,6 +255,7 @@ fn blastp(
     run(Command::new(diamond)
         .args(["blastp", "--quiet", "--threads", &threads.to_string()])
         .args(["--id", &MIN_IDENTITY.to_string()])
+        .args(["--dbsize", DBSIZE])
         // Report every subject: best hits are needed per subject genome.
         .args(["--max-target-seqs", "0"])
         .args([
@@ -417,6 +426,24 @@ mod tests {
     }
 
     #[test]
+    fn selected_proteins_keep_tagged_ids() {
+        let dir = std::env::temp_dir().join(format!("aeon_aai_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let proteome = dir.join("ref.faa");
+        fs::write(&proteome, ">a\nMKV*\n>b\n*\n>c\nMLL\n").unwrap();
+        let tagged = dir.join("tagged.faa");
+        let lengths = write_tagged_proteins(&[(7, proteome)], &tagged).unwrap();
+        assert_eq!(
+            lengths,
+            HashMap::from([("7|0".into(), 3), ("7|1".into(), 3)])
+        );
+        let selected = dir.join("selected.faa");
+        write_selected_proteins(&tagged, &HashSet::from(["7|1"]), &selected).unwrap();
+        assert_eq!(fs::read_to_string(&selected).unwrap(), ">7|1\nMLL\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn rank_consensus_falls_back_to_family() {
         let mut data = GtdbtkData::default();
         let taxa = [
@@ -441,11 +468,11 @@ mod tests {
         };
         assert_eq!(
             decide(
-                &[aai(0, 70.0), aai(0, 66.0), aai(1, 60.0)],
+                &[aai(0, 80.0), aai(0, 76.0), aai(1, 70.0)],
                 &accessions,
                 &data,
+                75.0,
                 65.0,
-                52.0,
                 10
             ),
             AaiDecision::Genus {
@@ -456,11 +483,11 @@ mod tests {
         );
         assert_eq!(
             decide(
-                &[aai(0, 66.0), aai(1, 65.5), aai(2, 55.0)],
+                &[aai(0, 74.0), aai(1, 70.0), aai(2, 66.0)],
                 &accessions,
                 &data,
+                75.0,
                 65.0,
-                52.0,
                 10
             ),
             AaiDecision::Family {
@@ -470,7 +497,7 @@ mod tests {
             }
         );
         assert_eq!(
-            decide(&[aai(0, 50.0)], &accessions, &data, 65.0, 52.0, 10),
+            decide(&[aai(0, 60.0)], &accessions, &data, 75.0, 65.0, 10),
             AaiDecision::Unresolved
         );
     }
