@@ -10,13 +10,15 @@ use std::path::Path;
 use std::process::Command;
 
 use needletail::parse_fastx_file;
+use rayon::prelude::*;
 
-use crate::classify::ani::reference_batches;
 use crate::classify::external::run;
 use crate::classify::refdata::GtdbtkData;
 
-/// Largest number of distinct reference proteomes searched by one DIAMOND batch.
-const MAX_BATCH_REFERENCES: usize = 256;
+/// DIAMOND threads per query job; small searches scale poorly past a few.
+const THREADS_PER_JOB: usize = 2;
+/// Genome tag of the query's proteins, distinct from every reference ID.
+const QUERY: u32 = u32::MAX;
 /// Reciprocal best hits must reach this identity (%) ...
 const MIN_IDENTITY: f64 = 30.0;
 /// ... and align this fraction of the shorter protein (MiGA/EzAAI-style).
@@ -41,7 +43,9 @@ struct ProteinHit {
 }
 
 /// AAI between each query proteome and its candidate reference proteomes,
-/// sorted by descending AAI.
+/// sorted by descending AAI. Each query is searched against its own
+/// candidates only, so small DIAMOND jobs run side by side with a few
+/// threads each.
 pub(crate) fn compute_aai(
     diamond: &Path,
     work_dir: &Path,
@@ -51,81 +55,112 @@ pub(crate) fn compute_aai(
     threads: usize,
 ) -> Result<Vec<Vec<AaiHit>>, Box<dyn Error>> {
     fs::create_dir_all(work_dir)?;
-    let mut hits = vec![Vec::new(); query_proteomes.len()];
-    for (batch_index, batch) in reference_batches(candidates, MAX_BATCH_REFERENCES)
-        .into_iter()
-        .enumerate()
-    {
-        let batch_dir = work_dir.join(format!("batch_{batch_index}"));
-        fs::create_dir_all(&batch_dir)?;
-        let mut references = batch
-            .iter()
-            .flat_map(|&query| candidates[query].iter().copied())
-            .collect::<Vec<_>>();
-        references.sort_unstable();
-        references.dedup();
+    let threads = threads.max(1);
+    let jobs = query_proteomes
+        .len()
+        .clamp(1, threads.div_ceil(THREADS_PER_JOB));
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(jobs).build()?;
+    let job_threads = (threads / jobs).max(1);
+    pool.install(|| {
+        query_proteomes
+            .par_iter()
+            .zip(candidates)
+            .enumerate()
+            .map(|(query, (proteome, references))| {
+                query_aai(
+                    diamond,
+                    &work_dir.join(format!("query_{query}")),
+                    proteome,
+                    references,
+                    reference_proteomes,
+                    job_threads,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .map_err(Into::into)
+}
 
-        // Protein IDs become "{genome}|{protein}" so hits map back to genomes.
-        let query_fasta = batch_dir.join("queries.faa");
-        let reference_fasta = batch_dir.join("references.faa");
-        let query_files = batch
-            .iter()
-            .map(|&query| (query as u32, query_proteomes[query].to_path_buf()))
-            .collect::<Vec<_>>();
-        let reference_files = references
-            .iter()
-            .map(|&id| (id, reference_proteomes[id as usize].clone().into()))
-            .collect::<Vec<_>>();
-        let query_lengths = write_tagged_proteins(&query_files, &query_fasta)?;
-        let reference_lengths = write_tagged_proteins(&reference_files, &reference_fasta)?;
-
-        let forward = blastp(
-            diamond,
-            &batch_dir,
-            "forward",
-            &query_fasta,
-            &reference_fasta,
-            threads,
-            &query_lengths,
-            &reference_lengths,
-        )?;
-        let reverse = blastp(
-            diamond,
-            &batch_dir,
-            "reverse",
-            &reference_fasta,
-            &query_fasta,
-            threads,
-            &reference_lengths,
-            &query_lengths,
-        )?;
-        let pairs = reciprocal_aai(&forward, &reverse);
-        for &query in &batch {
-            let mut query_hits = candidates[query]
-                .iter()
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .filter_map(|&reference| {
-                    pairs
-                        .get(&(query as u32, reference))
-                        .map(|&(aai, reciprocal_hits)| AaiHit {
-                            reference,
-                            aai,
-                            reciprocal_hits,
-                        })
-                })
-                .collect::<Vec<_>>();
-            query_hits.sort_by(|left, right| {
-                right
-                    .aai
-                    .total_cmp(&left.aai)
-                    .then(right.reciprocal_hits.cmp(&left.reciprocal_hits))
-                    .then(left.reference.cmp(&right.reference))
-            });
-            hits[query] = query_hits;
-        }
-        fs::remove_dir_all(&batch_dir)?;
+/// Reciprocal-best-hit AAI of one query proteome against its candidates.
+fn query_aai(
+    diamond: &Path,
+    dir: &Path,
+    proteome: &Path,
+    candidates: &[u32],
+    reference_proteomes: &[String],
+    threads: usize,
+) -> Result<Vec<AaiHit>, Box<dyn Error>> {
+    let mut references = candidates.to_vec();
+    references.sort_unstable();
+    references.dedup();
+    if references.is_empty() {
+        return Ok(Vec::new());
     }
+    fs::create_dir_all(dir)?;
+    // Protein IDs become "{genome}|{protein}" so hits map back to genomes;
+    // references keep their database IDs.
+    let query_fasta = dir.join("query.faa");
+    let reference_fasta = dir.join("references.faa");
+    let query_lengths = write_tagged_proteins(&[(QUERY, proteome.to_path_buf())], &query_fasta)?;
+    let reference_files = references
+        .iter()
+        .map(|&id| (id, reference_proteomes[id as usize].clone().into()))
+        .collect::<Vec<_>>();
+    let reference_lengths = write_tagged_proteins(&reference_files, &reference_fasta)?;
+    let forward = blastp(
+        diamond,
+        dir,
+        "forward",
+        &query_fasta,
+        &reference_fasta,
+        threads,
+        &query_lengths,
+        &reference_lengths,
+    )?;
+    // Reciprocity only needs the reverse best hits of reference proteins that
+    // are some query protein's best hit, so only those are searched back.
+    let best_subjects = best_hits(&forward)
+        .into_values()
+        .map(|hit| hit.subject.as_str())
+        .collect::<HashSet<_>>();
+    if best_subjects.is_empty() {
+        fs::remove_dir_all(dir)?;
+        return Ok(Vec::new());
+    }
+    let reverse_fasta = dir.join("best_hits.faa");
+    write_selected_proteins(&reference_fasta, &best_subjects, &reverse_fasta)?;
+    let reverse = blastp(
+        diamond,
+        dir,
+        "reverse",
+        &reverse_fasta,
+        &query_fasta,
+        threads,
+        &reference_lengths,
+        &query_lengths,
+    )?;
+    let pairs = reciprocal_aai(&forward, &reverse);
+    let mut hits = references
+        .into_iter()
+        .filter_map(|reference| {
+            pairs
+                .get(&(QUERY, reference))
+                .map(|&(aai, reciprocal_hits)| AaiHit {
+                    reference,
+                    aai,
+                    reciprocal_hits,
+                })
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .aai
+            .total_cmp(&left.aai)
+            .then(right.reciprocal_hits.cmp(&left.reciprocal_hits))
+            .then(left.reference.cmp(&right.reference))
+    });
+    fs::remove_dir_all(dir)?;
     Ok(hits)
 }
 
@@ -162,6 +197,27 @@ fn write_tagged_proteins(
     }
     writer.flush()?;
     Ok(lengths)
+}
+
+/// Copy the proteins named in `ids` from a tagged FASTA file.
+fn write_selected_proteins(
+    input: &Path,
+    ids: &HashSet<&str>,
+    output: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let mut writer = BufWriter::new(File::create(output)?);
+    let mut reader = parse_fastx_file(input)?;
+    while let Some(record) = reader.next() {
+        let record = record?;
+        let id = String::from_utf8_lossy(record.id());
+        if ids.contains(id.as_ref()) {
+            writeln!(writer, ">{id}")?;
+            writer.write_all(&record.seq())?;
+            writer.write_all(b"\n")?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

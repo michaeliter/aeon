@@ -203,9 +203,12 @@ pub(crate) fn decide(
         data.taxonomy_of(&accessions[hit.reference as usize])
             .map(|ranks| ranks[..6].join(";"))
     };
+    // A high ANI over a small aligned fraction (shared operons, mobile
+    // elements) is a poor genus signal, so only hits passing the AF
+    // threshold vote.
     let close = hits
         .iter()
-        .filter(|hit| hit.ani >= genus_ani)
+        .filter(|hit| hit.ani >= genus_ani && hit.af >= min_af)
         .filter_map(genus_of)
         .collect::<Vec<_>>();
     let Some(best_genus) = close.first() else {
@@ -310,6 +313,11 @@ mod tests {
         );
         assert_eq!(
             decide(&[hit(0, 79.0, 0.6)], &accessions, &data, 0.5, 80.0),
+            AniDecision::Unresolved
+        );
+        // Hits below the AF threshold do not vote.
+        assert_eq!(
+            decide(&[hit(0, 90.0, 0.1)], &accessions, &data, 0.5, 80.0),
             AniDecision::Unresolved
         );
     }

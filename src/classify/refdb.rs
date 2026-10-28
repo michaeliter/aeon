@@ -251,7 +251,8 @@ fn call_reference_genes(
     db: &Path,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let started = Instant::now();
-    let protein_dir = db.join(PROTEIN_DIR);
+    // The protein list must not depend on the directory classify runs from.
+    let protein_dir = std::path::absolute(db.join(PROTEIN_DIR))?;
     let done = AtomicUsize::new(0);
     let proteomes = genomes
         .par_iter()

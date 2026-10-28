@@ -448,7 +448,7 @@ fn build_cli() -> Command {
                 .arg(
                     Arg::new("genus_aai")
                         .long("genus-aai")
-                        .default_value("65")
+                        .default_value("75")
                         .value_name("PERCENT")
                         .value_parser(clap::value_parser!(f64))
                         .help("AAI needed for genus consensus"),
@@ -456,7 +456,7 @@ fn build_cli() -> Command {
                 .arg(
                     Arg::new("family_aai")
                         .long("family-aai")
-                        .default_value("52")
+                        .default_value("65")
                         .value_name("PERCENT")
                         .value_parser(clap::value_parser!(f64))
                         .help("AAI needed for family consensus"),

@@ -141,6 +141,41 @@ Search options:
 | `--beam-width <N>` | `512` | Graph-search beam. Larger values generally improve recall but reduce throughput. |
 | `--output <FILE>` | stdout | Write tab-separated results to a file. |
 
+### Classify
+
+`aeon classify` assigns GTDB taxonomy and writes GTDB-Tk 2.8 `classify_wf` outputs: `{prefix}.bac120.summary.tsv`, `{prefix}.ar53.summary.tsv`, and the `identify/`, `align/` and `classify/` directories with the same file names and columns. Each genome stops at the first tier that resolves it:
+
+1. **ANI.** DiskANN sketch search proposes `--candidates` GTDB representatives and TurboANI computes their exact ANI and AF. A genome within the closest AF-passing reference's species radius gets that species, as in the GTDB-Tk ANI screen. If at least `--genus-ani` ANI to a strict majority of AF-passing references in one genus, it gets that genus.
+2. **AAI.** pyrodigal calls genes (run as a separate program, translation table 11 or 4 as in GTDB-Tk). Protein sketch search proposes candidate reference proteomes, and DIAMOND reciprocal best hits (≥30% identity, ≥70% of the shorter protein) give AAI. The best hit's genus (`--genus-aai`), or else its family (`--family-aai`), is assigned when it is the strict majority among the `--aai-top` closest references above that threshold.
+3. **Markers.** The remaining genomes go through GTDB-Tk's pipeline, ported natively:
+   - hmmsearch against the bac120/ar53 markers, with the same copy-number and domain calls;
+   - hmmalign and the masked concatenated alignment;
+   - pplacer placement and RED-based classification. Bacteria use the backbone tree followed by a class-level tree unless `--full_tree` is set.
+
+```bash
+# Reference database. Genomes and proteome files are named by GTDB accession.
+aeon classify-db --db gtdb_db --gtdbtk-data $GTDBTK_DATA_PATH \
+  -r gtdb_reps.txt --call-genes
+
+aeon classify --db gtdb_db --genome_dir genomes -x fna.gz --out_dir out --cpus 8
+```
+
+Tier 3 requires a classify-db built with `--gtdbtk-data`, plus `hmmsearch`, `hmmalign`, `pplacer` and `guppy` on `PATH` (or in `--bin-dir`). `classify-db` takes `--protein-list` for precomputed proteomes (e.g. GTDB `protein_faa_reps`) instead of `--call-genes`.
+
+**Agreement with GTDB-Tk 2.8.** On development packages pruned from R232, aeon's tier-3 output matched GTDB-Tk byte for byte: marker summaries, alignments, classification trees, RED dictionaries, split-tree mapping, and summary rows for genomes without ANI hits. Where genomes do have ANI hits, the ANI and AF values in summary rows differ slightly between TurboANI and skani.
+
+**Threshold calibration.** The AAI and ANI defaults were set on holdouts of GTDB R232 species representatives. The training set covered five orders: Lactobacillales, Campylobacterales, Bacteroidales, Flavobacteriales and Oscillospirales. It had 272 references, and its 55 queries were 20 species, 15 genera and 20 whole families withheld from the database. The validation set covered five different orders: Enterobacterales, Rhodobacterales, Lachnospirales, Mycoplasmatales and Actinomycetales. It had 221 references and 49 queries.
+
+The highest AAI values the wrong answers reached were:
+- 73.6% for a genome to a genus in its own family when its own genus was withheld;
+- 62.9% for a genome to another family when its own family was withheld.
+
+The defaults (`--genus-ani 80`, `--genus-aai 75`, `--family-aai 65`, `--aai-top 10`) made no wrong ANI or AAI calls on either set. Those tiers resolved 26/55 and 24/49 genomes, and the rest went to tier 3. The earlier 65%/52% cutoffs made 21 and 9 wrong calls respectively. Most of these errors were withheld families assigned to a neighbouring family.
+
+**Runtime.** With only a few hundred references, these runs show nothing about index scaling. The machine was also under heavy unrelated load, so wall times are not comparable between tools. CPU time was 828 s for aeon and 720 s for GTDB-Tk on 55 genomes with 8 threads.
+
+At this scale, aeon's ANI stage (11 s) is dominated by exact TurboANI on the candidates rather than by index search, and is slower than GTDB-Tk's skani screen (7 s). The AAI tier took 1.7 s per genome. GTDB-Tk's pplacer is cheap on pruned trees, but on full R232 it needs over 140 GB of RAM. Expect DiskANN search and the genomes resolved before tier 3 to matter at full GTDB scale; this has not been measured yet.
+
 ## Update Semantics
 
 - Updates are written to temporary files before replacing database files.
