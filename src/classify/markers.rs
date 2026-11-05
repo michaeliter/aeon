@@ -4,12 +4,13 @@
 //! The alignment's residues are what the marker index sketches.
 
 use flate2::Compression;
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,6 +18,7 @@ use needletail::parse_fastx_file;
 use rayon::prelude::*;
 
 use crate::classify::external::run;
+use crate::classify::genes::write_plain_fasta;
 use crate::classify::refdata::GtdbtkData;
 use crate::classify::summary::{py_float, py_round};
 
@@ -222,6 +224,100 @@ pub(crate) fn marker_ids(marker_set: &str) -> Vec<&'static str> {
     };
     ids.sort_unstable();
     ids
+}
+
+/// GTDB-Tk R232's marker HMM libraries, bundled for databases built
+/// without a GTDB-Tk package (see `data/gtdb_markers/NOTICE.md`).
+const BUNDLED_TIGRFAM: &[u8] = include_bytes!("../../data/gtdb_markers/tigrfam.hmm.gz");
+const BUNDLED_PFAM: &[u8] = include_bytes!("../../data/gtdb_markers/Pfam-A.hmm.gz");
+const BUNDLED_PFAM_DAT: &[u8] = include_bytes!("../../data/gtdb_markers/Pfam-A.hmm.dat");
+
+/// Lay out the marker HMMs under `dest` as a GTDB-Tk package does
+/// (`markers/{tigrfam,pfam}/...`, including `individual_hmms/`), from
+/// `package` or else from the bundled copy, and copy the package's masks
+/// to `masks/{marker_set}.mask`. Returns whether masks were copied.
+pub(crate) fn write_marker_data(
+    dest: &Path,
+    package: Option<(&Path, &str)>,
+) -> Result<bool, Box<dyn Error>> {
+    let gunzip = |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
+        let mut text = Vec::new();
+        GzDecoder::new(bytes).read_to_end(&mut text)?;
+        Ok(text)
+    };
+    let from_package = |file: &str| -> Result<Vec<u8>, Box<dyn Error>> {
+        let (root, _) = package.expect("package");
+        let path = root.join("markers").join(file);
+        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()).into())
+    };
+    let (tigrfam, pfam, pfam_dat) = match package {
+        Some(_) => (
+            from_package("tigrfam/tigrfam.hmm")?,
+            from_package("pfam/Pfam-A.hmm")?,
+            from_package("pfam/Pfam-A.hmm.dat")?,
+        ),
+        None => (
+            gunzip(BUNDLED_TIGRFAM)?,
+            gunzip(BUNDLED_PFAM)?,
+            BUNDLED_PFAM_DAT.to_vec(),
+        ),
+    };
+    for (family, library, hmm_name, extension) in [
+        ("tigrfam", &tigrfam, "tigrfam.hmm", "HMM"),
+        ("pfam", &pfam, "Pfam-A.hmm", "hmm"),
+    ] {
+        let dir = dest.join("markers").join(family);
+        let individual = dir.join("individual_hmms");
+        fs::create_dir_all(&individual)?;
+        fs::write(dir.join(hmm_name), library)?;
+        for (accession, model) in split_hmm_library(library)? {
+            fs::write(individual.join(format!("{accession}.{extension}")), model)?;
+        }
+    }
+    fs::write(dest.join("markers/pfam/Pfam-A.hmm.dat"), pfam_dat)?;
+    for set in MARKER_SETS {
+        for hmm in marker_ids(set) {
+            let path = if hmm.starts_with("PF") {
+                dest.join(format!("markers/pfam/individual_hmms/{hmm}.hmm"))
+            } else {
+                dest.join(format!("markers/tigrfam/individual_hmms/{hmm}.HMM"))
+            };
+            if !path.exists() {
+                return Err(format!("the marker HMMs lack {set} marker {hmm}").into());
+            }
+        }
+    }
+    let Some((root, release)) = package else {
+        return Ok(false);
+    };
+    fs::create_dir_all(dest.join("masks"))?;
+    for set in MARKER_SETS {
+        let source = package_mask_path(root, release, set);
+        fs::copy(&source, mask_path(dest, set))
+            .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
+    }
+    Ok(true)
+}
+
+/// Split a concatenated HMMER3 library into `(ACC, model text)` pairs.
+fn split_hmm_library(library: &[u8]) -> Result<Vec<(String, Vec<u8>)>, Box<dyn Error>> {
+    let text = std::str::from_utf8(library)?;
+    let mut models = Vec::new();
+    let mut model = String::new();
+    let mut accession = None;
+    for line in text.split_inclusive('\n') {
+        model.push_str(line);
+        if let Some(value) = line.strip_prefix("ACC ") {
+            accession = Some(value.trim().to_owned());
+        }
+        if line.trim_end() == "//" {
+            let accession = accession
+                .take()
+                .ok_or("an HMM in the marker library has no ACC line")?;
+            models.push((accession, std::mem::take(&mut model).into_bytes()));
+        }
+    }
+    Ok(models)
 }
 
 /// One marker's individual HMM and its header fields.
@@ -953,15 +1049,26 @@ fn match_columns(stockholm: &str) -> Result<HashMap<String, String>, Box<dyn Err
         .collect())
 }
 
+/// The marker set's alignment mask in a marker-data directory
+/// (`masks/{marker_set}.mask`), if it has one.
 pub(crate) fn read_mask(
-    data: &GtdbtkData,
     root: &Path,
     marker_set: &str,
-) -> Result<Vec<bool>, Box<dyn Error>> {
-    let path = root
-        .join("masks")
-        .join(format!("gtdb_{}_{marker_set}.mask", data.version));
-    Ok(fs::read_to_string(&path)
+) -> Result<Option<Vec<bool>>, Box<dyn Error>> {
+    let path = mask_path(root, marker_set);
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_mask_file(&path).map(Some)
+}
+
+fn mask_path(root: &Path, marker_set: &str) -> PathBuf {
+    root.join("masks").join(format!("{marker_set}.mask"))
+}
+
+/// A GTDB mask file: one `0`/`1` per alignment column.
+pub(crate) fn read_mask_file(path: &Path) -> Result<Vec<bool>, Box<dyn Error>> {
+    Ok(fs::read_to_string(path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?
         .trim()
         .bytes()
@@ -969,26 +1076,37 @@ pub(crate) fn read_mask(
         .collect())
 }
 
+/// The GTDB-Tk package's mask (`masks/gtdb_{release}_{marker_set}.mask`).
+pub(crate) fn package_mask_path(package: &Path, release: &str, marker_set: &str) -> PathBuf {
+    package
+        .join("masks")
+        .join(format!("gtdb_{release}_{marker_set}.mask"))
+}
+
 /// Masked alignment, its share of non-gap characters (0-1), and GTDB-Tk's
-/// `aa_percent_msa` (alphabetic characters, percent).
+/// `aa_percent_msa` (alphabetic characters, percent). Without a mask every
+/// column is kept.
 pub(crate) fn apply_mask(
     alignment: &str,
-    mask: &[bool],
+    mask: Option<&[bool]>,
 ) -> Result<(String, f64, f64), Box<dyn Error>> {
-    if alignment.len() != mask.len() {
-        return Err(format!(
-            "Mask ({}) and alignment ({}) length do not match.",
-            mask.len(),
-            alignment.len()
-        )
-        .into());
-    }
-    let masked = alignment
-        .chars()
-        .zip(mask)
-        .filter(|(_, keep)| **keep)
-        .map(|(residue, _)| residue)
-        .collect::<String>();
+    let masked = match mask {
+        Some(mask) if alignment.len() != mask.len() => {
+            return Err(format!(
+                "Mask ({}) and alignment ({}) length do not match.",
+                mask.len(),
+                alignment.len()
+            )
+            .into());
+        }
+        Some(mask) => alignment
+            .chars()
+            .zip(mask)
+            .filter(|(_, keep)| **keep)
+            .map(|(residue, _)| residue)
+            .collect::<String>(),
+        None => alignment.to_owned(),
+    };
     if masked.is_empty() {
         return Ok((masked, 0.0, 0.0));
     }
@@ -1008,7 +1126,7 @@ pub(crate) fn marker_sequence(masked: &str) -> String {
     masked.chars().filter(char::is_ascii_alphabetic).collect()
 }
 
-/// HMMER and the GTDB-Tk package files needed to extract markers.
+/// HMMER and the marker-data directory needed to extract markers.
 pub(crate) struct MarkerTools<'a> {
     pub(crate) hmmsearch: &'a Path,
     pub(crate) hmmalign: &'a Path,
@@ -1032,6 +1150,19 @@ pub(crate) fn identify_markers(
         .map(|(id, faa)| {
             let genome_dir = out_dir.join(id);
             fs::create_dir_all(&genome_dir).map_err(|error| error.to_string())?;
+            // Compressed proteomes are written out as plain FASTA first;
+            // HMMER and the Pfam table writer read the file directly.
+            let compressed = faa.extension().is_some_and(|extension| {
+                ["gz", "xz", "bz2", "zst"].iter().any(|e| extension == *e)
+            });
+            let plain = genome_dir.join(format!("{id}.input.faa"));
+            let faa = if compressed {
+                write_plain_fasta(&faa.to_string_lossy(), &plain)
+                    .map_err(|error| format!("{id}: {error}"))?;
+                plain.as_path()
+            } else {
+                faa.as_path()
+            };
             let (pfam, tigrfam) = search_markers(
                 tools.hmmsearch,
                 tools.root,
@@ -1043,6 +1174,9 @@ pub(crate) fn identify_markers(
             )
             .map_err(|error| format!("marker search failed for {id}: {error}"))?;
             let proteins = read_proteins(faa).map_err(|error| format!("{id}: {error}"))?;
+            if compressed {
+                let _ = fs::remove_file(&plain);
+            }
             let copies = MARKER_SETS.map(|set| copy_number(set, &proteins, &pfam, &tigrfam));
             Ok((id.clone(), copies))
         })
@@ -1054,7 +1188,7 @@ pub(crate) fn identify_markers(
 /// single-copy marker of the set are absent.
 pub(crate) fn extract_masked_markers(
     tools: &MarkerTools,
-    mask: &[bool],
+    mask: Option<&[bool]>,
     marker_set: &str,
     proteomes: &[(String, PathBuf)],
     work_dir: &Path,
@@ -1137,6 +1271,18 @@ mod tests {
     }
 
     #[test]
+    fn bundled_hmms_cover_every_marker() {
+        let dir = std::env::temp_dir().join(format!("aeon-markers-{}", std::process::id()));
+        // Fails if any bac120 or ar53 marker is missing.
+        assert!(!write_marker_data(&dir, None).unwrap());
+        let hmms = marker_hmms(&dir, "bac120").unwrap();
+        assert_eq!(hmms.len(), 120);
+        assert_eq!(marker_hmms(&dir, "ar53").unwrap().len(), 53);
+        assert!(PfamInfo::load(&dir).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn marker_sets_have_gtdb_sizes() {
         assert_eq!(marker_ids("bac120").len(), 120);
         assert_eq!(marker_ids("ar53").len(), 53);
@@ -1198,7 +1344,7 @@ mod tests {
     #[test]
     fn mask_counts_valid_and_alphabetic_columns() {
         let (masked, valid, percent) =
-            apply_mask("MK-.AB", &[true, true, true, true, false, true]).unwrap();
+            apply_mask("MK-.AB", Some(&[true, true, true, true, false, true])).unwrap();
         assert_eq!(masked, "MK-.B");
         assert!((valid - 0.6).abs() < 1e-12);
         assert!((percent - 60.0).abs() < 1e-12);
@@ -1263,10 +1409,10 @@ mod gtdbtk_comparison {
             write_marker_info(&out.join(format!("gtdbtk.{set}.marker_info.tsv")), &hmms).unwrap();
             let user =
                 align_markers(&hmmalign, &hmms, &domain_genomes, &out.join("align_tmp")).unwrap();
-            let mask = read_mask(&gtdb, &data, set).unwrap();
+            let mask = read_mask_file(&package_mask_path(&data, &gtdb.version, set)).unwrap();
             let mut masked = BTreeMap::new();
             for (id, alignment) in &user {
-                let (sequence, _, percent) = apply_mask(alignment, &mask).unwrap();
+                let (sequence, _, percent) = apply_mask(alignment, Some(&mask)).unwrap();
                 eprintln!("{set} {id} msa_percent={}", py_round(percent, 2));
                 masked.insert(id.clone(), sequence);
             }

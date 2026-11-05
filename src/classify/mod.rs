@@ -211,7 +211,7 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
     let queries = resolve_queries(&options.input)?;
     let db = ClassifyDb::open(&options.db)?;
     log.info(format!(
-        "Using GTDB {} reference database {} ({} representative genomes)",
+        "Using {} reference database {} ({} reference genomes)",
         db.manifest.gtdb_release,
         options.db,
         db.nt.paths.len()
@@ -639,22 +639,28 @@ fn run_marker_tier(
             log.warn(format!("Identified 0 single copy {domain_name} hits."));
             continue;
         }
-        let mask = read_mask(&db.data, &root, set)?;
+        let mask = read_mask(&root, set)?;
         let unmasked_length = user.values().next().map_or(0, String::len);
         let (mut kept, mut pruned) = (BTreeMap::new(), BTreeMap::new());
         for (id, alignment) in user {
-            let (masked, valid, msa_percent) = apply_mask(&alignment, &mask)?;
+            let (masked, valid, msa_percent) = apply_mask(&alignment, mask.as_deref())?;
             if valid < options.min_perc_aa / 100.0 {
                 pruned.insert(id, masked);
             } else {
                 kept.insert(id, (masked, msa_percent));
             }
         }
-        log.info(format!(
-            "Masked {domain_name} alignment from {} to {} AAs.",
-            thousands(unmasked_length),
-            thousands(mask.iter().filter(|keep| **keep).count())
-        ));
+        log.info(match &mask {
+            Some(mask) => format!(
+                "Masked {domain_name} alignment from {} to {} AAs.",
+                thousands(unmasked_length),
+                thousands(mask.iter().filter(|keep| **keep).count())
+            ),
+            None => format!(
+                "Kept all {} columns of the {domain_name} alignment (the database has no mask).",
+                thousands(unmasked_length)
+            ),
+        });
         if options.min_perc_aa > 0.0 {
             log.info(format!(
                 "{} {domain_name} user genomes have amino acids in <{:.1}% of columns in filtered MSA.",

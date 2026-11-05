@@ -133,7 +133,7 @@ fn default_train_dirs(program: &Path) -> Vec<PathBuf> {
 }
 
 /// Decompress and normalise a FASTA/FASTQ file to plain FASTA; returns its base count.
-fn write_plain_fasta(input: &str, output: &Path) -> Result<usize, Box<dyn Error>> {
+pub(crate) fn write_plain_fasta(input: &str, output: &Path) -> Result<usize, Box<dyn Error>> {
     let mut reader =
         parse_fastx_file(input).map_err(|error| format!("invalid FASTA {input}: {error}"))?;
     let mut writer = BufWriter::new(File::create(output)?);

@@ -1,12 +1,14 @@
-//! The `aeon classify-db` reference database: three aeon indexes over GTDB
-//! species representatives (genome nucleotides, proteomes, and concatenated
-//! marker genes) plus the taxonomy and radii needed to report GTDB-Tk-style
-//! classifications.
+//! The `aeon classify-db` reference database: three aeon indexes over the
+//! reference genomes (e.g. GTDB species representatives or WoL2; genome nucleotides, proteomes, and concatenated
+//! marker genes), plus a `reference_data/` directory with the references'
+//! taxonomy and species radii and the marker HMMs (and masks, when built from
+//! a GTDB-Tk package). Classify needs nothing else.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -16,10 +18,11 @@ use crate::classify::external::find_tool;
 use crate::classify::genes::GeneCaller;
 use crate::classify::markers::{
     MARKER_SETS, MarkerTools, PfamInfo, apply_mask, extract_masked_markers, marker_sequence,
-    read_mask, reference_msa_path,
+    read_mask, reference_msa_path, write_marker_data,
 };
 use crate::classify::refdata::{
-    GtdbtkData, accession_from_path, canonical_gid, marker_set_for_taxonomy, strip_db_prefix,
+    DEFAULT_RADIUS, GtdbtkData, Radius, accession_from_path, canonical_gid,
+    marker_set_for_taxonomy, strip_db_prefix,
 };
 use crate::database::build_database;
 use crate::metadata::{PrefixParams, genomes_path, load_params};
@@ -33,20 +36,37 @@ const AA_PREFIX: &str = "aa";
 const MARKER_PREFIX: &str = "markers";
 const PROTEIN_DIR: &str = "proteins";
 const MARKER_DIR: &str = "marker_genes";
+const REFERENCE_DIR: &str = "reference_data";
+const TAXONOMY_FILE: &str = "taxonomy.tsv";
+const RADII_FILE: &str = "radii.tsv";
 
 /// Where reference proteomes for the AAI and marker indexes come from.
 pub(crate) enum ProteinSource {
-    /// Precomputed proteomes (e.g. GTDB `protein_faa_reps`), named by accession.
+    /// Precomputed proteomes (e.g. GTDB `protein_faa_reps`), named by genome ID.
     List(String),
     /// Call genes for every reference genome with FragGeneScanRs.
     CallGenes(GeneCaller),
+}
+
+/// Where reference taxonomy, radii and marker data come from.
+pub(crate) struct ReferenceSources {
+    /// A GTDB-Tk reference data package: taxonomy, radii, marker HMMs,
+    /// masks and the reference MSA.
+    pub(crate) gtdbtk_data: Option<String>,
+    /// Taxonomy files, used instead of the package's.
+    pub(crate) taxonomy: Vec<String>,
+    /// A radii file, used instead of the package's.
+    pub(crate) radii: Option<String>,
+    /// Release label, by default the package's.
+    pub(crate) release: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Manifest {
     pub(crate) aeon_version: String,
     pub(crate) gtdb_release: String,
-    pub(crate) gtdbtk_data: String,
+    /// The GTDB-Tk package the database was built from, for the record.
+    pub(crate) gtdbtk_data: Option<String>,
     pub(crate) references: usize,
     /// References with markers in the marker index.
     pub(crate) marker_references: usize,
@@ -58,7 +78,7 @@ pub(crate) struct Index {
     pub(crate) params: PrefixParams,
     /// Indexed files in vector-ID order.
     pub(crate) paths: Vec<String>,
-    /// GTDB accessions (`GCF_000005845.2`) aligned with `paths`.
+    /// Genome IDs (`GCF_000005845.2`, `G000005825`, ...) aligned with `paths`.
     pub(crate) accessions: Vec<String>,
 }
 
@@ -83,6 +103,8 @@ impl Index {
 pub(crate) struct ClassifyDb {
     pub(crate) manifest: Manifest,
     pub(crate) data: GtdbtkData,
+    /// Taxonomy, radii and marker data (`reference_data/`).
+    reference_dir: PathBuf,
     /// Reference genomes.
     pub(crate) nt: Index,
     /// Reference proteomes, aligned with `nt` vector IDs.
@@ -112,17 +134,25 @@ impl ClassifyDb {
         if nt.len() != aa.len() {
             return Err("amino-acid and nucleotide indexes have different sizes".into());
         }
+        let reference_dir = dir.join(REFERENCE_DIR);
+        let file = |name: &str| reference_dir.join(name).to_string_lossy().into_owned();
         Ok(Self {
-            data: GtdbtkData::load(&manifest.gtdbtk_data)?,
+            data: GtdbtkData::from_files(
+                &manifest.gtdb_release,
+                &[file(TAXONOMY_FILE)],
+                Some(&file(RADII_FILE)),
+            )?,
             markers: Index::open(&dir, MARKER_PREFIX)?,
+            reference_dir,
             nt,
             aa,
             manifest,
         })
     }
 
+    /// The marker-data directory (GTDB-Tk package layout).
     pub(crate) fn root(&self) -> &Path {
-        Path::new(&self.manifest.gtdbtk_data)
+        &self.reference_dir
     }
 }
 
@@ -136,7 +166,7 @@ pub(crate) struct IndexParams {
 pub(crate) fn build_classify_db(
     db_dir: &str,
     genome_list: &str,
-    gtdbtk_data: &str,
+    sources: ReferenceSources,
     proteins: ProteinSource,
     bin_dir: Option<&str>,
     params: IndexParams,
@@ -146,10 +176,29 @@ pub(crate) fn build_classify_db(
     if genomes.is_empty() {
         return Err("reference genome list is empty".into());
     }
-    let root = std::path::absolute(gtdbtk_data)?;
-    let data = GtdbtkData::load(&root.to_string_lossy())?;
+    let package = sources
+        .gtdbtk_data
+        .as_deref()
+        .map(std::path::absolute)
+        .transpose()?;
+    let mut data = match &package {
+        Some(root) => GtdbtkData::load(&root.to_string_lossy())?,
+        None => GtdbtkData::default(),
+    };
+    let package_release = package.as_ref().map(|_| data.version.clone());
+    let files = GtdbtkData::from_files("", &sources.taxonomy, sources.radii.as_deref())?;
+    if !sources.taxonomy.is_empty() {
+        data.taxonomy = files.taxonomy;
+    }
+    if sources.radii.is_some() {
+        data.radii = files.radii;
+    }
+    data.version = sources
+        .release
+        .or_else(|| package_release.clone())
+        .unwrap_or_else(|| "custom".into());
     eprintln!(
-        "Loaded GTDB {} reference data: {} taxonomy records, {} species radii",
+        "Loaded {} reference data: {} taxonomy records, {} species radii",
         data.version,
         data.taxonomy.len(),
         data.radii.len()
@@ -160,9 +209,25 @@ pub(crate) fn build_classify_db(
         .map(|path| accession_from_path(path))
         .collect::<Vec<_>>();
     check_references(&accessions, &data)?;
+    let data = reference_subset(&data, &accessions);
 
     let db = &std::path::absolute(db_dir)?;
-    fs::create_dir_all(db)?;
+    let reference_dir = db.join(REFERENCE_DIR);
+    fs::create_dir_all(&reference_dir)?;
+    write_reference_data(&reference_dir, &data, &accessions)?;
+    let package = package.as_deref().zip(package_release.as_deref());
+    let masked = write_marker_data(&reference_dir, package)?;
+    eprintln!(
+        "Wrote marker HMMs from {}{}",
+        package.map_or("aeon's bundled GTDB R232 copy".into(), |(root, _)| root
+            .display()
+            .to_string()),
+        if masked {
+            ", with GTDB masks"
+        } else {
+            ", without alignment masks"
+        }
+    );
     // The nucleotide index needs only the genomes, so it builds while the
     // proteomes, protein index and marker index are prepared.
     let (nt, rest) = rayon::join(
@@ -187,9 +252,16 @@ pub(crate) fn build_classify_db(
                         .map_err(|error| error.to_string())
                 },
                 || {
-                    let markers =
-                        write_reference_markers(&root, &data, &accessions, &proteomes, bin_dir, db)
-                            .map_err(|error| error.to_string())?;
+                    let markers = write_reference_markers(
+                        &reference_dir,
+                        package,
+                        &data,
+                        &accessions,
+                        &proteomes,
+                        bin_dir,
+                        db,
+                    )
+                    .map_err(|error| error.to_string())?;
                     build_database(
                         &db.join(MARKER_PREFIX).to_string_lossy(),
                         &markers,
@@ -208,7 +280,7 @@ pub(crate) fn build_classify_db(
     let manifest = Manifest {
         aeon_version: env!("CARGO_PKG_VERSION").into(),
         gtdb_release: data.version.clone(),
-        gtdbtk_data: root.to_string_lossy().into_owned(),
+        gtdbtk_data: package.map(|(root, _)| root.to_string_lossy().into_owned()),
         references: genomes.len(),
         marker_references: markers.len(),
     };
@@ -227,11 +299,12 @@ pub(crate) fn build_classify_db(
 }
 
 /// Write each reference's masked marker residues to `marker_genes/{accession}.faa`
-/// and return the files in reference order. Rows come from the GTDB-Tk
-/// package's reference MSA; references missing from it (custom or test
-/// packages) get theirs from hmmsearch and hmmalign on their proteomes.
+/// and return the files in reference order. With a GTDB-Tk package, rows
+/// come from its reference MSA; other references get theirs from hmmsearch
+/// and hmmalign on their proteomes, using the marker data in `root`.
 fn write_reference_markers(
     root: &Path,
+    package: Option<(&Path, &str)>,
     data: &GtdbtkData,
     accessions: &[String],
     proteomes: &[String],
@@ -265,10 +338,13 @@ fn write_reference_markers(
         if pending.is_empty() {
             continue;
         }
-        let mask = read_mask(data, root, set)?;
+        let mask = read_mask(root, set)?;
         // The R232 bac120 MSA is several GB, so rows are streamed.
-        let msa = reference_msa_path(root, &data.version, set);
-        if fs::metadata(&msa).is_ok_and(|metadata| metadata.len() > 0) {
+        let msa = package.map(|(package, release)| reference_msa_path(package, release, set));
+        if let Some(msa) = msa
+            .as_ref()
+            .filter(|msa| fs::metadata(msa).is_ok_and(|metadata| metadata.len() > 0))
+        {
             let mut reader = parse_fastx_file(&msa)
                 .map_err(|error| format!("cannot read {}: {error}", msa.display()))?;
             while let Some(record) = reader.next() {
@@ -278,7 +354,8 @@ fn write_reference_markers(
                 let Some((accession, _)) = pending.remove(&canonical_gid(id)) else {
                     continue;
                 };
-                let (masked, _, _) = apply_mask(&String::from_utf8_lossy(&record.seq()), &mask)?;
+                let (masked, _, _) =
+                    apply_mask(&String::from_utf8_lossy(&record.seq()), mask.as_deref())?;
                 if write(accession, &masked)? {
                     with_markers.insert(accession.clone());
                     from_package += 1;
@@ -292,9 +369,12 @@ fn write_reference_markers(
             continue;
         }
         eprintln!(
-            "Extracting {set} markers with HMMER for {} reference(s) missing from {}",
+            "Extracting {set} markers with HMMER for {} reference(s){}",
             pending.len(),
-            msa.display()
+            msa.map_or(String::new(), |msa| format!(
+                " missing from {}",
+                msa.display()
+            ))
         );
         let pfam_info = PfamInfo::load(root)?;
         let (hmmsearch, hmmalign) = (
@@ -314,7 +394,7 @@ fn write_reference_markers(
         let work_dir = db.join(format!("{MARKER_DIR}_tmp"));
         let masked: BTreeMap<String, String> = extract_masked_markers(
             &tools,
-            &mask,
+            mask.as_deref(),
             set,
             &inputs,
             &work_dir,
@@ -407,8 +487,7 @@ fn call_reference_genes(
     Ok(proteomes)
 }
 
-/// Every reference must be a GTDB species representative with a taxonomy
-/// and an ANI radius, and accessions must be unique.
+/// Every reference needs a seven-rank taxonomy, and accessions must be unique.
 fn check_references(accessions: &[String], data: &GtdbtkData) -> Result<(), Box<dyn Error>> {
     let mut seen = HashSet::with_capacity(accessions.len());
     let mut missing = Vec::new();
@@ -416,7 +495,7 @@ fn check_references(accessions: &[String], data: &GtdbtkData) -> Result<(), Box<
         if !seen.insert(canonical_gid(accession)) {
             return Err(format!("reference list contains accession {accession} twice").into());
         }
-        if data.taxonomy_of(accession).is_none() || data.radius_of(accession).is_none() {
+        if data.taxonomy_of(accession).is_none() {
             missing.push(accession.as_str());
         }
     }
@@ -424,10 +503,57 @@ fn check_references(accessions: &[String], data: &GtdbtkData) -> Result<(), Box<
         return Ok(());
     }
     Err(format!(
-        "{} reference genome(s) are not GTDB {} species representatives with a taxonomy and ANI radius (e.g. {}). Reference files must be named by accession, like GCF_000005845.2_genomic.fna.gz",
+        "{} reference genome(s) have no taxonomy (e.g. {}). Reference files must be named by accession, like GCF_000005845.2_genomic.fna.gz, and listed in the taxonomy file",
         missing.len(),
-        data.version,
         missing[..missing.len().min(5)].join(", ")
     )
     .into())
+}
+
+/// The references' taxonomy and radii; species without a radius get
+/// GTDB-Tk's default of 95%.
+fn reference_subset(data: &GtdbtkData, accessions: &[String]) -> GtdbtkData {
+    let mut subset = GtdbtkData {
+        version: data.version.clone(),
+        ..GtdbtkData::default()
+    };
+    let mut defaulted = 0;
+    for accession in accessions {
+        let gid = canonical_gid(accession);
+        let taxonomy = data.taxonomy[&gid].clone();
+        let radius = data.radii.get(&gid).cloned().unwrap_or_else(|| {
+            defaulted += 1;
+            Radius {
+                species: taxonomy[6].clone(),
+                ani: DEFAULT_RADIUS,
+            }
+        });
+        subset.radii.insert(gid.clone(), radius);
+        subset.taxonomy.insert(gid, taxonomy);
+    }
+    if defaulted > 0 {
+        eprintln!(
+            "{defaulted} reference(s) have no species radius; using {DEFAULT_RADIUS}% for them"
+        );
+    }
+    subset
+}
+
+/// `taxonomy.tsv` and `radii.tsv` in GTDB-Tk's package formats.
+fn write_reference_data(
+    dir: &Path,
+    data: &GtdbtkData,
+    accessions: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let mut taxonomy = BufWriter::new(File::create(dir.join(TAXONOMY_FILE))?);
+    let mut radii = BufWriter::new(File::create(dir.join(RADII_FILE))?);
+    for accession in accessions {
+        let gid = canonical_gid(accession);
+        writeln!(taxonomy, "{accession}\t{}", data.taxonomy[&gid].join(";"))?;
+        let radius = &data.radii[&gid];
+        writeln!(radii, "{}\t{accession}\t{}", radius.species, radius.ani)?;
+    }
+    taxonomy.flush()?;
+    radii.flush()?;
+    Ok(())
 }

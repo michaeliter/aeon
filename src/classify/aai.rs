@@ -429,6 +429,10 @@ pub(crate) fn decide(
             return None;
         }
         let taxon = &taxonomy[..ranks];
+        // A reference without a name at this rank cannot give one.
+        if taxon[ranks - 1].len() <= 3 {
+            return None;
+        }
         let lead = rest
             .iter()
             .find(|(_, other)| other[..ranks] != *taxon)

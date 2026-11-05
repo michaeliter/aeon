@@ -1,4 +1,6 @@
-//! Readers for the GTDB-Tk reference data package (GTDBTK_DATA_PATH layout).
+//! Readers for reference taxonomy and species radii: plain lineage and radii
+//! files (GTDB's release files, WoL2's `lineages.txt`, ...) or a GTDB-Tk
+//! reference data package (GTDBTK_DATA_PATH layout).
 
 use flate2::read::MultiGzDecoder;
 use std::collections::HashMap;
@@ -9,20 +11,18 @@ use std::path::Path;
 
 pub(crate) const RANK_PREFIXES: [&str; 7] = ["d__", "p__", "c__", "o__", "f__", "g__", "s__"];
 
-/// Canonical form of an NCBI accession, mirroring GTDB-Tk's `canonical_gid`:
-/// `RS_GCF_005435135.1` -> `G005435135`. UBA identifiers are returned unchanged.
+/// Genome ID used to match genomes with their taxonomy. NCBI assembly
+/// accessions take GTDB-Tk's `canonical_gid` form, so GenBank and RefSeq
+/// versions match (`RS_GCF_005435135.1` -> `G005435135`, which is also how
+/// WoL2 names genomes); any other ID is used as is.
 pub(crate) fn canonical_gid(gid: &str) -> String {
-    if gid.starts_with('U') {
-        return gid.to_owned();
-    }
-    let gid = gid
-        .replace("RS_", "")
-        .replace("GB_", "")
-        .replace("GCA_", "G")
-        .replace("GCF_", "G");
-    match gid.find('.') {
-        Some(dot) => gid[..dot].to_owned(),
-        None => gid,
+    let gid = strip_db_prefix(gid);
+    match gid
+        .strip_prefix("GCA_")
+        .or_else(|| gid.strip_prefix("GCF_"))
+    {
+        Some(rest) => format!("G{}", rest.split('.').next().unwrap_or(rest)),
+        None => gid.to_owned(),
     }
 }
 
@@ -33,8 +33,9 @@ pub(crate) fn strip_db_prefix(gid: &str) -> &str {
         .unwrap_or(gid)
 }
 
-/// Derive a reference accession from a GTDB file path such as
-/// `.../GCF_000005845.2_genomic.fna.gz` or `.../GCA_000006155.2_protein.faa`.
+/// Derive a genome ID from a file path such as
+/// `.../GCF_000005845.2_genomic.fna.gz`, `.../GCA_000006155.2_protein.faa`
+/// or `.../G000005825.fna.xz`.
 pub(crate) fn accession_from_path(path: &str) -> String {
     let name = Path::new(path)
         .file_name()
@@ -42,7 +43,7 @@ pub(crate) fn accession_from_path(path: &str) -> String {
         .unwrap_or(path);
     let mut stem = name;
     for suffix in [
-        ".gz", ".fna", ".faa", ".fa", ".fasta", "_genomic", "_protein",
+        ".gz", ".xz", ".bz2", ".zst", ".fna", ".faa", ".fa", ".fasta", "_genomic", "_protein",
     ] {
         stem = stem.strip_suffix(suffix).unwrap_or(stem);
     }
@@ -99,7 +100,10 @@ pub(crate) struct Radius {
     pub(crate) ani: f64,
 }
 
-/// Reference taxonomy and species radii from a GTDB-Tk package.
+/// GTDB-Tk's ANI radius for species without one of their own.
+pub(crate) const DEFAULT_RADIUS: f64 = 95.0;
+
+/// Reference taxonomy and species radii.
 #[derive(Debug, Default)]
 pub(crate) struct GtdbtkData {
     pub(crate) version: String,
@@ -117,6 +121,26 @@ impl GtdbtkData {
             taxonomy: read_taxonomy(&root.join("taxonomy").join("gtdb_taxonomy.tsv"))?,
             radii: read_radii(&root.join("radii").join("gtdb_radii.tsv"))?,
         })
+    }
+
+    /// Taxonomy files (e.g. GTDB's `bac120_taxonomy_r232.tsv.gz` and
+    /// `ar53_taxonomy_r232.tsv.gz`) and an optional radii file.
+    pub(crate) fn from_files(
+        version: &str,
+        taxonomy: &[String],
+        radii: Option<&str>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut data = Self {
+            version: version.to_owned(),
+            ..Self::default()
+        };
+        for path in taxonomy {
+            data.taxonomy.extend(read_taxonomy(Path::new(path))?);
+        }
+        if let Some(path) = radii {
+            data.radii = read_radii(Path::new(path))?;
+        }
+        Ok(data)
     }
 
     pub(crate) fn taxonomy_of(&self, gid: &str) -> Option<&[String]> {
@@ -142,6 +166,9 @@ pub(crate) fn read_lines(
     Ok(BufReader::new(reader).lines())
 }
 
+/// Taxonomy lines `genome<TAB>d__...;p__...;...;s__...`. Ranks carry
+/// GTDB-style prefixes and may be separated by `;` or `; `; missing lower
+/// ranks are left empty.
 pub(crate) fn read_taxonomy(path: &Path) -> Result<HashMap<String, Vec<String>>, Box<dyn Error>> {
     let mut taxonomy = HashMap::new();
     for line in read_lines(path)? {
@@ -153,25 +180,59 @@ pub(crate) fn read_taxonomy(path: &Path) -> Result<HashMap<String, Vec<String>>,
         let (gid, taxa) = line
             .split_once('\t')
             .ok_or_else(|| format!("malformed taxonomy line in {}: {line}", path.display()))?;
-        let ranks = taxa.split(';').map(str::to_owned).collect::<Vec<_>>();
-        if ranks.len() != RANK_PREFIXES.len() {
-            return Err(format!("expected a 7-rank taxonomy for {gid}: {taxa}").into());
-        }
-        taxonomy.insert(canonical_gid(gid), ranks);
+        let ranks = parse_lineage(taxa).ok_or_else(|| {
+            format!(
+                "{gid} in {} has a malformed lineage: {taxa}",
+                path.display()
+            )
+        })?;
+        taxonomy.insert(canonical_gid(gid.trim()), ranks);
     }
     Ok(taxonomy)
 }
 
+/// Seven ranks from a prefixed lineage (`d__` to `s__`, in order, lower
+/// ranks optional).
+fn parse_lineage(lineage: &str) -> Option<Vec<String>> {
+    let mut ranks = RANK_PREFIXES.map(str::to_owned).to_vec();
+    let mut next = 0;
+    for taxon in lineage
+        .split(';')
+        .map(str::trim)
+        .filter(|taxon| !taxon.is_empty())
+    {
+        let rank = RANK_PREFIXES[next..]
+            .iter()
+            .position(|prefix| taxon.starts_with(prefix))?;
+        next += rank;
+        ranks[next] = taxon.to_owned();
+        next += 1;
+    }
+    (next > 0).then_some(ranks)
+}
+
+/// Species radii from GTDB-Tk's `gtdb_radii.tsv` (species, genome, radius)
+/// or GTDB's `sp_clusters_r*.tsv` (genome, species, taxonomy, radius, ...,
+/// with a header).
 pub(crate) fn read_radii(path: &Path) -> Result<HashMap<String, Radius>, Box<dyn Error>> {
     let mut radii = HashMap::new();
-    for line in read_lines(path)? {
+    let mut sp_clusters = false;
+    for (number, line) in read_lines(path)?.enumerate() {
         let line = line?;
         let fields = line.trim().split('\t').collect::<Vec<_>>();
         if fields.len() == 1 && fields[0].is_empty() {
             continue;
         }
-        let [species, genome, ani] = fields[..] else {
-            return Err(format!("malformed radii line in {}: {line}", path.display()).into());
+        if number == 0 && fields[0] == "Representative genome" {
+            sp_clusters = true;
+            continue;
+        }
+        let (species, genome, ani) = match fields[..] {
+            [genome, species, _, ani, ..] if sp_clusters => (species, genome, ani),
+            [species, genome, ani] if !sp_clusters => (species, genome, ani),
+            _ => {
+                return Err(format!("malformed radii line in {}: {line}", path.display()).into());
+            }
         };
         radii.insert(
             canonical_gid(genome),
@@ -209,6 +270,9 @@ mod tests {
         assert_eq!(canonical_gid("RS_GCF_005435135.1"), "G005435135");
         assert_eq!(canonical_gid("GB_GCA_005435135.1"), "G005435135");
         assert_eq!(canonical_gid("UBA1234"), "UBA1234");
+        // Other IDs, e.g. WoL2's or MAG bins, are kept as they are.
+        assert_eq!(canonical_gid("G000005825"), "G000005825");
+        assert_eq!(canonical_gid("bin.12"), "bin.12");
     }
 
     #[test]
@@ -226,6 +290,7 @@ mod tests {
             "GCF_000005845.2"
         );
         assert_eq!(accession_from_path("/mags/bin.12.fa"), "bin.12");
+        assert_eq!(accession_from_path("/wol2/G000005825.fna.xz"), "G000005825");
     }
 
     #[test]
@@ -242,6 +307,48 @@ mod tests {
             standardise_taxonomy("", Some("bac120")),
             "d__Bacteria;p__;c__;o__;f__;g__;s__"
         );
+    }
+
+    #[test]
+    fn lineages_accept_spaces_and_missing_ranks() {
+        let full = "d__Bacteria;p__P;c__C;o__O;f__F;g__G;s__G sp";
+        assert_eq!(parse_lineage(full).unwrap().join(";"), full);
+        // WoL2's lineages.txt separates ranks with "; ".
+        assert_eq!(
+            parse_lineage("d__Bacteria; p__P; c__C; o__O; f__F; g__G; s__G sp")
+                .unwrap()
+                .join(";"),
+            full
+        );
+        assert_eq!(
+            parse_lineage("d__Bacteria;p__P;c__C;o__O")
+                .unwrap()
+                .join(";"),
+            "d__Bacteria;p__P;c__C;o__O;f__;g__;s__"
+        );
+        assert_eq!(parse_lineage("Bacteria;Firmicutes"), None);
+        assert_eq!(parse_lineage("p__P;d__Bacteria"), None);
+    }
+
+    #[test]
+    fn radii_come_from_gtdbtk_or_sp_clusters() {
+        let dir = std::env::temp_dir().join(format!("aeon-radii-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let gtdbtk = dir.join("gtdb_radii.tsv");
+        fs::write(&gtdbtk, "s__Escherichia coli\tRS_GCF_003697165.2\t95.0\n").unwrap();
+        let sp_clusters = dir.join("sp_clusters.tsv");
+        fs::write(
+            &sp_clusters,
+            "Representative genome\tGTDB species\tGTDB taxonomy\tANI circumscription radius\tMean intra-species ANI\n\
+             RS_GCF_003697165.2\ts__Escherichia coli\td__Bacteria;g__Escherichia\t96.5\t98.1\n",
+        )
+        .unwrap();
+        let gtdbtk = read_radii(&gtdbtk).unwrap();
+        let sp_clusters = read_radii(&sp_clusters).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(gtdbtk["G003697165"].ani, 95.0);
+        assert_eq!(sp_clusters["G003697165"].ani, 96.5);
+        assert_eq!(sp_clusters["G003697165"].species, "s__Escherichia coli");
     }
 
     #[test]

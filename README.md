@@ -143,25 +143,45 @@ Search options:
 
 ### Classify
 
-`aeon classify` assigns GTDB taxonomy and writes GTDB-Tk 2.8 `classify_wf` outputs: `{prefix}.bac120.summary.tsv`, `{prefix}.ar53.summary.tsv`, and the `identify/`, `align/` and `classify/` directories with GTDB-Tk's file names and columns. Results should be close to GTDB-Tk's, but the method differs. aeon has no pplacer, RED or reference-tree step. Below species it classifies by AAI and by a search of marker genes.
+`aeon classify` assigns genomes the taxonomy of a reference database and writes GTDB-Tk 2.8 `classify_wf` outputs: `{prefix}.bac120.summary.tsv`, `{prefix}.ar53.summary.tsv`, and the `identify/`, `align/` and `classify/` directories with GTDB-Tk's file names and columns. aeon has no pplacer, RED or reference-tree step. Below species it classifies by AAI and by a search of marker genes.
 
-**Three indexes.** `aeon classify-db` builds three aeon indexes over the GTDB species representatives, and every classify run uses all three:
+The reference database can be any collection of bacterial and archaeal genomes with a rank-prefixed taxonomy:
+- **GTDB:** built from the GTDB species representatives, aeon is a drop-in replacement for GTDB-Tk. Results should be close to GTDB-Tk's, but the method differs.
+- **Other collections:** for example WoL2, or a custom genome set.
+
+**Three indexes.** `aeon classify-db` builds three aeon indexes over the reference genomes, and every classify run uses all three:
 
 | Index | Sequences | k-mers | Sketch size |
 |---|---|---|---|
 | `nt` | reference genomes | nucleotide, k=16 (`-k`) | 15,000 (`-s`) |
 | `aa` | reference proteomes | amino acid, k=7 (`--aa-kmer-size`) | 10,000 (`--aa-sketch-size`) |
-| `markers` | concatenated bac120/ar53 marker genes (masked GTDB-Tk alignment, gaps removed) | amino acid, k=5 (`--marker-kmer-size`) | 3,000 (`--marker-sketch-size`) |
+| `markers` | concatenated bac120/ar53 marker genes (aligned as in GTDB-Tk, gaps removed) | amino acid, k=5 (`--marker-kmer-size`) | 3,000 (`--marker-sketch-size`) |
 
 All three graphs are built with max degree 128 (`--max-degree`), construction beam 512 (`--build-beam-width`) and alpha 1.2 (`--alpha`).
 
-Marker genes for references come from the GTDB-Tk package's reference MSA. References missing from it get theirs from hmmsearch and hmmalign on their proteomes.
+**Inputs:**
+
+| Input | Option | Default |
+|---|---|---|
+| Reference genomes, one FASTA per genome named by genome ID (e.g. `GCF_000005845.2_genomic.fna.gz`, `G000005825.fna.xz`) | `-r/--genome-list` | required |
+| Reference taxonomy, `genome<TAB>d__…;p__…;…;s__…` with rank prefixes and lower ranks optional (e.g. GTDB's `bac120_taxonomy_r232.tsv.gz` and `ar53_taxonomy_r232.tsv.gz`, or WoL2's `lineages.txt`) | `--taxonomy` (repeatable or comma-separated) | required without `--gtdbtk-data` |
+| Reference proteomes, one FASTA per genome named by genome ID (e.g. GTDB `protein_faa_reps`) | `--protein-list` | genes called with FragGeneScanRs |
+| Species ANI radii, `species<TAB>genome<TAB>radius` (GTDB-Tk `gtdb_radii.tsv`), or GTDB's `sp_clusters_r232.tsv` | `--radii` | 95% for every species |
+| Marker HMMs (bac120 and ar53) | — | GTDB R232's TIGRFAM and Pfam models, bundled with aeon (`data/gtdb_markers/`, see its NOTICE for their licences) |
+
+- **Genome IDs:** taken from file names and matched to the taxonomy. NCBI assembly accessions match across GenBank/RefSeq prefixes and versions, as in GTDB-Tk (`RS_GCF_000005845.2` and `GCA_000005845.1` are the same genome). Any other ID must match exactly.
+- **Compression:** genomes and proteomes may be plain, gzip, bzip2, xz or zstd FASTA.
+- **Collections shipped as one file:** for collections distributed as a single FASTA (WoL2's `all.fna.xz`), split it into one file per genome first.
+- **Reference marker genes:** extracted with hmmsearch and hmmalign on the reference proteomes, the same way as for queries.
+- **Marker sets:** the GTDB bac120/ar53 markers are universal bacterial and archaeal genes, so the marker step works for any reference collection. A reference counts as archaeal if its domain is `d__Archaea`.
+- **`--gtdbtk-data DIR`** (GTDB-Tk compatibility): optionally supplies the taxonomy, radii, marker HMMs, alignment masks and reference MSA from a GTDB-Tk package. Reference markers then come from the package's MSA, and queries and references are masked with GTDB's masks. `--taxonomy` and `--radii` override the package's files.
+- **Self-contained database:** the database keeps its own copy of the references' taxonomy, radii and marker HMMs in `reference_data/`, so `aeon classify` needs only `--db`.
 
 **Cascade.** Each genome stops at the first step that resolves it:
 
-1. **nt search, then TurboANI when candidates span species.** The genome sketch search proposes `--candidates` (10) species representatives with a sketch-estimated ANI.
+1. **nt search, then TurboANI when candidates span species.** The genome sketch search proposes the `--candidates` (10) closest reference genomes, each with a sketch-estimated ANI.
    - **One candidate at or above `--min-sketch-ani` (90%):** if its estimate clears that species' radius by at least 1 point, the genome gets the species without TurboANI.
-   - **Several candidates at or above 90%, or one without that margin:** TurboANI computes their exact ANI and AF, and GTDB-Tk's ANI screen rule decides. The closest reference with AF ≥ `--min_af` (0.5) gives its species if the ANI is within that species' GTDB radius (95% for most species).
+   - **Several candidates at or above 90%, or one without that margin:** TurboANI computes their exact ANI and AF, and GTDB-Tk's ANI screen rule decides. The closest reference with AF ≥ `--min_af` (0.5) gives its species if the ANI is within that species' radius (95% unless `--radii` gives another).
    - **No candidate at or above 90%:** the genome goes to step 2.
 2. **FragGeneScanRs, aa search, DIAMOND AAI.**
    - Genes are called with FragGeneScanRs's complete-genome model (`-t complete -w 1`).
@@ -174,6 +194,7 @@ Marker genes for references come from the GTDB-Tk package's reference MSA. Refer
    - The closest reference by AAI gives the call:
      - **Genus:** its genus is assigned if its AAI is ≥ `--genus-aai` (65%) and beats every reference of another genus by at least `--aai-margin` (5) points.
      - **Family:** failing that, its family is assigned under the same rule with ≥ `--family-aai` (45%).
+     - A rank the closest reference has no name for (e.g. `g__`) is never assigned.
      - **Otherwise** the genome goes to step 3.
 3. **hmmer marker extraction, marker search.**
    - hmmsearch and hmmalign extract the bac120/ar53 markers exactly as GTDB-Tk's `identify` and `align` steps do, with the same copy-number rules, domain call, mask and `--min_perc_aa` filter.
@@ -185,7 +206,7 @@ Marker genes for references come from the GTDB-Tk package's reference MSA. Refer
 **Design decisions:**
 - **pplacer is replaced by AAI and the marker search.** This removes the reference tree and its large memory requirement.
 - **FragGeneScanRs replaces Prodigal/pyrodigal.** It is faster, and accurate enough for AAI and marker extraction. It runs as a separate program because it is GPL-3.0 and aeon is MIT. It translates with table 11 only, so `translation_table` is always 11.
-- **Species calls use GTDB's species radius**, so they match GTDB-Tk's ANI screen. 95% applies to most species.
+- **Species calls use each species' ANI radius**, by default 95%. With GTDB's radii (`--radii sp_clusters_r232.tsv`, or `--gtdbtk-data`) they match GTDB-Tk's ANI screen.
 - **TurboANI runs only when the sketch search cannot settle the species on its own.**
   - A species call made from the sketch estimate alone reports `closest_genome_af` as `N/A`. Its Jaccard-based estimate already drops with the shared fraction.
   - The 1-point margin sends borderline genomes to TurboANI. These include chimeras whose AF would fail, because the sketch cannot check AF.
@@ -214,13 +235,18 @@ conda env create -f environment.yml && conda activate aeon-classify
 cargo install frag_gene_scan_rs
 
 # Reference database. Genomes and proteomes are named by GTDB accession.
-aeon classify-db --db gtdb_db --gtdbtk-data $GTDBTK_DATA_PATH \
-  -r gtdb_reps.txt --protein-list gtdb_protein_reps.txt   # or --call-genes
+aeon classify-db --db gtdb_db -r gtdb_reps.txt \
+  --taxonomy bac120_taxonomy_r232.tsv.gz,ar53_taxonomy_r232.tsv.gz \
+  --radii sp_clusters_r232.tsv --protein-list gtdb_protein_reps.txt --release r232
+
+# Or take taxonomy, radii, marker HMMs, masks and the reference MSA from a GTDB-Tk package.
+aeon classify-db --db gtdb_db -r gtdb_reps.txt --gtdbtk-data $GTDBTK_DATA_PATH \
+  --protein-list gtdb_protein_reps.txt
 
 aeon classify --db gtdb_db --genome_dir genomes -x fna.gz --out_dir out --cpus 8
 ```
 
-`--call-genes` calls reference genes with FragGeneScanRs instead of reading `--protein-list` (e.g. GTDB `protein_faa_reps`). aeon finds FragGeneScanRs's `train/` models next to the executable or in the sources `cargo install` keeps. Otherwise, pass `--fgs-train-dir`.
+Without `--protein-list`, reference genes are called with FragGeneScanRs. aeon finds FragGeneScanRs's `train/` models next to the executable or in the sources `cargo install` keeps. Otherwise, pass `--fgs-train-dir`.
 
 **Holdout results.** Holdouts of GTDB R232 species representatives were used, each with the query's species, whole genus or whole family withheld from the database.
 
@@ -260,7 +286,7 @@ The default row comes from full classify runs. The other rows replay the rule ov
 - **DIAMOND mode:** the default mode gives AAI about 2 points higher than `--sensitive` on the same pairs (median +2.2 and +2.3 on the two sets). It made about the same number of wrong calls under the majority vote (19 against 21) in about a third of the time.
 - **Species calls from the sketch alone:** reference genomes cut into 10 kb pieces, keeping 50–90% of them, were all assigned their own species, 24 of 24, with no TurboANI call.
 
-**Runtime.** On the 55-genome training set with 8 threads, classify took 80 s wall time and 570 CPU-seconds, with a peak RSS of 0.95 GB. Building the 272-reference database with `--call-genes` took 126 s, with a peak RSS of 1.7 GB. Index scaling at full GTDB size has not been measured yet.
+**Runtime.** On the 55-genome training set with 8 threads, classify took 80 s wall time and 570 CPU-seconds, with a peak RSS of 0.95 GB. Building the 272-reference database with FragGeneScanRs gene calls (no `--protein-list`) took 124 s, with a peak RSS of 1.7 GB. Index scaling at full GTDB size has not been measured yet.
 
 ## Update Semantics
 

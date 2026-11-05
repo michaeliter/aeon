@@ -7,7 +7,7 @@ mod utils;
 use std::error::Error;
 
 use crate::classify::genes::GeneCaller;
-use crate::classify::refdb::{IndexParams, ProteinSource, build_classify_db};
+use crate::classify::refdb::{IndexParams, ProteinSource, ReferenceSources, build_classify_db};
 use crate::classify::{ClassifyOptions, QueryInput, classify_genomes};
 use crate::database::{build_database, search_database, update_database};
 use crate::metadata::PrefixParams;
@@ -284,8 +284,8 @@ fn build_cli() -> Command {
         )
         .subcommand(
             Command::new("classify-db")
-                .about("Build a GTDB reference database for aeon classify")
-                .long_about("Build the three aeon indexes aeon classify searches, over GTDB species-representative genomes: their genomes (nucleotide k-mers), their proteomes (amino-acid k-mers), and their concatenated bac120/ar53 marker genes (amino-acid k-mers). Taxonomy, species ANI radii, marker HMMs and masks come from a GTDB-Tk reference data package. Marker genes come from the package's reference MSA; references missing from it get theirs from hmmsearch and hmmalign on their proteomes. Proteomes come from --protein-list (e.g. GTDB protein_faa_reps) or are called with FragGeneScanRs (--call-genes). Reference files must be named by accession (e.g. GCF_000005845.2_genomic.fna.gz) and must stay at their listed paths, because classify computes exact ANI and AAI against them.")
+                .about("Build a reference database for aeon classify (GTDB, WoL2 or any genome collection with a taxonomy)")
+                .long_about("Build the three aeon indexes aeon classify searches, over a set of reference genomes (e.g. GTDB species representatives or WoL2): their genomes (nucleotide k-mers), their proteomes (amino-acid k-mers), and their concatenated bac120/ar53 marker genes (amino-acid k-mers). Inputs are the genomes (--genome-list), their taxonomy (--taxonomy, e.g. GTDB's bac120_taxonomy_r232.tsv.gz and ar53_taxonomy_r232.tsv.gz, or WoL2's lineages.txt) and optionally their proteomes (--protein-list; otherwise genes are called with FragGeneScanRs) and species radii (--radii; otherwise 95%). Marker genes are extracted with hmmsearch and hmmalign using the GTDB R232 marker HMMs bundled with aeon. Alternatively --gtdbtk-data supplies taxonomy, radii, marker HMMs, masks and the reference MSA from a GTDB-Tk reference data package. The database keeps its own copy of the taxonomy, radii and marker HMMs. Reference files must be named by genome ID (e.g. GCF_000005845.2_genomic.fna.gz or G000005825.fna.xz) and must stay at their listed paths, because classify computes exact ANI and AAI against them.")
                 .arg(
                     Arg::new("db")
                         .long("db")
@@ -299,29 +299,40 @@ fn build_cli() -> Command {
                         .short('r')
                         .required(true)
                         .value_name("FILE")
-                        .help("Text file with one GTDB representative genome FASTA path per line"),
+                        .help("Text file with one reference genome FASTA path per line, named by genome ID (e.g. GCF_000005845.2_genomic.fna.gz or G000005825.fna.xz)"),
                 )
                 .arg(
-                    Arg::new("gtdbtk_data")
-                        .long("gtdbtk-data")
-                        .required(true)
-                        .value_name("DIR")
-                        .env("GTDBTK_DATA_PATH")
-                        .help("GTDB-Tk reference data package (taxonomy, radii, marker HMMs, masks and reference MSA)"),
+                    Arg::new("taxonomy")
+                        .long("taxonomy")
+                        .value_name("FILE")
+                        .action(ArgAction::Append)
+                        .value_delimiter(',')
+                        .required_unless_present("gtdbtk_data")
+                        .help("Reference taxonomy, one 'genome<TAB>d__...;p__...;...;s__...' line per genome, lower ranks optional (e.g. GTDB's bac120_taxonomy_r232.tsv.gz,ar53_taxonomy_r232.tsv.gz or WoL2's lineages.txt); repeatable"),
+                )
+                .arg(
+                    Arg::new("radii")
+                        .long("radii")
+                        .value_name("FILE")
+                        .help("Species ANI radii: 'species<TAB>genome<TAB>radius' lines (GTDB-Tk gtdb_radii.tsv) or GTDB sp_clusters_r232.tsv [default: 95% for every species]"),
                 )
                 .arg(
                     Arg::new("protein_list")
                         .long("protein-list")
                         .value_name("FILE")
-                        .required_unless_present("call_genes")
-                        .conflicts_with("call_genes")
-                        .help("Text file with one reference proteome path per line, named by accession (e.g. GTDB protein_faa_reps)"),
+                        .help("Text file with one reference proteome path per line, named by genome ID (e.g. GTDB protein_faa_reps) [default: call genes with FragGeneScanRs]"),
                 )
                 .arg(
-                    Arg::new("call_genes")
-                        .long("call-genes")
-                        .action(ArgAction::SetTrue)
-                        .help("Call reference genes with FragGeneScanRs instead of --protein-list"),
+                    Arg::new("gtdbtk_data")
+                        .long("gtdbtk-data")
+                        .value_name("DIR")
+                        .help("GTDB-Tk reference data package; supplies taxonomy, radii, marker HMMs, masks and the reference MSA unless --taxonomy or --radii are given"),
+                )
+                .arg(
+                    Arg::new("release")
+                        .long("release")
+                        .value_name("NAME")
+                        .help("Release label recorded in the database and logs (e.g. r232) [default: the package's, or 'custom']"),
                 )
                 .args(fgs_args())
                 .arg(bin_dir_arg())
@@ -403,8 +414,8 @@ fn build_cli() -> Command {
         )
         .subcommand(
             Command::new("classify")
-                .about("Classify genomes against GTDB with GTDB-Tk-compatible output")
-                .long_about("Classify genomes in a cascade over the three indexes of an aeon classify-db. (1) Genome sketch search proposes the closest GTDB species representatives. When only one has a sketch ANI of at least --min-sketch-ani and that estimate reaches its species radius, the genome gets that species; when several do, or the estimate falls short, TurboANI computes their exact ANI and AF and GTDB-Tk's ANI screen rule decides (closest reference with AF >= --min_af, within its GTDB radius, 95% by default). (2) Remaining genomes have genes called with FragGeneScanRs (complete-genome model); proteome sketch search proposes candidate reference proteomes and DIAMOND reciprocal best hits give AAI. The closest reference's genus (>= --genus-aai) or else family (>= --family-aai) is assigned when its AAI beats every reference of another genus (family) by at least --aai-margin points. (3) Genomes still unresolved have their bac120/ar53 marker genes extracted with hmmsearch and hmmalign as in GTDB-Tk; the masked concatenated markers are searched against the marker index, and the closest reference's lineage down to order is assigned. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, identify/, align/, classify/, and {prefix}.log.")
+                .about("Classify genomes against an aeon classify-db reference database, with GTDB-Tk-compatible output")
+                .long_about("Classify genomes in a cascade over the three indexes of an aeon classify-db. (1) Genome sketch search proposes the closest reference genomes. When only one has a sketch ANI of at least --min-sketch-ani and that estimate reaches its species radius, the genome gets that species; when several do, or the estimate falls short, TurboANI computes their exact ANI and AF and GTDB-Tk's ANI screen rule decides (closest reference with AF >= --min_af, within its species radius, 95% by default). (2) Remaining genomes have genes called with FragGeneScanRs (complete-genome model); proteome sketch search proposes candidate reference proteomes and DIAMOND reciprocal best hits give AAI. The closest reference's genus (>= --genus-aai) or else family (>= --family-aai) is assigned when its AAI beats every reference of another genus (family) by at least --aai-margin points. (3) Genomes still unresolved have their bac120/ar53 marker genes extracted with hmmsearch and hmmalign as in GTDB-Tk; the masked concatenated markers are searched against the marker index, and the closest reference's lineage down to order is assigned. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, identify/, align/, classify/, and {prefix}.log.")
                 .arg(
                     Arg::new("db")
                         .long("db")
@@ -597,7 +608,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         "classify-db" => build_classify_db(
             args.get_one::<String>("db").unwrap(),
             args.get_one::<String>("genome_list").unwrap(),
-            args.get_one::<String>("gtdbtk_data").unwrap(),
+            ReferenceSources {
+                gtdbtk_data: args.get_one::<String>("gtdbtk_data").cloned(),
+                taxonomy: args
+                    .get_many::<String>("taxonomy")
+                    .map_or_else(Vec::new, |files| files.cloned().collect()),
+                radii: args.get_one::<String>("radii").cloned(),
+                release: args.get_one::<String>("release").cloned(),
+            },
             match args.get_one::<String>("protein_list") {
                 Some(list) => ProteinSource::List(list.clone()),
                 None => ProteinSource::CallGenes(GeneCaller::locate(
