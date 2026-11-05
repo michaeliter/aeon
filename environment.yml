@@ -1,13 +1,14 @@
 # External tools used by `aeon classify`.
 # Create with: conda env create -f environment.yml && conda activate aeon-classify
+# FragGeneScanRs is not on bioconda; install it with
+#   cargo install frag_gene_scan_rs
+# (aeon finds its training models in the sources cargo keeps, or pass --fgs-train-dir).
 name: aeon-classify
 channels:
   - conda-forge
   - bioconda
 dependencies:
-  - pyrodigal>=3.6
   - diamond>=2.1
   - hmmer>=3.4
-  - pplacer>=1.1.alpha19
-  # Only needed to validate aeon classify against GTDB-Tk.
+  # Only needed to compare aeon classify with GTDB-Tk.
   - gtdbtk=2.8.0

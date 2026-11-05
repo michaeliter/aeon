@@ -6,7 +6,8 @@ mod utils;
 
 use std::error::Error;
 
-use crate::classify::refdb::{ProteinSource, TaxonomySource, build_classify_db};
+use crate::classify::genes::GeneCaller;
+use crate::classify::refdb::{IndexParams, ProteinSource, build_classify_db};
 use crate::classify::{ClassifyOptions, QueryInput, classify_genomes};
 use crate::database::{build_database, search_database, update_database};
 use crate::metadata::PrefixParams;
@@ -34,18 +35,34 @@ fn threads_arg() -> Arg {
         .help("Worker threads [default: all logical CPUs]")
 }
 
-fn pyrodigal_arg() -> Arg {
-    Arg::new("pyrodigal")
-        .long("pyrodigal")
-        .default_value("pyrodigal")
-        .value_name("PATH")
-        .help("pyrodigal executable used for gene calling")
+fn fgs_args() -> [Arg; 2] {
+    [
+        Arg::new("fgs")
+            .long("fgs")
+            .default_value("FragGeneScanRs")
+            .value_name("PATH")
+            .help("FragGeneScanRs executable used for gene calling"),
+        Arg::new("fgs_train_dir")
+            .long("fgs-train-dir")
+            .value_name("DIR")
+            .env("FGS_TRAIN_DIR")
+            .help("FragGeneScanRs train/ directory [default: next to the executable, or the sources cargo install keeps]"),
+    ]
 }
 
-fn classify_index_params(args: &clap::ArgMatches, seq_type: &str) -> PrefixParams {
-    let (kmer_size, sketch_size) = match seq_type {
-        "aa" => ("aa_kmer_size", "aa_sketch_size"),
-        _ => ("kmer_size", "sketch_size"),
+fn bin_dir_arg() -> Arg {
+    Arg::new("bin_dir")
+        .long("bin-dir")
+        .value_name("DIR")
+        .help("Directory holding hmmsearch and hmmalign (default: search PATH)")
+}
+
+/// Parameters of the "nt", "aa" or "markers" index of a classify database.
+fn classify_index_params(args: &clap::ArgMatches, index: &str) -> PrefixParams {
+    let (kmer_size, sketch_size, seq_type) = match index {
+        "aa" => ("aa_kmer_size", "aa_sketch_size", "aa"),
+        "markers" => ("marker_kmer_size", "marker_sketch_size", "aa"),
+        _ => ("kmer_size", "sketch_size", "dna"),
     };
     PrefixParams {
         kmer_size: *args.get_one(kmer_size).unwrap(),
@@ -54,7 +71,7 @@ fn classify_index_params(args: &clap::ArgMatches, seq_type: &str) -> PrefixParam
         seq_type: seq_type.into(),
         max_degree: *args.get_one("max_degree").unwrap(),
         build_beam_width: *args.get_one("build_beam_width").unwrap(),
-        alpha: 1.2,
+        alpha: *args.get_one("alpha").unwrap(),
         extra_seeds: 1,
         sketch_elem_size: 2,
         sketch_elem_type: "u16".into(),
@@ -268,7 +285,7 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("classify-db")
                 .about("Build a GTDB reference database for aeon classify")
-                .long_about("Sketch GTDB species-representative genomes into a static DiskANN index and store the GTDB taxonomy and species ANI radii needed by aeon classify. Taxonomy comes from a GTDB-Tk reference data package, or from GTDB release taxonomy and sp_clusters files. Reference files must be named by accession (e.g. GCF_000005845.2_genomic.fna.gz) and must stay at their listed paths, because classify computes exact ANI against them.")
+                .long_about("Build the three aeon indexes aeon classify searches, over GTDB species-representative genomes: their genomes (nucleotide k-mers), their proteomes (amino-acid k-mers), and their concatenated bac120/ar53 marker genes (amino-acid k-mers). Taxonomy, species ANI radii, marker HMMs and masks come from a GTDB-Tk reference data package. Marker genes come from the package's reference MSA; references missing from it get theirs from hmmsearch and hmmalign on their proteomes. Proteomes come from --protein-list (e.g. GTDB protein_faa_reps) or are called with FragGeneScanRs (--call-genes). Reference files must be named by accession (e.g. GCF_000005845.2_genomic.fna.gz) and must stay at their listed paths, because classify computes exact ANI and AAI against them.")
                 .arg(
                     Arg::new("db")
                         .long("db")
@@ -287,36 +304,16 @@ fn build_cli() -> Command {
                 .arg(
                     Arg::new("gtdbtk_data")
                         .long("gtdbtk-data")
+                        .required(true)
                         .value_name("DIR")
                         .env("GTDBTK_DATA_PATH")
-                        .conflicts_with_all(["taxonomy", "sp_clusters"])
-                        .help("GTDB-Tk reference data package; required later for marker-based placement"),
-                )
-                .arg(
-                    Arg::new("taxonomy")
-                        .long("taxonomy")
-                        .value_name("FILE")
-                        .action(ArgAction::Append)
-                        .requires_all(["sp_clusters", "release"])
-                        .help("GTDB release taxonomy file(s), e.g. bac120_taxonomy_r232.tsv.gz (repeatable)"),
-                )
-                .arg(
-                    Arg::new("sp_clusters")
-                        .long("sp-clusters")
-                        .value_name("FILE")
-                        .requires("taxonomy")
-                        .help("GTDB release sp_clusters_r*.tsv providing species ANI radii"),
-                )
-                .arg(
-                    Arg::new("release")
-                        .long("release")
-                        .value_name("NAME")
-                        .help("GTDB release name recorded with --taxonomy, e.g. r232"),
+                        .help("GTDB-Tk reference data package (taxonomy, radii, marker HMMs, masks and reference MSA)"),
                 )
                 .arg(
                     Arg::new("protein_list")
                         .long("protein-list")
                         .value_name("FILE")
+                        .required_unless_present("call_genes")
                         .conflicts_with("call_genes")
                         .help("Text file with one reference proteome path per line, named by accession (e.g. GTDB protein_faa_reps)"),
                 )
@@ -324,9 +321,10 @@ fn build_cli() -> Command {
                     Arg::new("call_genes")
                         .long("call-genes")
                         .action(ArgAction::SetTrue)
-                        .help("Call reference genes with pyrodigal to build the AAI protein index"),
+                        .help("Call reference genes with FragGeneScanRs instead of --protein-list"),
                 )
-                .arg(pyrodigal_arg())
+                .args(fgs_args())
+                .arg(bin_dir_arg())
                 .arg(
                     Arg::new("kmer_size")
                         .long("kmer-size")
@@ -335,6 +333,22 @@ fn build_cli() -> Command {
                         .value_name("K")
                         .value_parser(clap::value_parser!(usize))
                         .help("Nucleotide k-mer length"),
+                )
+                .arg(
+                    Arg::new("marker_kmer_size")
+                        .long("marker-kmer-size")
+                        .default_value("5")
+                        .value_name("K")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Amino-acid k-mer length for the marker-gene index"),
+                )
+                .arg(
+                    Arg::new("marker_sketch_size")
+                        .long("marker-sketch-size")
+                        .default_value("3000")
+                        .value_name("N")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Number of u16 values in each marker-gene MinHash sketch"),
                 )
                 .arg(
                     Arg::new("aa_kmer_size")
@@ -347,7 +361,7 @@ fn build_cli() -> Command {
                 .arg(
                     Arg::new("aa_sketch_size")
                         .long("aa-sketch-size")
-                        .default_value("12000")
+                        .default_value("10000")
                         .value_name("N")
                         .value_parser(clap::value_parser!(usize))
                         .help("Number of u16 values in each protein MinHash sketch"),
@@ -356,15 +370,15 @@ fn build_cli() -> Command {
                     Arg::new("sketch_size")
                         .long("sketch-size")
                         .short('s')
-                        .default_value("12000")
+                        .default_value("15000")
                         .value_name("N")
                         .value_parser(clap::value_parser!(usize))
-                        .help("Number of u16 values in each MinHash sketch"),
+                        .help("Number of u16 values in each nucleotide MinHash sketch"),
                 )
                 .arg(
                     Arg::new("max_degree")
                         .long("max-degree")
-                        .default_value("64")
+                        .default_value("128")
                         .value_name("R")
                         .value_parser(clap::value_parser!(usize))
                         .help("Maximum Vamana out-degree"),
@@ -372,17 +386,25 @@ fn build_cli() -> Command {
                 .arg(
                     Arg::new("build_beam_width")
                         .long("build-beam-width")
-                        .default_value("256")
+                        .default_value("512")
                         .value_name("L")
                         .value_parser(clap::value_parser!(usize))
                         .help("Construction beam"),
+                )
+                .arg(
+                    Arg::new("alpha")
+                        .long("alpha")
+                        .default_value("1.2")
+                        .value_name("FLOAT")
+                        .value_parser(clap::value_parser!(f32))
+                        .help("Vamana robust-pruning alpha parameter"),
                 )
                 .arg(threads_arg()),
         )
         .subcommand(
             Command::new("classify")
                 .about("Classify genomes against GTDB with GTDB-Tk-compatible output")
-                .long_about("Classify genomes in a cascade. DiskANN sketch search proposes the closest GTDB representatives and TurboANI computes their exact ANI. A genome within the closest reference's ANI radius (AF >= --min_af) receives that species, as in the GTDB-Tk ANI screen; one at or above --genus-ani (with AF >= --min_af) to a strict majority of one genus receives that genus. Remaining genomes have genes called with pyrodigal; protein sketch search proposes candidate reference proteomes and DIAMOND reciprocal best hits give AAI, assigning a genus (--genus-aai) or family (--family-aai) by majority among the --aai-top closest references. Genomes still unresolved go through GTDB-Tk's marker pipeline: hmmsearch finds the bac120/ar53 markers, the copy-number profile picks the domain, hmmalign builds the masked concatenated alignment, and pplacer places it in the GTDB reference tree (bacteria in the backbone tree, then a class-level tree, unless --full_tree), where RED and topology decide the rank. This tier requires a classify-db built from a GTDB-Tk data package. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, classify/, and {prefix}.log.")
+                .long_about("Classify genomes in a cascade over the three indexes of an aeon classify-db. (1) Genome sketch search proposes the closest GTDB species representatives. When only one has a sketch ANI of at least --min-sketch-ani and that estimate reaches its species radius, the genome gets that species; when several do, or the estimate falls short, TurboANI computes their exact ANI and AF and GTDB-Tk's ANI screen rule decides (closest reference with AF >= --min_af, within its GTDB radius, 95% by default). (2) Remaining genomes have genes called with FragGeneScanRs (complete-genome model); proteome sketch search proposes candidate reference proteomes and DIAMOND reciprocal best hits give AAI. The closest reference's genus (>= --genus-aai) or else family (>= --family-aai) is assigned when its AAI beats every reference of another genus (family) by at least --aai-margin points. (3) Genomes still unresolved have their bac120/ar53 marker genes extracted with hmmsearch and hmmalign as in GTDB-Tk; the masked concatenated markers are searched against the marker index, and the closest reference's lineage down to order is assigned. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, identify/, align/, classify/, and {prefix}.log.")
                 .arg(
                     Arg::new("db")
                         .long("db")
@@ -435,41 +457,49 @@ fn build_cli() -> Command {
                         .default_value("0.5")
                         .value_name("FLOAT")
                         .value_parser(clap::value_parser!(f64))
-                        .help("Minimum alignment fraction for a hit to count toward a species or ANI genus assignment"),
+                        .help("Minimum alignment fraction for a species assignment"),
                 )
                 .arg(
-                    Arg::new("genus_ani")
-                        .long("genus-ani")
-                        .default_value("80")
+                    Arg::new("min_sketch_ani")
+                        .long("min-sketch-ani")
+                        .default_value("90")
                         .value_name("PERCENT")
                         .value_parser(clap::value_parser!(f64))
-                        .help("ANI needed for genus consensus among hits passing --min_af; other genomes are left for the AAI tier"),
+                        .help("Sketch-estimated ANI a candidate needs to be considered for a species call; incomplete genomes lower the estimate"),
+                )
+                .arg(
+                    Arg::new("min_marker_identity")
+                        .long("min-marker-identity")
+                        .default_value("25")
+                        .value_name("PERCENT")
+                        .value_parser(clap::value_parser!(f64))
+                        .help("Sketch-estimated marker identity a marker-index hit needs; below it a genome stays unclassified past its domain"),
                 )
                 .arg(
                     Arg::new("genus_aai")
                         .long("genus-aai")
-                        .default_value("75")
+                        .default_value("65")
                         .value_name("PERCENT")
                         .value_parser(clap::value_parser!(f64))
-                        .help("AAI needed for genus consensus"),
+                        .help("AAI to the closest reference needed to assign its genus"),
                 )
                 .arg(
                     Arg::new("family_aai")
                         .long("family-aai")
-                        .default_value("65")
+                        .default_value("45")
                         .value_name("PERCENT")
                         .value_parser(clap::value_parser!(f64))
-                        .help("AAI needed for family consensus"),
+                        .help("AAI to the closest reference needed to assign its family"),
                 )
                 .arg(
-                    Arg::new("aai_top")
-                        .long("aai-top")
-                        .default_value("10")
-                        .value_name("N")
-                        .value_parser(clap::value_parser!(usize))
-                        .help("Closest references by AAI that vote on genus and family"),
+                    Arg::new("aai_margin")
+                        .long("aai-margin")
+                        .default_value("5")
+                        .value_name("POINTS")
+                        .value_parser(clap::value_parser!(f64))
+                        .help("AAI points by which the closest reference must beat every other genus (or family) to assign it"),
                 )
-                .arg(pyrodigal_arg())
+                .args(fgs_args())
                 .arg(
                     Arg::new("diamond")
                         .long("diamond")
@@ -486,27 +516,14 @@ fn build_cli() -> Command {
                         .value_parser(clap::value_parser!(f64))
                         .help("Leave out genomes with amino acids in fewer than this percentage of masked MSA columns"),
                 )
-                .arg(
-                    Arg::new("full_tree")
-                        .short('f')
-                        .long("full_tree")
-                        .visible_alias("full-tree")
-                        .action(ArgAction::SetTrue)
-                        .help("Place bacterial genomes in the full bac120 tree instead of the backbone and class-level trees"),
-                )
-                .arg(
-                    Arg::new("bin_dir")
-                        .long("bin-dir")
-                        .value_name("DIR")
-                        .help("Directory holding hmmsearch, hmmalign, pplacer and guppy (default: search PATH)"),
-                )
+                .arg(bin_dir_arg())
                 .arg(
                     Arg::new("candidates")
                         .long("candidates")
                         .default_value("10")
                         .value_name("N")
                         .value_parser(clap::value_parser!(usize))
-                        .help("Sketch-search candidates re-scored with exact ANI per genome"),
+                        .help("Sketch-search candidates per genome in each index"),
                 )
                 .arg(
                     Arg::new("beam_width")
@@ -580,31 +597,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         "classify-db" => build_classify_db(
             args.get_one::<String>("db").unwrap(),
             args.get_one::<String>("genome_list").unwrap(),
-            match args.get_one::<String>("gtdbtk_data") {
-                Some(root) if !args.contains_id("taxonomy") => {
-                    TaxonomySource::GtdbtkPackage(root.clone())
-                }
-                _ => TaxonomySource::ReleaseFiles {
-                    taxonomy: args
-                        .get_many::<String>("taxonomy")
-                        .ok_or("provide --gtdbtk-data, or --taxonomy with --sp-clusters")?
-                        .cloned()
-                        .collect(),
-                    release: args.get_one::<String>("release").unwrap().clone(),
-                    sp_clusters: args.get_one::<String>("sp_clusters").unwrap().clone(),
-                },
+            args.get_one::<String>("gtdbtk_data").unwrap(),
+            match args.get_one::<String>("protein_list") {
+                Some(list) => ProteinSource::List(list.clone()),
+                None => ProteinSource::CallGenes(GeneCaller::locate(
+                    args.get_one::<String>("fgs").unwrap(),
+                    args.get_one::<String>("fgs_train_dir").map(String::as_str),
+                )?),
             },
-            if args.get_flag("call_genes") {
-                ProteinSource::CallGenes(classify::external::find_program(
-                    args.get_one::<String>("pyrodigal").unwrap(),
-                )?)
-            } else if let Some(list) = args.get_one::<String>("protein_list") {
-                ProteinSource::List(list.clone())
-            } else {
-                ProteinSource::None
+            args.get_one::<String>("bin_dir").map(String::as_str),
+            IndexParams {
+                nt: classify_index_params(args, "nt"),
+                aa: classify_index_params(args, "aa"),
+                markers: classify_index_params(args, "markers"),
             },
-            classify_index_params(args, "dna"),
-            classify_index_params(args, "aa"),
         )?,
         "classify" => classify_genomes(&ClassifyOptions {
             db: args.get_one::<String>("db").unwrap().clone(),
@@ -620,15 +626,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             min_af: *args.get_one("min_af").unwrap(),
             candidates: *args.get_one("candidates").unwrap(),
             beam_width: *args.get_one("beam_width").unwrap(),
-            genus_ani: *args.get_one("genus_ani").unwrap(),
+            min_sketch_ani: *args.get_one("min_sketch_ani").unwrap(),
+            min_marker_identity: *args.get_one("min_marker_identity").unwrap(),
             genus_aai: *args.get_one("genus_aai").unwrap(),
             family_aai: *args.get_one("family_aai").unwrap(),
-            aai_top: *args.get_one("aai_top").unwrap(),
-            pyrodigal: args.get_one::<String>("pyrodigal").unwrap().clone(),
+            aai_margin: *args.get_one("aai_margin").unwrap(),
+            fgs: args.get_one::<String>("fgs").unwrap().clone(),
+            fgs_train_dir: args.get_one::<String>("fgs_train_dir").cloned(),
             diamond: args.get_one::<String>("diamond").unwrap().clone(),
             min_perc_aa: *args.get_one("min_perc_aa").unwrap(),
             bin_dir: args.get_one::<String>("bin_dir").cloned(),
-            full_tree: args.get_flag("full_tree"),
             threads: requested_threads(args),
         })?,
         _ => unreachable!(),

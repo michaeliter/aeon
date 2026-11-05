@@ -71,7 +71,8 @@ pub(crate) fn py_round(value: f64, digits: usize) -> String {
 pub(crate) struct RelatedReference {
     pub(crate) genome_id: String,
     pub(crate) ani: f64,
-    pub(crate) af: f64,
+    /// `None` for a sketch estimate without an aligned fraction.
+    pub(crate) af: Option<f64>,
 }
 
 /// Format closest-first references, skipping `exclude`, capped at 50 entries.
@@ -97,7 +98,9 @@ pub(crate) fn format_related_references(
                 species,
                 radius,
                 py_round(reference.ani, 2),
-                py_round(reference.af, 3)
+                reference
+                    .af
+                    .map_or_else(|| NONE_VALUE.into(), |af| py_round(af, 3))
             )
         })
         .collect::<Vec<_>>();
@@ -202,7 +205,7 @@ pub(crate) struct AniScreenRow {
     pub(crate) user_genome: String,
     pub(crate) reference_genome: String,
     pub(crate) ani: f64,
-    pub(crate) af: f64,
+    pub(crate) af: Option<f64>,
     pub(crate) reference_taxonomy: String,
     pub(crate) other_related_references: Option<String>,
 }
@@ -225,7 +228,8 @@ pub(crate) fn write_ani_summary(path: &Path, rows: &[AniScreenRow]) -> io::Resul
             row.user_genome,
             row.reference_genome,
             py_float(row.ani),
-            py_round(row.af, 3),
+            row.af
+                .map_or_else(|| NONE_VALUE.into(), |af| py_round(af, 3)),
             row.reference_taxonomy,
             row.other_related_references
                 .as_deref()
@@ -379,12 +383,12 @@ mod tests {
             RelatedReference {
                 genome_id: "GCF_000001.1".into(),
                 ani: 99.0,
-                af: 0.9,
+                af: Some(0.9),
             },
             RelatedReference {
                 genome_id: "GCF_000005845.2".into(),
                 ani: 96.123,
-                af: 0.8756,
+                af: Some(0.8756),
             },
         ];
         assert_eq!(

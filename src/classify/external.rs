@@ -28,6 +28,14 @@ pub(crate) fn find_program(program: &str) -> Result<PathBuf, Box<dyn Error>> {
         })
 }
 
+/// `program` from `bin_dir` when given, else from PATH.
+pub(crate) fn find_tool(bin_dir: Option<&str>, program: &str) -> Result<PathBuf, Box<dyn Error>> {
+    match bin_dir {
+        Some(dir) => find_program(&Path::new(dir).join(program).to_string_lossy()),
+        None => find_program(program),
+    }
+}
+
 /// Run a command to completion, turning a non-zero exit into an error that
 /// carries the command line and its stderr.
 pub(crate) fn run(command: &mut Command) -> Result<(), Box<dyn Error>> {

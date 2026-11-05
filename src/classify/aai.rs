@@ -1,6 +1,12 @@
 //! Tier 2: amino-acid identity. Amino-acid sketch search proposes candidate
-//! reference proteomes, DIAMOND reciprocal best hits give AAI, and a
-//! majority vote among close references assigns a genus or family.
+//! reference proteomes, DIAMOND reciprocal best hits give AAI, and the
+//! closest reference's genus or family is assigned when it leads every other
+//! genus or family by a margin.
+//!
+//! AAI comes from DIAMOND `blastp` in both directions with DIAMOND's default
+//! e-value: each protein's first hit of at least 20% identity is its best
+//! hit, and AAI is the unweighted mean identity of reciprocal best hits,
+//! reported only when there are at least 50 of them.
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -17,15 +23,15 @@ use crate::classify::refdata::GtdbtkData;
 
 /// DIAMOND threads per query job; small searches scale poorly past a few.
 const THREADS_PER_JOB: usize = 2;
-/// Fixed DIAMOND database size (letters), roughly ten candidate proteomes, so
-/// e-values do not depend on how many references a query was searched against.
-const DBSIZE: &str = "10000000";
 /// Genome tag of the query's proteins, distinct from every reference ID.
 const QUERY: u32 = u32::MAX;
-/// Reciprocal best hits must reach this identity (%) ...
-const MIN_IDENTITY: f64 = 30.0;
-/// ... and align this fraction of the shorter protein (MiGA/EzAAI-style).
-const MIN_ALIGNED_FRACTION: f64 = 0.7;
+/// DIAMOND's default e-value cutoff, applied as if each reference proteome
+/// were its own database, as in a search of one genome pair.
+const MAX_EVALUE: f64 = 0.001;
+/// Best hits need this identity (%) ...
+const MIN_IDENTITY: f64 = 20.0;
+/// ... and an AAI needs this many reciprocal best hits.
+const MIN_RECIPROCAL_HITS: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct AaiHit {
@@ -33,7 +39,11 @@ pub(crate) struct AaiHit {
     pub(crate) reference: u32,
     /// Mean identity of reciprocal best hits, 0-100.
     pub(crate) aai: f64,
+    /// Population standard deviation of those identities.
+    pub(crate) sd: f64,
     pub(crate) reciprocal_hits: usize,
+    /// Protein count of the smaller of the two proteomes.
+    pub(crate) min_proteins: usize,
 }
 
 /// One DIAMOND tabular hit: (query protein, subject protein, identity, bitscore).
@@ -45,8 +55,13 @@ struct ProteinHit {
     bitscore: f64,
 }
 
-/// Tagged protein ID ("{genome}|{index}") -> residues.
-type Proteins = HashMap<String, Vec<u8>>;
+/// Tagged protein IDs ("{genome}|{index}") of one or more proteomes.
+struct Proteomes {
+    /// Tagged ID -> residues.
+    proteins: HashMap<String, Vec<u8>>,
+    /// Genome -> (protein count, residue count).
+    sizes: HashMap<u32, (usize, usize)>,
+}
 
 /// AAI between each query proteome and its candidate reference proteomes,
 /// sorted by descending AAI. Each query is searched against its own
@@ -116,25 +131,53 @@ fn query_aai(
     // references keep their database IDs.
     let query_fasta = dir.join("query.faa");
     let reference_fasta = dir.join("references.faa");
-    let query_proteins = write_tagged_proteins(&[(QUERY, proteome)], &query_fasta)?;
+    let query = write_tagged_proteins(&[(QUERY, proteome)], &query_fasta)?;
     let reference_files = references
         .iter()
         .map(|&id| (id, Path::new(&reference_proteomes[id as usize])))
         .collect::<Vec<_>>();
-    let reference_proteins = write_tagged_proteins(&reference_files, &reference_fasta)?;
+    let reference = write_tagged_proteins(&reference_files, &reference_fasta)?;
+    let Some(&(query_count, _)) = query.sizes.get(&QUERY) else {
+        return Ok(Vec::new());
+    };
+    // All candidates share one database. Its size is pinned to their total
+    // length and each hit's e-value rescaled to its own proteome's length,
+    // reproducing the e-values of one database per reference.
+    let total_letters = reference
+        .sizes
+        .values()
+        .map(|&(_, letters)| letters)
+        .sum::<usize>();
+    let smallest = reference
+        .sizes
+        .values()
+        .map(|&(_, letters)| letters)
+        .min()
+        .unwrap_or(1);
+    let evalue_scale = |hit: &ProteinHit| {
+        reference.sizes[&genome_of(&hit.subject)].1 as f64 / total_letters as f64
+    };
     let forward = blastp(
         diamond,
-        dir,
-        "forward",
+        &[
+            "--dbsize",
+            &total_letters.to_string(),
+            "--evalue",
+            &(MAX_EVALUE * total_letters as f64 / smallest.max(1) as f64).to_string(),
+            // Every reference needs its own best hit, not the 25 best overall.
+            "--max-target-seqs",
+            "0",
+        ],
+        &dir.join("forward.tsv"),
         &query_fasta,
         &reference_fasta,
         threads,
-        &query_proteins,
-        &reference_proteins,
+        |hit, evalue| evalue * evalue_scale(hit) <= MAX_EVALUE,
     )?;
     let forward_best = best_hits(&forward);
     // Reciprocity only needs the reverse best hits of reference proteins that
-    // are some query protein's best hit, so only those are searched back.
+    // are some query protein's best hit, so only those are searched back
+    // against the whole query proteome.
     let best_subjects = forward_best
         .values()
         .map(|hit| hit.subject.as_str())
@@ -143,25 +186,27 @@ fn query_aai(
         return Ok(Vec::new());
     }
     let reverse_fasta = dir.join("best_hits.faa");
-    write_selected_proteins(&reference_proteins, &best_subjects, &reverse_fasta)?;
+    write_selected_proteins(&reference.proteins, &best_subjects, &reverse_fasta)?;
     let reverse = blastp(
         diamond,
-        dir,
-        "reverse",
+        &[],
+        &dir.join("reverse.tsv"),
         &reverse_fasta,
         &query_fasta,
         threads,
-        &reference_proteins,
-        &query_proteins,
+        |_, _| true,
     )?;
     let pairs = reciprocal_aai(&forward_best, &reverse);
     let mut hits = references
         .into_iter()
-        .filter_map(|reference| {
-            pairs.get(&reference).map(|&(aai, reciprocal_hits)| AaiHit {
-                reference,
-                aai,
-                reciprocal_hits,
+        .filter_map(|id| {
+            let identity = pairs.get(&id)?;
+            (identity.count >= MIN_RECIPROCAL_HITS).then(|| AaiHit {
+                reference: id,
+                aai: identity.mean(),
+                sd: identity.sd(),
+                reciprocal_hits: identity.count,
+                min_proteins: query_count.min(reference.sizes[&id].0),
             })
         })
         .collect::<Vec<_>>();
@@ -175,42 +220,41 @@ fn query_aai(
     Ok(hits)
 }
 
-/// Concatenate proteomes with `{genome}|{index}` IDs, dropping stop codons.
-/// Returns the written proteins.
+/// Concatenate proteomes with `{genome}|{index}` IDs, keeping stop codons.
 fn write_tagged_proteins(
     proteomes: &[(u32, &Path)],
     output: &Path,
-) -> Result<Proteins, Box<dyn Error>> {
+) -> Result<Proteomes, Box<dyn Error>> {
     let mut writer = BufWriter::new(File::create(output)?);
     let mut proteins = HashMap::new();
+    let mut sizes = HashMap::new();
     for &(genome, path) in proteomes {
         let mut reader = parse_fastx_file(path)
             .map_err(|error| format!("invalid protein FASTA {}: {error}", path.display()))?;
-        let mut index = 0usize;
+        let (mut count, mut letters) = (0usize, 0usize);
         while let Some(record) = reader.next() {
             let record = record?;
-            let sequence = record
-                .seq()
-                .iter()
-                .copied()
-                .filter(|&residue| residue != b'*')
-                .collect::<Vec<_>>();
-            if sequence.is_empty() {
+            let sequence = record.seq();
+            if sequence.iter().all(|&residue| residue == b'*') {
                 continue;
             }
-            let id = format!("{genome}|{index}");
-            index += 1;
+            let id = format!("{genome}|{count}");
+            count += 1;
+            letters += sequence.len();
             write_record(&mut writer, &id, &sequence)?;
-            proteins.insert(id, sequence);
+            proteins.insert(id, sequence.into_owned());
+        }
+        if count > 0 {
+            sizes.insert(genome, (count, letters));
         }
     }
     writer.flush()?;
-    Ok(proteins)
+    Ok(Proteomes { proteins, sizes })
 }
 
 /// Write the proteins named in `ids`, in ID order.
 fn write_selected_proteins(
-    proteins: &Proteins,
+    proteins: &HashMap<String, Vec<u8>>,
     ids: &HashSet<&str>,
     output: &Path,
 ) -> Result<(), Box<dyn Error>> {
@@ -230,55 +274,46 @@ fn write_record(writer: &mut impl Write, id: &str, sequence: &[u8]) -> std::io::
     writer.write_all(b"\n")
 }
 
-/// DIAMOND blastp of `queries` against the FASTA `subjects` (DIAMOND builds
-/// the database in memory), keeping hits that cover `MIN_ALIGNED_FRACTION`
-/// of the shorter protein.
-#[allow(clippy::too_many_arguments)]
+/// DIAMOND `blastp` of `queries` against the FASTA `subjects`
+/// (DIAMOND builds the database in memory), keeping hits of at least
+/// `MIN_IDENTITY` that `keep(hit, evalue)` accepts.
 fn blastp(
     diamond: &Path,
-    dir: &Path,
-    name: &str,
+    options: &[&str],
+    output: &Path,
     queries: &Path,
     subjects: &Path,
     threads: usize,
-    query_proteins: &Proteins,
-    subject_proteins: &Proteins,
+    keep: impl Fn(&ProteinHit, f64) -> bool,
 ) -> Result<Vec<ProteinHit>, Box<dyn Error>> {
-    let output = dir.join(format!("{name}.tsv"));
     run(Command::new(diamond)
         .args(["blastp", "--quiet", "--threads", &threads.to_string()])
-        .args(["--id", &MIN_IDENTITY.to_string()])
-        .args(["--dbsize", DBSIZE])
-        // Report every subject: best hits are needed per subject genome.
-        .args(["--max-target-seqs", "0"])
+        .args(options)
         .args([
-            "--outfmt", "6", "qseqid", "sseqid", "pident", "length", "bitscore",
+            "--outfmt", "6", "qseqid", "sseqid", "pident", "bitscore", "evalue",
         ])
         .arg("-q")
         .arg(queries)
         .arg("-d")
         .arg(subjects)
         .arg("-o")
-        .arg(&output))?;
-    let length = |proteins: &Proteins, id: &str| proteins.get(id).map_or(0, Vec::len);
+        .arg(output))?;
     let mut hits = Vec::new();
-    for line in BufReader::new(File::open(&output)?).lines() {
+    for line in BufReader::new(File::open(output)?).lines() {
         let line = line?;
         let fields = line.split('\t').collect::<Vec<_>>();
         if fields.len() < 5 {
             continue;
         }
-        let shorter = length(query_proteins, fields[0]).min(length(subject_proteins, fields[1]));
-        let aligned: usize = fields[3].parse()?;
-        if shorter == 0 || (aligned as f64) < MIN_ALIGNED_FRACTION * shorter as f64 {
-            continue;
-        }
-        hits.push(ProteinHit {
+        let hit = ProteinHit {
             query: fields[0].to_owned(),
             subject: fields[1].to_owned(),
             identity: fields[2].parse()?,
-            bitscore: fields[4].parse()?,
-        });
+            bitscore: fields[3].parse()?,
+        };
+        if hit.identity >= MIN_IDENTITY && keep(&hit, fields[4].parse()?) {
+            hits.push(hit);
+        }
     }
     Ok(hits)
 }
@@ -291,6 +326,7 @@ fn genome_of(protein: &str) -> u32 {
 }
 
 /// Best hit of each protein in each subject genome: (protein, genome) -> hit.
+/// Ties keep DIAMOND's first hit.
 fn best_hits(hits: &[ProteinHit]) -> HashMap<(&str, u32), &ProteinHit> {
     let mut best: HashMap<(&str, u32), &ProteinHit> = HashMap::new();
     for hit in hits {
@@ -305,83 +341,108 @@ fn best_hits(hits: &[ProteinHit]) -> HashMap<(&str, u32), &ProteinHit> {
     best
 }
 
-/// Mean identity and count of reciprocal best hits per reference, from the
-/// query's forward best hits and the reverse search.
+/// Running sums of reciprocal-best-hit identities.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct Identities {
+    sum: f64,
+    sum_squares: f64,
+    count: usize,
+}
+
+impl Identities {
+    fn mean(&self) -> f64 {
+        self.sum / self.count as f64
+    }
+
+    /// Population standard deviation.
+    fn sd(&self) -> f64 {
+        (self.sum_squares / self.count as f64 - self.mean().powi(2))
+            .max(0.0)
+            .sqrt()
+    }
+}
+
+/// Identities of reciprocal best hits per reference, from the query's
+/// forward best hits and the reverse search.
 fn reciprocal_aai(
     forward_best: &HashMap<(&str, u32), &ProteinHit>,
     reverse: &[ProteinHit],
-) -> HashMap<u32, (f64, usize)> {
+) -> HashMap<u32, Identities> {
     let reverse_best = best_hits(reverse);
-    let mut sums: HashMap<u32, (f64, usize)> = HashMap::new();
+    let mut sums: HashMap<u32, Identities> = HashMap::new();
     for (&(query_protein, reference), hit) in forward_best {
-        let reciprocal = reverse_best
-            .get(&(hit.subject.as_str(), genome_of(query_protein)))
-            .is_some_and(|back| back.subject == query_protein);
-        if reciprocal {
+        // The reverse search's identity is averaged; the forward one is the
+        // same alignment up to DIAMOND's heuristics.
+        let Some(back) = reverse_best.get(&(hit.subject.as_str(), genome_of(query_protein))) else {
+            continue;
+        };
+        if back.subject == query_protein {
             let entry = sums.entry(reference).or_default();
-            entry.0 += hit.identity;
-            entry.1 += 1;
+            entry.sum += back.identity;
+            entry.sum_squares += back.identity.powi(2);
+            entry.count += 1;
         }
     }
-    sums.into_iter()
-        .map(|(reference, (sum, count))| (reference, (sum / count as f64, count)))
-        .collect()
+    sums
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AaiDecision {
-    Genus {
-        taxonomy: String,
-        supporting: usize,
-        considered: usize,
-    },
-    Family {
-        taxonomy: String,
-        supporting: usize,
-        considered: usize,
-    },
+    Genus(AaiCall),
+    Family(AaiCall),
     Unresolved,
 }
 
-/// Among the top `top_n` hits, assign the best hit's genus (or else family)
-/// when it is the strict-majority taxon among hits at or above the threshold.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AaiCall {
+    pub(crate) taxonomy: String,
+    /// AAI to the closest reference, which gives the taxon.
+    pub(crate) aai: f64,
+    /// Points by which it beats the closest reference of another taxon at
+    /// the same rank; `None` when every hit shares the taxon.
+    pub(crate) lead: Option<f64>,
+}
+
+/// Assign the closest reference's genus (or else family) when its AAI
+/// reaches the rank's threshold and beats every other genus (family) among
+/// the hits by at least `margin` points. Unlike a vote, the margin does not
+/// depend on how many references a taxon has. `hits` are sorted by
+/// descending AAI.
 pub(crate) fn decide(
     hits: &[AaiHit],
     accessions: &[String],
     data: &GtdbtkData,
     genus_aai: f64,
     family_aai: f64,
-    top_n: usize,
+    margin: f64,
 ) -> AaiDecision {
-    let top = &hits[..hits.len().min(top_n)];
-    let consensus = |threshold: f64, ranks: usize| {
-        let taxa = top
+    let ranked = hits
+        .iter()
+        .filter_map(|hit| {
+            data.taxonomy_of(&accessions[hit.reference as usize])
+                .map(|taxonomy| (hit.aai, taxonomy))
+        })
+        .collect::<Vec<_>>();
+    let call = |threshold: f64, ranks: usize| {
+        let ((aai, taxonomy), rest) = ranked.split_first()?;
+        if *aai < threshold {
+            return None;
+        }
+        let taxon = &taxonomy[..ranks];
+        let lead = rest
             .iter()
-            .filter(|hit| hit.aai >= threshold)
-            .filter_map(|hit| {
-                data.taxonomy_of(&accessions[hit.reference as usize])
-                    .map(|taxonomy| taxonomy[..ranks].join(";"))
-            })
-            .collect::<Vec<_>>();
-        let best = taxa.first()?.clone();
-        let supporting = taxa.iter().filter(|taxon| **taxon == best).count();
-        (supporting * 2 > taxa.len()).then_some((best, supporting, taxa.len()))
+            .find(|(_, other)| other[..ranks] != *taxon)
+            .map(|(other, _)| aai - other);
+        lead.is_none_or(|lead| lead >= margin).then(|| AaiCall {
+            taxonomy: taxon.join(";"),
+            aai: *aai,
+            lead,
+        })
     };
-    if let Some((taxonomy, supporting, considered)) = consensus(genus_aai, 6) {
-        return AaiDecision::Genus {
-            taxonomy,
-            supporting,
-            considered,
-        };
+    if let Some(call) = call(genus_aai, 6) {
+        return AaiDecision::Genus(call);
     }
-    if let Some((taxonomy, supporting, considered)) = consensus(family_aai, 5) {
-        return AaiDecision::Family {
-            taxonomy,
-            supporting,
-            considered,
-        };
-    }
-    AaiDecision::Unresolved
+    call(family_aai, 5).map_or(AaiDecision::Unresolved, AaiDecision::Family)
 }
 
 #[cfg(test)]
@@ -412,7 +473,9 @@ mod tests {
             hit("7|2", "0|1", 40.0, 150.0),
         ];
         let pairs = reciprocal_aai(&best_hits(&forward), &reverse);
-        assert_eq!(pairs[&7], (75.0, 2));
+        assert_eq!(pairs[&7].count, 2);
+        assert_eq!(pairs[&7].mean(), 75.0);
+        assert_eq!(pairs[&7].sd(), 5.0);
     }
 
     #[test]
@@ -422,24 +485,25 @@ mod tests {
         let proteome = dir.join("ref.faa");
         fs::write(&proteome, ">a\nMKV*\n>b\n*\n>c\nMLL\n").unwrap();
         let tagged = dir.join("tagged.faa");
-        let proteins = write_tagged_proteins(&[(7, &proteome)], &tagged).unwrap();
+        let proteomes = write_tagged_proteins(&[(7, &proteome)], &tagged).unwrap();
         assert_eq!(
             fs::read_to_string(&tagged).unwrap(),
-            ">7|0\nMKV\n>7|1\nMLL\n"
+            ">7|0\nMKV*\n>7|1\nMLL\n"
         );
+        assert_eq!(proteomes.sizes[&7], (2, 7));
         let selected = dir.join("selected.faa");
-        write_selected_proteins(&proteins, &HashSet::from(["7|1"]), &selected).unwrap();
+        write_selected_proteins(&proteomes.proteins, &HashSet::from(["7|1"]), &selected).unwrap();
         assert_eq!(fs::read_to_string(&selected).unwrap(), ">7|1\nMLL\n");
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn rank_consensus_falls_back_to_family() {
+    fn margin_decides_genus_then_family() {
         let mut data = GtdbtkData::default();
         let taxa = [
             ("GCF_000000001.1", "f__F;g__A"),
             ("GCF_000000002.1", "f__F;g__B"),
-            ("GCF_000000003.1", "f__F;g__C"),
+            ("GCF_000000003.1", "f__G;g__C"),
         ];
         for (accession, family_genus) in taxa {
             data.taxonomy.insert(
@@ -454,41 +518,35 @@ mod tests {
         let aai = |reference, aai| AaiHit {
             reference,
             aai,
+            sd: 10.0,
             reciprocal_hits: 500,
+            min_proteins: 2000,
         };
+        let decide = |hits: &[AaiHit]| decide(hits, &accessions, &data, 65.0, 45.0, 5.0);
+        let call = |taxonomy: &str, aai, lead| AaiCall {
+            taxonomy: format!("d__Bacteria;p__P;c__C;o__O;{taxonomy}"),
+            aai,
+            lead,
+        };
+        // A genus with one reference still wins on its lead.
         assert_eq!(
-            decide(
-                &[aai(0, 80.0), aai(0, 76.0), aai(1, 70.0)],
-                &accessions,
-                &data,
-                75.0,
-                65.0,
-                10
-            ),
-            AaiDecision::Genus {
-                taxonomy: "d__Bacteria;p__P;c__C;o__O;f__F;g__A".into(),
-                supporting: 2,
-                considered: 2,
-            }
+            decide(&[aai(0, 80.0), aai(1, 70.0), aai(1, 69.0), aai(2, 60.0)]),
+            AaiDecision::Genus(call("f__F;g__A", 80.0, Some(10.0)))
+        );
+        // Too close to genus B for a genus, but well ahead of family G.
+        assert_eq!(
+            decide(&[aai(0, 72.0), aai(1, 70.0), aai(2, 60.0)]),
+            AaiDecision::Family(call("f__F", 72.0, Some(12.0)))
         );
         assert_eq!(
-            decide(
-                &[aai(0, 74.0), aai(1, 70.0), aai(2, 66.0)],
-                &accessions,
-                &data,
-                75.0,
-                65.0,
-                10
-            ),
-            AaiDecision::Family {
-                taxonomy: "d__Bacteria;p__P;c__C;o__O;f__F".into(),
-                supporting: 3,
-                considered: 3,
-            }
-        );
-        assert_eq!(
-            decide(&[aai(0, 60.0)], &accessions, &data, 75.0, 65.0, 10),
+            decide(&[aai(0, 72.0), aai(2, 70.0)]),
             AaiDecision::Unresolved
         );
+        // An unopposed taxon needs only the threshold.
+        assert_eq!(
+            decide(&[aai(0, 60.0)]),
+            AaiDecision::Family(call("f__F", 60.0, None))
+        );
+        assert_eq!(decide(&[aai(0, 40.0)]), AaiDecision::Unresolved);
     }
 }

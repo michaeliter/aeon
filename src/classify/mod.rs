@@ -1,4 +1,5 @@
-//! GTDB-Tk-compatible genome classification: ANI screen, AAI, then marker placement.
+//! GTDB-Tk-compatible genome classification: ANI screen, AAI, then a
+//! marker-gene search.
 
 pub(crate) mod aai;
 pub(crate) mod ani;
@@ -6,15 +7,12 @@ pub(crate) mod external;
 pub(crate) mod genes;
 pub(crate) mod log;
 pub(crate) mod markers;
-pub(crate) mod placement;
 pub(crate) mod refdata;
 pub(crate) mod refdb;
-pub(crate) mod split;
 pub(crate) mod summary;
 
 use rayon::prelude::*;
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -22,26 +20,20 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::classify::aai::{AaiDecision, AaiHit, compute_aai};
-use crate::classify::ani::{AniDecision, AniHit, MIN_SPECIES_RADIUS, decide, refine_candidates};
-use crate::classify::external::find_program;
-use crate::classify::genes::{GeneCalls, call_genes};
+use crate::classify::ani::{
+    AniDecision, AniHit, Candidate, MIN_SPECIES_RADIUS, Screen, decide, refine_candidates, screen,
+    sketch_ani,
+};
+use crate::classify::external::{find_program, find_tool};
+use crate::classify::genes::{GeneCaller, GeneCalls, TRANSLATION_TABLE};
 use crate::classify::log::ClassifyLog;
 use crate::classify::markers::{
-    CopyNumber, MARKER_SETS, PfamInfo, align_markers, apply_mask, copy_number, filtered_reason,
-    genome_domain, marker_hmms, multihit_warning, read_mask, read_msa, read_proteins,
-    read_reference_msa, search_markers, write_filtered, write_marker_info, write_markers_summary,
-    write_msa_gz,
+    CopyNumber, MARKER_SETS, MarkerTools, PfamInfo, align_markers, apply_mask, filtered_reason,
+    genome_domain, identify_markers, marker_hmms, marker_sequence, multihit_warning, read_mask,
+    write_filtered, write_marker_info, write_markers_summary, write_msa_gz,
 };
-use crate::classify::placement::{
-    Placement, classify_tree, program_version, run_pplacer, write_pplacer_classification,
-    write_red_dictionary,
-};
-use crate::classify::refdata::{marker_set_for_taxonomy, standardise_taxonomy, strip_db_prefix};
+use crate::classify::refdata::{marker_set_for_taxonomy, standardise_taxonomy};
 use crate::classify::refdb::ClassifyDb;
-use crate::classify::split::{
-    backbone_placement, class_tree, classify_backbone, phyla_of_classes, read_tree_mapping,
-    reconcile, write_backbone_classification, write_tree_mapping,
-};
 use crate::classify::summary::{
     AniScreenRow, RelatedReference, SummaryRow, format_related_references, py_round,
     write_ani_summary, write_summary,
@@ -65,15 +57,16 @@ pub(crate) struct ClassifyOptions {
     pub(crate) min_af: f64,
     pub(crate) candidates: usize,
     pub(crate) beam_width: usize,
-    pub(crate) genus_ani: f64,
+    pub(crate) min_sketch_ani: f64,
+    pub(crate) min_marker_identity: f64,
     pub(crate) genus_aai: f64,
     pub(crate) family_aai: f64,
-    pub(crate) aai_top: usize,
-    pub(crate) pyrodigal: String,
+    pub(crate) aai_margin: f64,
+    pub(crate) fgs: String,
+    pub(crate) fgs_train_dir: Option<String>,
     pub(crate) diamond: String,
     pub(crate) min_perc_aa: f64,
     pub(crate) bin_dir: Option<String>,
-    pub(crate) full_tree: bool,
     pub(crate) threads: usize,
 }
 
@@ -152,7 +145,7 @@ struct QueryResult<'a> {
     hits: Vec<AniHit>,
     decision: AniDecision,
     /// Gene calls for genomes the ANI tier left unresolved; the inner
-    /// `None` means pyrodigal called no genes.
+    /// `None` means FragGeneScanRs called no genes.
     genes: Option<Option<GeneCalls>>,
     aai: Option<AaiResult>,
     markers: Option<MarkerResult>,
@@ -166,8 +159,11 @@ struct AaiResult {
 /// Where the marker pipeline left a genome.
 #[derive(Debug)]
 enum MarkerOutcome {
-    /// In the masked user MSA, ready for placement.
-    Aligned { msa_percent: f64 },
+    /// In the masked user MSA and searched against the marker index.
+    Aligned {
+        msa_percent: f64,
+        closest: Option<MarkerHit>,
+    },
     /// No single-copy marker of either set.
     NoMarkers,
     /// Too few amino acids in the masked MSA; carries GTDB-Tk's reason.
@@ -179,8 +175,14 @@ struct MarkerResult {
     outcome: MarkerOutcome,
     /// Domain-questionable and multiple-hit warnings.
     warnings: Vec<String>,
-    /// Set once pplacer has placed an aligned genome.
-    placement: Option<Placement>,
+}
+
+/// The closest reference in the marker index.
+#[derive(Debug, Clone, PartialEq)]
+struct MarkerHit {
+    accession: String,
+    /// Sketch-estimated identity of the concatenated markers, 0-100.
+    identity: f64,
 }
 
 impl QueryResult<'_> {
@@ -212,7 +214,7 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
         "Using GTDB {} reference database {} ({} representative genomes)",
         db.manifest.gtdb_release,
         options.db,
-        db.nt_paths.len()
+        db.nt.paths.len()
     ));
     log.info(format!("Identified {} genomes to classify", queries.len()));
 
@@ -221,34 +223,67 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
         .iter()
         .map(|genome| genome.path.clone())
         .collect::<Vec<_>>();
-    let vectors = sketch_from_params(&query_paths, &db.nt_params);
-    let candidates = search_vectors(
-        &db.nt_prefix(),
-        db.nt_paths.len(),
+    let vectors = sketch_from_params(&query_paths, &db.nt.params);
+    let screens = search_vectors(
+        &db.nt.prefix,
+        db.nt.len(),
         &vectors,
         options.candidates,
         options.beam_width,
     )?
     .into_iter()
-    .map(|neighbors| neighbors.into_iter().map(|(id, _)| id).collect::<Vec<_>>())
+    .map(|neighbors| {
+        let candidates = neighbors
+            .into_iter()
+            .map(|(reference, distance)| Candidate {
+                reference,
+                sketch_ani: sketch_ani(distance, db.nt.params.kmer_size),
+            })
+            .collect::<Vec<_>>();
+        screen(
+            &candidates,
+            &db.nt.accessions,
+            &db.data,
+            options.min_sketch_ani,
+        )
+    })
     .collect::<Vec<_>>();
-    let hits = refine_candidates(&query_paths, &candidates, &db.nt_paths)?;
+    let exact = screens
+        .iter()
+        .map(|screen| match screen {
+            Screen::Exact(references) => references.clone(),
+            Screen::Estimated(_) => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let turboani = exact
+        .iter()
+        .filter(|references| !references.is_empty())
+        .count();
+    log.info(format!(
+        "TurboANI checks candidates for {turboani} genome(s); {} matched one species by sketch alone.",
+        screens
+            .iter()
+            .filter(|screen| matches!(screen, Screen::Estimated(_)))
+            .count()
+    ));
+    let exact_hits = refine_candidates(&query_paths, &exact, &db.nt.paths)?;
     let results = queries
         .iter()
-        .zip(hits)
-        .map(|(genome, hits)| QueryResult {
-            decision: decide(
-                &hits,
-                &db.nt_accessions,
-                &db.data,
-                options.min_af,
-                options.genus_ani,
-            ),
-            genome,
-            hits,
-            genes: None,
-            aai: None,
-            markers: None,
+        .zip(screens)
+        .zip(exact_hits)
+        .map(|((genome, screen), exact_hits)| {
+            let hits = match screen {
+                Screen::Estimated(hit) => vec![hit],
+                Screen::Exact(_) => exact_hits,
+            };
+            QueryResult {
+                decision: decide(&hits, &db.nt.accessions, &db.data, options.min_af),
+                genome,
+                hits,
+                genes: None,
+                aai: None,
+                markers: None,
+            }
         })
         .collect::<Vec<_>>();
     for result in &results {
@@ -260,8 +295,8 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
                 .hits
                 .iter()
                 .map(|hit| format!(
-                    "{}:{:.2}/{:.3}",
-                    db.nt_accessions[hit.reference as usize], hit.ani, hit.af
+                    "{}:{:.2}/{:?}",
+                    db.nt.accessions[hit.reference as usize], hit.ani, hit.af
                 ))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -278,7 +313,6 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
     call_query_genes(&mut results, options, &out_dir, &log)?;
     run_aai_tier(&mut results, &db, options, &out_dir, &log)?;
     run_marker_tier(&mut results, &db, options, &out_dir, &log)?;
-    run_placement_tier(&mut results, &db, options, &out_dir, &log)?;
 
     write_identify_files(&results, &out_dir, &options.prefix)?;
     let mut rows: BTreeMap<&'static str, Vec<SummaryRow>> = BTreeMap::new();
@@ -291,7 +325,7 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
         if let AniDecision::Species { hit } = &result.decision {
             ani_rows.entry(marker_set).or_default().push(AniScreenRow {
                 user_genome: result.genome.id.clone(),
-                reference_genome: db.nt_accessions[hit.reference as usize].clone(),
+                reference_genome: db.nt.accessions[hit.reference as usize].clone(),
                 ani: hit.ani,
                 af: hit.af,
                 reference_taxonomy: row.closest_genome_taxonomy.clone().unwrap_or_default(),
@@ -326,6 +360,8 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
     Ok(())
 }
 
+const NO_GENES: &str = "No genes were called by FragGeneScanRs";
+
 fn marker_genes_dir(out_dir: &Path) -> PathBuf {
     out_dir
         .join("identify")
@@ -333,7 +369,7 @@ fn marker_genes_dir(out_dir: &Path) -> PathBuf {
         .join("marker_genes")
 }
 
-/// Call genes with pyrodigal for genomes the ANI tier left unresolved.
+/// Call genes with FragGeneScanRs for genomes the ANI tier left unresolved.
 fn call_query_genes(
     results: &mut [QueryResult],
     options: &ClassifyOptions,
@@ -349,17 +385,20 @@ fn call_query_genes(
     if pending.is_empty() {
         return Ok(());
     }
-    let pyrodigal = find_program(&options.pyrodigal)?;
+    let caller = GeneCaller::locate(&options.fgs, options.fgs_train_dir.as_deref())?;
     log.info(format!(
-        "Calling genes with pyrodigal for {} genome(s) not resolved by ANI",
+        "Calling genes with FragGeneScanRs for {} genome(s) not resolved by ANI",
         pending.len()
     ));
     let marker_dir = marker_genes_dir(out_dir);
+    // FragGeneScanRs splits a genome's contigs across its threads.
+    let job_threads = (options.threads / pending.len()).max(1);
     let genes = pending
         .par_iter()
         .map(|&index| {
             let genome = results[index].genome;
-            call_genes(&pyrodigal, &genome.path, &genome.id, &marker_dir)
+            caller
+                .call(&genome.path, &genome.id, &marker_dir, job_threads)
                 .map_err(|error| format!("gene calling failed for {}: {error}", genome.id))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -391,13 +430,6 @@ fn run_aai_tier(
     if called.is_empty() {
         return Ok(());
     }
-    let Some((aa_params, aa_paths)) = &db.aa else {
-        log.warn(format!(
-            "{} genome(s) need the AAI tier, but the database has no protein index; rebuild it with --call-genes or --protein-list",
-            called.len()
-        ));
-        return Ok(());
-    };
     let diamond = find_program(&options.diamond)?;
     log.info(format!(
         "Running AAI search with DiskANN candidate search and DIAMOND for {} genome(s)",
@@ -407,10 +439,10 @@ fn run_aai_tier(
         .iter()
         .map(|(_, faa)| faa.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    let vectors = sketch_from_params(&proteome_paths, aa_params);
+    let vectors = sketch_from_params(&proteome_paths, &db.aa.params);
     let candidates = search_vectors(
-        &db.aa_prefix(),
-        aa_paths.len(),
+        &db.aa.prefix,
+        db.aa.len(),
         &vectors,
         options.candidates,
         options.beam_width,
@@ -430,7 +462,7 @@ fn run_aai_tier(
             .join("intermediate_results"),
         &proteomes,
         &candidates,
-        aa_paths,
+        &db.aa.paths,
         options.threads,
     )?;
 
@@ -445,11 +477,11 @@ fn run_aai_tier(
         let hits = hits_by_index.remove(&index).unwrap_or_default();
         let decision = aai::decide(
             &hits,
-            &db.nt_accessions,
+            &db.nt.accessions,
             &db.data,
             options.genus_aai,
             options.family_aai,
-            options.aai_top,
+            options.aai_margin,
         );
         if decision != AaiDecision::Unresolved {
             resolved += 1;
@@ -461,7 +493,7 @@ fn run_aai_tier(
             hits.iter()
                 .map(|hit| format!(
                     "{}:{:.2}/{}",
-                    db.nt_accessions[hit.reference as usize], hit.aai, hit.reciprocal_hits
+                    db.nt.accessions[hit.reference as usize], hit.aai, hit.reciprocal_hits
                 ))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -474,404 +506,10 @@ fn run_aai_tier(
     write_aai_summary(results, db, out_dir, &options.prefix)
 }
 
-/// An external program from `--bin-dir`, or from PATH.
-fn tool(options: &ClassifyOptions, program: &str) -> Result<PathBuf, Box<dyn Error>> {
-    match &options.bin_dir {
-        Some(dir) => find_program(&Path::new(dir).join(program).to_string_lossy()),
-        None => find_program(program),
-    }
-}
-
-/// GTDB-Tk's `classify` step for aligned genomes: pplacer into the reference
-/// tree, then RED and topology. Bacteria go through the backbone and
-/// class-level trees unless `--full_tree` is set.
-fn run_placement_tier(
-    results: &mut [QueryResult],
-    db: &ClassifyDb,
-    options: &ClassifyOptions,
-    out_dir: &Path,
-    log: &ClassifyLog,
-) -> Result<(), Box<dyn Error>> {
-    let Some(root) = db.data.root.clone() else {
-        return Ok(());
-    };
-    for set in MARKER_SETS {
-        let pending = results
-            .iter()
-            .enumerate()
-            .filter(|(_, result)| {
-                result.markers.as_ref().is_some_and(|markers| {
-                    markers.marker_set == set
-                        && matches!(markers.outcome, MarkerOutcome::Aligned { .. })
-                })
-            })
-            .map(|(index, result)| (result.genome.id.clone(), index))
-            .collect::<BTreeMap<_, _>>();
-        if pending.is_empty() {
-            continue;
-        }
-        let placer = Placer {
-            pplacer: tool(options, "pplacer")?,
-            guppy: tool(options, "guppy")?,
-            root: &root,
-            db,
-            options,
-            out_dir,
-            log,
-            red_dict: if set == "ar53" {
-                &db.data.red_dist_arc
-            } else {
-                &db.data.red_dist_bac
-            },
-        };
-        fs::create_dir_all(placer.pplacer_dir())?;
-        write_red_dictionary(
-            &placer
-                .intermediate()
-                .join(format!("{}.{set}.red_dictionary.tsv", options.prefix)),
-            placer.red_dict,
-        )?;
-        let users = pending.keys().cloned().collect::<HashSet<_>>();
-        let placements = if set == "bac120" && !options.full_tree {
-            placer.place_split(&users)?
-        } else {
-            placer.place_full_tree(set, &users)?
-        };
-        for (genome, placement) in placements {
-            let index = pending[&genome];
-            add_placement_ani(&mut results[index], &placement, db)?;
-            if let Some(markers) = results[index].markers.as_mut() {
-                markers.placement = Some(placement);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Runs pplacer for one marker set and classifies its placements.
-struct Placer<'a> {
-    pplacer: PathBuf,
-    guppy: PathBuf,
-    root: &'a Path,
-    db: &'a ClassifyDb,
-    options: &'a ClassifyOptions,
-    out_dir: &'a Path,
-    log: &'a ClassifyLog,
-    red_dict: &'a HashMap<String, f64>,
-}
-
-impl Placer<'_> {
-    fn classify_dir(&self) -> PathBuf {
-        self.out_dir.join("classify")
-    }
-
-    fn intermediate(&self) -> PathBuf {
-        self.classify_dir().join("intermediate_results")
-    }
-
-    fn pplacer_dir(&self) -> PathBuf {
-        self.intermediate().join("pplacer")
-    }
-
-    fn user_msa(&self, set: &str) -> PathBuf {
-        self.out_dir
-            .join("align")
-            .join(format!("{}.{set}.user_msa.fasta.gz", self.options.prefix))
-    }
-
-    fn threads(&self) -> usize {
-        self.options.threads.clamp(1, 64)
-    }
-
-    fn run(
-        &self,
-        refpkg: &Path,
-        msa: &Path,
-        json_out: &Path,
-        pplacer_out: &Path,
-        tree_out: &Path,
-    ) -> Result<(), Box<dyn Error>> {
-        run_pplacer(
-            &self.pplacer,
-            &self.guppy,
-            refpkg,
-            msa,
-            json_out,
-            pplacer_out,
-            tree_out,
-            self.options.threads,
-        )?;
-        self.log
-            .info("Calculating RED values based on reference tree.");
-        Ok(())
-    }
-
-    fn warn_unplaced(&self, expected: usize, placed: usize) {
-        if expected > placed {
-            self.log.warn(format!(
-                "{} out of {expected} have not been properly placed by pplacer. This is a known issue with pplacer but we do not have a solution currently.",
-                expected - placed
-            ));
-        }
-    }
-
-    /// The whole reference tree of `set` (GTDB-Tk's full-tree mode).
-    fn place_full_tree(
-        &self,
-        set: &str,
-        users: &HashSet<String>,
-    ) -> Result<BTreeMap<String, Placement>, Box<dyn Error>> {
-        let prefix = &self.options.prefix;
-        self.log.info(format!(
-            "Placing {} {} genomes into reference tree with pplacer using {} CPUs (be patient).",
-            thousands(users.len()),
-            domain_adjective(set),
-            self.threads()
-        ));
-        self.log.info(format!(
-            "pplacer version: {}",
-            program_version(&self.pplacer)
-        ));
-        let tree_path = self
-            .classify_dir()
-            .join(format!("{prefix}.{set}.classify.tree"));
-        self.run(
-            &self
-                .root
-                .join("pplacer")
-                .join(format!("gtdb_{}_{set}.refpkg", self.db.data.version)),
-            &self.user_msa(set),
-            &self.pplacer_dir().join(format!("pplacer.{set}.json")),
-            &self.pplacer_dir().join(format!("pplacer.{set}.out")),
-            &tree_path,
-        )?;
-        let placements = classify_tree(
-            &tree_path,
-            &self
-                .root
-                .join("mrca_red")
-                .join(format!("gtdbtk_{}_{set}.tsv", self.db.data.version)),
-            set,
-            users,
-            &self.db.data,
-            self.red_dict,
-        )?;
-        write_pplacer_classification(
-            &self
-                .intermediate()
-                .join(format!("{prefix}.{set}.classification_pplacer.tsv")),
-            &placements,
-        )?;
-        self.log
-            .info("Traversing tree to determine classification method.");
-        self.warn_unplaced(users.len(), placements.len());
-        Ok(placements)
-    }
-
-    /// GTDB-Tk's split-tree mode for bacteria: the backbone tree assigns a
-    /// class, the class picks a class-level tree, and rules 1-6 reconcile
-    /// the two placements.
-    fn place_split(
-        &self,
-        users: &HashSet<String>,
-    ) -> Result<BTreeMap<String, Placement>, Box<dyn Error>> {
-        let prefix = &self.options.prefix;
-        let split = self.root.join("split");
-        let class_level = split.join("class_level");
-        self.log.info(format!(
-            "Placing {} bacterial genomes into backbone reference tree with pplacer using {} CPUs (be patient).",
-            thousands(users.len()),
-            self.threads()
-        ));
-        self.log.info(format!(
-            "pplacer version: {}",
-            program_version(&self.pplacer)
-        ));
-        let backbone_tree = self
-            .classify_dir()
-            .join(format!("{prefix}.backbone.bac120.classify.tree"));
-        self.run(
-            &split
-                .join("backbone")
-                .join("pplacer")
-                .join("gtdbtk_package_backbone.refpkg"),
-            &self.user_msa("bac120"),
-            &self.pplacer_dir().join("pplacer.backbone.bac120.json"),
-            &self.pplacer_dir().join("pplacer.backbone.bac120.out"),
-            &backbone_tree,
-        )?;
-        let backbone = classify_backbone(
-            &backbone_tree,
-            &split
-                .join("backbone")
-                .join("red")
-                .join("backbone_red_value.tsv"),
-            users,
-            &self.db.data,
-            self.red_dict,
-        )?;
-        write_backbone_classification(
-            &self.intermediate().join(format!(
-                "{prefix}.bac120.backbone.classification_pplacer.tsv"
-            )),
-            &backbone,
-        )?;
-        self.warn_unplaced(users.len(), backbone.len());
-
-        let mapping = read_tree_mapping(&class_level.join("tree_mapping.tsv"))?;
-        let mut placements = BTreeMap::new();
-        let mut rules = BTreeMap::new();
-        let mut trees: Vec<(&str, Vec<&str>)> = Vec::new();
-        for (genome, call) in &backbone {
-            match class_tree(call, &mapping)? {
-                Some(tree) => match trees.iter_mut().find(|(id, _)| *id == tree) {
-                    Some((_, genomes)) => genomes.push(genome),
-                    None => trees.push((tree, vec![genome])),
-                },
-                None => {
-                    placements.insert(genome.clone(), backbone_placement(call));
-                    rules.insert(genome.clone(), ("backbone".to_owned(), "Rule 1"));
-                }
-            }
-        }
-        self.log.info(format!(
-            "{} out of {} have an class assignments. Those genomes will be reclassified.",
-            trees
-                .iter()
-                .map(|(_, genomes)| genomes.len())
-                .sum::<usize>(),
-            users.len()
-        ));
-        trees.sort_by_key(|(_, genomes)| Reverse(genomes.len()));
-
-        let msa = read_msa(&self.user_msa("bac120"))?;
-        let calls = backbone
-            .iter()
-            .map(|(genome, call)| (genome.as_str(), call))
-            .collect::<HashMap<_, _>>();
-        for (index, (tree_id, genomes)) in trees.iter().enumerate() {
-            let tree_dir = self.pplacer_dir().join(format!("tree_{tree_id}"));
-            fs::create_dir_all(&tree_dir)?;
-            let sub_msa = tree_dir.join("user_msa_file.fasta");
-            let mut output = BufWriter::new(File::create(&sub_msa)?);
-            for genome in genomes {
-                writeln!(
-                    output,
-                    ">{genome}\n{}",
-                    msa.get(*genome).map_or("", String::as_str)
-                )?;
-            }
-            output.flush()?;
-            self.log.info(format!(
-                "Placing {} bacterial genomes into class-level reference tree {tree_id} ({}/{}) with pplacer using {} CPUs (be patient).",
-                thousands(genomes.len()),
-                index + 1,
-                trees.len(),
-                self.threads()
-            ));
-            let tree_path = self
-                .classify_dir()
-                .join(format!("{prefix}.bac120.classify.tree.{tree_id}.tree"));
-            self.run(
-                &class_level
-                    .join("pplacer")
-                    .join(format!("gtdbtk.package.{tree_id}.refpkg")),
-                &sub_msa,
-                &tree_dir.join("pplacer.class_level.bac120.json"),
-                &tree_dir.join("pplacer.class_level.bac120.out"),
-                &tree_path,
-            )?;
-            let tree_users = genomes.iter().map(|g| (*g).to_owned()).collect();
-            let class_placements = classify_tree(
-                &tree_path,
-                &class_level
-                    .join("red")
-                    .join(format!("red_value_{tree_id}.tsv")),
-                "bac120",
-                &tree_users,
-                &self.db.data,
-                self.red_dict,
-            )?;
-            write_pplacer_classification(
-                &self.intermediate().join(format!(
-                    "{prefix}.bac120.class_level.classification_pplacer_tree_{tree_id}.tsv"
-                )),
-                &class_placements,
-            )?;
-            self.log
-                .info("Traversing tree to determine classification method.");
-            self.warn_unplaced(genomes.len(), class_placements.len());
-            let valid_classes = mapping
-                .iter()
-                .filter(|(_, tree)| tree == tree_id)
-                .map(|(class, _)| class.clone())
-                .collect::<HashSet<_>>();
-            let valid_phyla = phyla_of_classes(&valid_classes, &self.db.data);
-            for (genome, placement) in class_placements {
-                let reconciled = reconcile(
-                    calls[genome.as_str()],
-                    placement,
-                    &valid_classes,
-                    &valid_phyla,
-                );
-                let tree = if reconciled.on_backbone {
-                    "backbone".to_owned()
-                } else {
-                    (*tree_id).to_owned()
-                };
-                rules.insert(genome.clone(), (tree, reconciled.rule));
-                placements.insert(genome, reconciled.placement);
-            }
-        }
-        write_tree_mapping(
-            &self
-                .classify_dir()
-                .join(format!("{prefix}.bac120.tree.mapping.tsv")),
-            &rules,
-        )?;
-        Ok(placements)
-    }
-}
-
-/// GTDB-Tk compares a placed genome that has ANI hits with every reference,
-/// so its placement reference always has an ANI if one exists. aeon's hits
-/// come from candidate search, so measure the placement reference directly
-/// when it is missing.
-fn add_placement_ani(
-    result: &mut QueryResult,
-    placement: &Placement,
-    db: &ClassifyDb,
-) -> Result<(), Box<dyn Error>> {
-    let Some(reference) = &placement.reference else {
-        return Ok(());
-    };
-    if ani::reportable(&result.hits).next().is_none() {
-        return Ok(());
-    }
-    let accession = strip_db_prefix(reference);
-    let Some(index) = db.nt_accessions.iter().position(|id| id == accession) else {
-        return Ok(());
-    };
-    if result
-        .hits
-        .iter()
-        .any(|hit| hit.reference as usize == index)
-    {
-        return Ok(());
-    }
-    let hits = refine_candidates(
-        std::slice::from_ref(&result.genome.path),
-        &[vec![index as u32]],
-        &db.nt_paths,
-    )?;
-    result.hits.extend(hits.into_iter().flatten());
-    ani::sort_hits(&mut result.hits);
-    Ok(())
-}
-
 /// GTDB-Tk's `identify` and `align` steps for genomes neither ANI nor AAI
-/// resolved: marker search, copy number, domain call, and the masked
-/// concatenated alignment.
+/// resolved (marker search, copy number, domain call, and the masked
+/// concatenated alignment), then a search of the marker index for the
+/// closest reference.
 fn run_marker_tier(
     results: &mut [QueryResult],
     db: &ClassifyDb,
@@ -891,14 +529,11 @@ fn run_marker_tier(
     if pending.is_empty() {
         return Ok(());
     }
-    let Some(root) = db.data.root.clone() else {
-        log.warn(format!(
-            "{} genome(s) need the marker tier, but the database was not built from a GTDB-Tk data package (--gtdbtk-data)",
-            pending.len()
-        ));
-        return Ok(());
-    };
-    let (hmmsearch, hmmalign) = (tool(options, "hmmsearch")?, tool(options, "hmmalign")?);
+    let root = db.root().to_path_buf();
+    let (hmmsearch, hmmalign) = (
+        find_tool(options.bin_dir.as_deref(), "hmmsearch")?,
+        find_tool(options.bin_dir.as_deref(), "hmmalign")?,
+    );
 
     log.info(format!(
         "Identifying markers in {} genomes with {} threads.",
@@ -906,18 +541,26 @@ fn run_marker_tier(
         options.threads
     ));
     let pfam_info = PfamInfo::load(&root)?;
-    let marker_dir = marker_genes_dir(out_dir);
-    let searched = pending
-        .par_iter()
-        .map(|(index, id, faa)| {
-            let (pfam, tigrfam) =
-                search_markers(&hmmsearch, &root, &pfam_info, id, faa, &marker_dir.join(id))
-                    .map_err(|error| format!("marker search failed for {id}: {error}"))?;
-            let proteins = read_proteins(faa).map_err(|error| format!("{id}: {error}"))?;
-            let copies = MARKER_SETS.map(|set| copy_number(set, &proteins, &pfam, &tigrfam));
-            Ok::<_, String>((*index, id.clone(), copies))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let tools = MarkerTools {
+        hmmsearch: &hmmsearch,
+        hmmalign: &hmmalign,
+        root: &root,
+        pfam_info: &pfam_info,
+    };
+    let proteomes = pending
+        .iter()
+        .map(|(_, id, faa)| (id.clone(), faa.clone()))
+        .collect::<Vec<_>>();
+    let searched = identify_markers(
+        &tools,
+        &proteomes,
+        &marker_genes_dir(out_dir),
+        options.threads,
+    )?
+    .into_iter()
+    .zip(&pending)
+    .map(|((id, copies), (index, _, _))| (*index, id, copies))
+    .collect::<Vec<_>>();
     let mut summaries: BTreeMap<&str, BTreeMap<String, CopyNumber>> = BTreeMap::new();
     for (_, id, copies) in &searched {
         for (set, copies) in MARKER_SETS.iter().zip(copies) {
@@ -972,6 +615,7 @@ fn run_marker_tier(
         options.threads
     ));
     let mut outcomes: BTreeMap<String, MarkerOutcome> = BTreeMap::new();
+    let mut aligned: BTreeMap<String, (String, f64, &'static str)> = BTreeMap::new();
     for set in MARKER_SETS {
         let genomes = domains
             .iter()
@@ -1027,20 +671,6 @@ fn run_marker_tier(
             .iter()
             .map(|(id, (masked, _))| (id.clone(), masked.clone()))
             .collect::<BTreeMap<_, _>>();
-        let mut msa = user_msa.clone();
-        for (id, alignment) in read_reference_msa(&root, &db.data.version, set)? {
-            msa.insert(id, apply_mask(&alignment, &mask)?.0);
-        }
-        log.info(format!(
-            "Creating concatenated alignment for {} {domain_name} GTDB and user genomes.",
-            thousands(msa.len())
-        ));
-        write_msa_gz(
-            &align_dir.join(format!("{}.{set}.msa.fasta.gz", options.prefix)),
-            &msa,
-            &db.data,
-        )?;
-        drop(msa);
         if !user_msa.is_empty() {
             log.info(format!(
                 "Creating concatenated alignment for {} {domain_name} user genomes.",
@@ -1059,9 +689,19 @@ fn run_marker_tier(
         for (id, masked) in &pruned {
             outcomes.insert(id.clone(), MarkerOutcome::Filtered(filtered_reason(masked)));
         }
-        for (id, (_, msa_percent)) in kept {
-            outcomes.insert(id, MarkerOutcome::Aligned { msa_percent });
+        for (id, (masked, msa_percent)) in kept {
+            aligned.insert(id, (masked, msa_percent, set));
         }
+    }
+    let closest = search_marker_index(&aligned, db, options, out_dir, log)?;
+    for (id, (_, msa_percent, _)) in aligned {
+        outcomes.insert(
+            id.clone(),
+            MarkerOutcome::Aligned {
+                msa_percent,
+                closest: closest.get(&id).cloned(),
+            },
+        );
     }
     let no_markers = outcomes
         .iter()
@@ -1083,10 +723,80 @@ fn run_marker_tier(
             marker_set: set,
             outcome,
             warnings,
-            placement: None,
         });
     }
     Ok(())
+}
+
+/// Search the marker index with each aligned genome's marker residues, and
+/// write the hits of the genome's own domain at or above
+/// `--min-marker-identity` to `classify/markers/{prefix}.marker_summary.tsv`.
+/// Returns the closest such reference per genome.
+fn search_marker_index(
+    aligned: &BTreeMap<String, (String, f64, &'static str)>,
+    db: &ClassifyDb,
+    options: &ClassifyOptions,
+    out_dir: &Path,
+    log: &ClassifyLog,
+) -> Result<BTreeMap<String, MarkerHit>, Box<dyn Error>> {
+    if aligned.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    log.info(format!(
+        "Searching the marker index for {} genome(s).",
+        thousands(aligned.len())
+    ));
+    let dir = out_dir.join("classify").join("markers");
+    let sequence_dir = dir.join("intermediate_results");
+    fs::create_dir_all(&sequence_dir)?;
+    let mut paths = Vec::with_capacity(aligned.len());
+    for (id, (masked, _, _)) in aligned {
+        let path = sequence_dir.join(format!("{id}.faa"));
+        fs::write(&path, format!(">{id}\n{}\n", marker_sequence(masked)))?;
+        paths.push(path.to_string_lossy().into_owned());
+    }
+    let vectors = sketch_from_params(&paths, &db.markers.params);
+    let neighbors = search_vectors(
+        &db.markers.prefix,
+        db.markers.len(),
+        &vectors,
+        options.candidates,
+        options.beam_width,
+    )?;
+    let mut output = BufWriter::new(File::create(
+        dir.join(format!("{}.marker_summary.tsv", options.prefix)),
+    )?);
+    writeln!(
+        output,
+        "user_genome\treference_genome\testimated_marker_identity\treference_taxonomy"
+    )?;
+    let mut closest = BTreeMap::new();
+    for ((id, (_, _, marker_set)), hits) in aligned.iter().zip(neighbors) {
+        for (reference, distance) in hits {
+            let accession = &db.markers.accessions[reference as usize];
+            let identity = sketch_ani(distance, db.markers.params.kmer_size);
+            // Unrelated marker sets share k-mers only by chance, and the
+            // other domain's markers are different genes.
+            let Some(taxonomy) = db.data.taxonomy_of(accession).filter(|taxonomy| {
+                marker_set_for_taxonomy(taxonomy) == *marker_set
+                    && identity >= options.min_marker_identity
+            }) else {
+                continue;
+            };
+            writeln!(
+                output,
+                "{id}\t{accession}\t{}\t{}",
+                py_round(identity, 2),
+                taxonomy.join(";")
+            )?;
+            closest.entry(id.clone()).or_insert_with(|| MarkerHit {
+                accession: accession.clone(),
+                identity,
+            });
+        }
+    }
+    output.flush()?;
+    Ok(closest)
 }
 
 fn domain_adjective(marker_set: &str) -> &'static str {
@@ -1122,21 +832,23 @@ fn write_aai_summary(
     let mut output = BufWriter::new(File::create(dir.join(format!("{prefix}.aai_summary.tsv")))?);
     writeln!(
         output,
-        "user_genome\treference_genome\taai\treciprocal_best_hits\treference_taxonomy"
+        "user_genome\treference_genome\taai\taai_sd\treciprocal_best_hits\tsmaller_proteome\treference_taxonomy"
     )?;
     let mut sorted = results.iter().collect::<Vec<_>>();
     sorted.sort_by(|left, right| left.genome.id.cmp(&right.genome.id));
     for result in sorted {
         let Some(aai) = &result.aai else { continue };
         for hit in &aai.hits {
-            let accession = &db.nt_accessions[hit.reference as usize];
+            let accession = &db.nt.accessions[hit.reference as usize];
             writeln!(
                 output,
-                "{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 result.genome.id,
                 accession,
                 py_round(hit.aai, 2),
+                py_round(hit.sd, 2),
                 hit.reciprocal_hits,
+                hit.min_proteins,
                 db.data
                     .taxonomy_of(accession)
                     .map_or_else(|| "N/A".to_owned(), |taxonomy| taxonomy.join(";"))
@@ -1167,11 +879,11 @@ fn write_identify_files(
     let mut failed = BTreeMap::new();
     for (genome, genes) in called {
         match genes {
-            Some(genes) => {
-                tables.insert(genome.id.as_str(), genes.translation_table);
+            Some(_) => {
+                tables.insert(genome.id.as_str(), TRANSLATION_TABLE);
             }
             None => {
-                failed.insert(genome.id.as_str(), "No genes were called by Prodigal");
+                failed.insert(genome.id.as_str(), NO_GENES);
             }
         }
     }
@@ -1212,9 +924,9 @@ fn link_summary(out_dir: &Path, name: &str) -> std::io::Result<()> {
 
 fn related(hits: &[AniHit], db: &ClassifyDb, min_af: f64) -> Vec<RelatedReference> {
     ani::reportable(hits)
-        .filter(|hit| hit.af >= min_af)
+        .filter(|hit| hit.passes_af(min_af))
         .map(|hit| RelatedReference {
-            genome_id: db.nt_accessions[hit.reference as usize].clone(),
+            genome_id: db.nt.accessions[hit.reference as usize].clone(),
             ani: hit.ani,
             af: hit.af,
         })
@@ -1232,7 +944,7 @@ fn summary_row(
     let related = related(&result.hits, db, options.min_af);
     let taxonomy_of = |hit: &AniHit| {
         db.data
-            .taxonomy_of(&db.nt_accessions[hit.reference as usize])
+            .taxonomy_of(&db.nt.accessions[hit.reference as usize])
             .map(<[String]>::to_vec)
     };
     let best_taxonomy = result.hits.first().and_then(taxonomy_of);
@@ -1242,14 +954,14 @@ fn summary_row(
 
     match &result.decision {
         AniDecision::Species { hit } => {
-            let accession = &db.nt_accessions[hit.reference as usize];
+            let accession = &db.nt.accessions[hit.reference as usize];
             let taxonomy = taxonomy_of(hit).unwrap_or_default().join(";");
             row.classification = Some(standardise_taxonomy(&taxonomy, None));
             row.closest_genome_reference = Some(accession.clone());
             row.closest_genome_reference_radius = db.data.radius_of(accession);
             row.closest_genome_taxonomy = Some(taxonomy.clone());
             row.closest_genome_ani = Some(hit.ani);
-            row.closest_genome_af = Some(hit.af);
+            row.closest_genome_af = hit.af;
             row.classification_method = Some("ani_screen".into());
             row.note = Some("classification based on ANI only".into());
             row.other_related_references =
@@ -1257,19 +969,7 @@ fn summary_row(
             let marker_set = taxonomy_of(hit)
                 .as_deref()
                 .map_or(marker_set, marker_set_for_taxonomy);
-            return (marker_set, row);
-        }
-        AniDecision::Genus {
-            genus_taxonomy,
-            supporting,
-            considered,
-        } => {
-            row.classification = Some(standardise_taxonomy(genus_taxonomy, None));
-            row.classification_method = Some("taxonomic classification defined by ANI".into());
-            row.note = Some(format!(
-                "genus assigned by ANI consensus ({supporting}/{considered} references >= {}%)",
-                options.genus_ani
-            ));
+            (marker_set, row)
         }
         AniDecision::Unresolved => {
             row.other_related_references = format_related_references(&related, &[], &db.data);
@@ -1278,25 +978,18 @@ fn summary_row(
                 // GTDB-Tk reports genomes without genes in the bac120 summary.
                 (Some(None), _, _) => {
                     row.classification = Some("Unclassified".into());
-                    row.warnings.push("No genes were called by Prodigal".into());
-                    return ("bac120", row);
+                    row.warnings.push(NO_GENES.into());
+                    ("bac120", row)
                 }
-                (Some(Some(genes)), Some(markers), _) => {
-                    return marker_summary_row(row, genes, markers, &result.hits, db);
-                }
-                (Some(Some(genes)), None, Some(aai)) => {
-                    return aai_summary_row(row, genes, aai, marker_set, db, options);
-                }
+                (Some(Some(_)), Some(markers), _) => marker_summary_row(row, markers, db),
+                (Some(Some(_)), None, Some(aai)) => aai_summary_row(row, aai, marker_set, db),
                 _ => {
                     row.classification = Some(unclassified(marker_set, best_taxonomy.is_some()));
-                    return (marker_set, row);
+                    (marker_set, row)
                 }
             }
         }
     }
-    row.other_related_references = format_related_references(&related, &[], &db.data);
-    row.warnings = radius_warnings(&result.hits, db, options.min_af);
-    (marker_set, row)
 }
 
 fn unclassified(marker_set: &str, domain_known: bool) -> String {
@@ -1310,55 +1003,43 @@ fn unclassified(marker_set: &str, domain_known: bool) -> String {
 /// Fill in the AAI-tier fields of a row the ANI tier could not resolve.
 fn aai_summary_row(
     mut row: SummaryRow,
-    genes: &GeneCalls,
     aai: &AaiResult,
     ani_marker_set: &'static str,
     db: &ClassifyDb,
-    options: &ClassifyOptions,
 ) -> (&'static str, SummaryRow) {
-    row.translation_table = Some(genes.translation_table);
+    row.translation_table = Some(TRANSLATION_TABLE);
     let best_taxonomy = aai.hits.first().and_then(|hit| {
         db.data
-            .taxonomy_of(&db.nt_accessions[hit.reference as usize])
+            .taxonomy_of(&db.nt.accessions[hit.reference as usize])
     });
     let marker_set = best_taxonomy.map_or(ani_marker_set, marker_set_for_taxonomy);
-    let (taxonomy, rank, threshold, supporting, considered) = match &aai.decision {
-        AaiDecision::Genus {
-            taxonomy,
-            supporting,
-            considered,
-        } => (taxonomy, "genus", options.genus_aai, supporting, considered),
-        AaiDecision::Family {
-            taxonomy,
-            supporting,
-            considered,
-        } => (
-            taxonomy,
-            "family",
-            options.family_aai,
-            supporting,
-            considered,
-        ),
+    let (call, rank) = match &aai.decision {
+        AaiDecision::Genus(call) => (call, "genus"),
+        AaiDecision::Family(call) => (call, "family"),
         AaiDecision::Unresolved => {
             row.classification = Some(unclassified(marker_set, best_taxonomy.is_some()));
             return (marker_set, row);
         }
     };
-    row.classification = Some(standardise_taxonomy(taxonomy, None));
+    row.classification = Some(standardise_taxonomy(&call.taxonomy, None));
     row.classification_method = Some("taxonomic classification defined by AAI".into());
+    let lead = call.lead.map_or_else(
+        || format!("no other {rank} among the AAI hits"),
+        |lead| format!("{} points above the next {rank}", py_round(lead, 2)),
+    );
     row.note = Some(format!(
-        "{rank} assigned by AAI consensus ({supporting}/{considered} references >= {threshold}%)"
+        "{rank} of the closest reference by AAI ({}%, {lead})",
+        py_round(call.aai, 2)
     ));
     (marker_set, row)
 }
 
-/// Fill in the marker-tier fields, following GTDB-Tk's rows for genomes
-/// without markers, filtered from the MSA, or (until placement) aligned.
+/// Fill in the marker-tier fields: GTDB-Tk's rows for genomes without
+/// markers or filtered from the MSA, else the closest marker reference's
+/// lineage down to order.
 fn marker_summary_row(
     mut row: SummaryRow,
-    genes: &GeneCalls,
     markers: &MarkerResult,
-    hits: &[AniHit],
     db: &ClassifyDb,
 ) -> (&'static str, SummaryRow) {
     match &markers.outcome {
@@ -1372,48 +1053,31 @@ fn marker_summary_row(
             row.warnings.push(reason.clone());
             (markers.marker_set, row)
         }
-        MarkerOutcome::Aligned { msa_percent } => {
-            row.translation_table = Some(genes.translation_table);
+        MarkerOutcome::Aligned {
+            msa_percent,
+            closest,
+        } => {
+            row.translation_table = Some(TRANSLATION_TABLE);
             row.msa_percent = Some(*msa_percent);
             row.warnings.extend(markers.warnings.iter().cloned());
-            let Some(placement) = &markers.placement else {
+            let Some((hit, taxonomy)) = closest.as_ref().and_then(|hit| {
+                db.data
+                    .taxonomy_of(&hit.accession)
+                    .map(|taxonomy| (hit, taxonomy))
+            }) else {
                 row.classification = Some(unclassified(markers.marker_set, true));
                 return (markers.marker_set, row);
             };
-            row.classification = Some(placement.classification.clone());
-            row.pplacer_taxonomy = Some(placement.pplacer_taxonomy.clone());
-            row.red_value = Some(placement.red_value);
-            row.note = placement.note.map(Into::into);
-            row.warnings.extend(placement.warning.map(Into::into));
-            let Some(method) = placement.method else {
-                // GTDB-Tk reports genomes the backbone tree alone classified
-                // on a fresh row, without ANI details.
-                row.other_related_references = None;
-                row.warnings = markers.warnings.clone();
-                return (markers.marker_set, row);
-            };
-            row.classification_method = Some(method.into());
-            // GTDB-Tk reports the placement reference for genomes with ANI hits.
-            if ani::reportable(hits).next().is_some() {
-                row.classification_method =
-                    Some("taxonomic classification defined by topology and ANI".into());
-                if let Some(reference) = &placement.reference {
-                    let accession = strip_db_prefix(reference).to_owned();
-                    row.closest_placement_radius = db.data.radius_of(&accession);
-                    row.closest_placement_taxonomy = db
-                        .data
-                        .taxonomy_of(&accession)
-                        .map(|taxonomy| taxonomy.join(";"));
-                    if let Some(hit) = hits
-                        .iter()
-                        .find(|hit| db.nt_accessions[hit.reference as usize] == accession)
-                    {
-                        row.closest_placement_ani = Some(hit.ani);
-                        row.closest_placement_af = Some(hit.af);
-                    }
-                    row.closest_placement_reference = Some(accession);
-                }
-            }
+            row.classification = Some(standardise_taxonomy(&taxonomy[..4].join(";"), None));
+            row.closest_placement_reference = Some(hit.accession.clone());
+            row.closest_placement_radius = db.data.radius_of(&hit.accession);
+            row.closest_placement_taxonomy = Some(taxonomy.join(";"));
+            row.classification_method =
+                Some("taxonomic classification defined by marker gene search".into());
+            row.note = Some(format!(
+                "order of the closest marker gene match (estimated marker identity {}%)",
+                py_round(hit.identity, 2)
+            ));
             (markers.marker_set, row)
         }
     }
@@ -1422,8 +1086,8 @@ fn marker_summary_row(
 /// GTDB-Tk's warnings for near misses that did not receive a species call.
 fn radius_warnings(hits: &[AniHit], db: &ClassifyDb, min_af: f64) -> Vec<String> {
     let mut warnings = Vec::new();
-    if let Some(best) = hits.iter().find(|hit| hit.af >= min_af) {
-        let accession = &db.nt_accessions[best.reference as usize];
+    if let Some(best) = hits.iter().find(|hit| hit.passes_af(min_af)) {
+        let accession = &db.nt.accessions[best.reference as usize];
         if best.ani >= MIN_SPECIES_RADIUS {
             let radius = db
                 .data
@@ -1432,16 +1096,16 @@ fn radius_warnings(hits: &[AniHit], db: &ClassifyDb, min_af: f64) -> Vec<String>
             warnings.push(format!(
                 "Genome not assigned to closest species as it falls outside its pre-defined ANI radius (closest {accession} ANI={}%, AF={}, radius={radius}%)",
                 py_round(best.ani, 2),
-                py_round(best.af, 3)
+                best.af.map_or_else(|| "N/A".to_owned(), |af| py_round(af, 3))
             ));
         }
     } else if let Some(top) = hits.first() {
         if top.ani >= MIN_SPECIES_RADIUS {
             warnings.push(format!(
                 "Closest reference {} has ANI={}% but alignment fraction AF={} below the {} threshold; no species assignment",
-                db.nt_accessions[top.reference as usize],
+                db.nt.accessions[top.reference as usize],
                 py_round(top.ani, 2),
-                py_round(top.af, 3),
+                top.af.map_or_else(|| "N/A".to_owned(), |af| py_round(af, 3)),
                 summary::py_float(min_af)
             ));
         }

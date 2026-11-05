@@ -1,12 +1,11 @@
 //! Readers for the GTDB-Tk reference data package (GTDBTK_DATA_PATH layout).
 
 use flate2::read::MultiGzDecoder;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub(crate) const RANK_PREFIXES: [&str; 7] = ["d__", "p__", "c__", "o__", "f__", "g__", "s__"];
 
@@ -100,50 +99,23 @@ pub(crate) struct Radius {
     pub(crate) ani: f64,
 }
 
-/// Reference taxonomy and species radii, plus the GTDB-Tk package root when
-/// one is available (needed for marker-based placement).
+/// Reference taxonomy and species radii from a GTDB-Tk package.
 #[derive(Debug, Default)]
 pub(crate) struct GtdbtkData {
-    pub(crate) root: Option<PathBuf>,
     pub(crate) version: String,
     /// Seven-rank taxonomy keyed by canonical genome ID.
     pub(crate) taxonomy: HashMap<String, Vec<String>>,
     /// Species ANI radius keyed by canonical representative genome ID.
     pub(crate) radii: HashMap<String, Radius>,
-    pub(crate) red_dist_bac: HashMap<String, f64>,
-    pub(crate) red_dist_arc: HashMap<String, f64>,
 }
 
 impl GtdbtkData {
     pub(crate) fn load(root: &str) -> Result<Self, Box<dyn Error>> {
-        let root = PathBuf::from(root);
-        let (version, red_dist_bac, red_dist_arc) =
-            read_metadata(&root.join("metadata").join("metadata.txt"))?;
+        let root = Path::new(root);
         Ok(Self {
+            version: read_version(&root.join("metadata").join("metadata.txt"))?,
             taxonomy: read_taxonomy(&root.join("taxonomy").join("gtdb_taxonomy.tsv"))?,
             radii: read_radii(&root.join("radii").join("gtdb_radii.tsv"))?,
-            root: Some(root),
-            version,
-            red_dist_bac,
-            red_dist_arc,
-        })
-    }
-
-    /// Load only the taxonomy and radii, e.g. from an aeon classify database.
-    pub(crate) fn from_files(
-        version: &str,
-        taxonomy_paths: &[PathBuf],
-        radii_path: &Path,
-    ) -> Result<Self, Box<dyn Error>> {
-        let mut taxonomy = HashMap::new();
-        for path in taxonomy_paths {
-            taxonomy.extend(read_taxonomy(path)?);
-        }
-        Ok(Self {
-            version: version.to_owned(),
-            taxonomy,
-            radii: read_radii(radii_path)?,
-            ..Self::default()
         })
     }
 
@@ -212,71 +184,14 @@ pub(crate) fn read_radii(path: &Path) -> Result<HashMap<String, Radius>, Box<dyn
     Ok(radii)
 }
 
-/// Species radii from a GTDB release `sp_clusters_r*.tsv` file (columns:
-/// representative genome, species, taxonomy, ANI circumscription radius, ...).
-pub(crate) fn read_sp_clusters_radii(
-    path: &Path,
-) -> Result<HashMap<String, Radius>, Box<dyn Error>> {
-    let mut radii = HashMap::new();
-    for line in read_lines(path)?.skip(1) {
-        let line = line?;
-        let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.len() < 4 {
-            continue;
-        }
-        radii.insert(
-            canonical_gid(fields[0]),
-            Radius {
-                species: fields[1].to_owned(),
-                ani: fields[3].parse().map_err(|error| {
-                    format!("bad radius in {}: {line}: {error}", path.display())
-                })?,
-            },
-        );
-    }
-    Ok(radii)
-}
-
-type Metadata = (String, HashMap<String, f64>, HashMap<String, f64>);
-
-pub(crate) fn read_metadata(path: &Path) -> Result<Metadata, Box<dyn Error>> {
+/// `VERSION_DATA` (e.g. `r232`) from the package's `metadata/metadata.txt`.
+pub(crate) fn read_version(path: &Path) -> Result<String, Box<dyn Error>> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("cannot open GTDB-Tk file {}: {error}", path.display()))?;
-    let mut version = None;
-    let mut bac = None;
-    let mut arc = None;
-    for line in text.lines() {
-        let Some((key, value)) = line.trim().split_once('=') else {
-            continue;
-        };
-        match key {
-            "VERSION_DATA" => version = Some(value.to_owned()),
-            "RED_DIST_BAC_DICT" => bac = Some(parse_red_dict(value)?),
-            "RED_DIST_ARC_DICT" => arc = Some(parse_red_dict(value)?),
-            _ => {}
-        }
-    }
-    let missing = |key: &str| format!("{} is missing {key}", path.display());
-    Ok((
-        version.ok_or_else(|| missing("VERSION_DATA"))?,
-        bac.ok_or_else(|| missing("RED_DIST_BAC_DICT"))?,
-        arc.ok_or_else(|| missing("RED_DIST_ARC_DICT"))?,
-    ))
-}
-
-fn parse_red_dict(json: &str) -> Result<HashMap<String, f64>, Box<dyn Error>> {
-    let value: Value = serde_json::from_str(json)?;
-    let object = value
-        .as_object()
-        .ok_or("RED distribution is not a JSON object")?;
-    object
-        .iter()
-        .map(|(rank, red)| {
-            red.as_f64()
-                .map(|red| (rank.clone(), red))
-                .ok_or_else(|| format!("RED value for {rank} is not a number").into())
-        })
-        .collect()
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("VERSION_DATA="))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{} is missing VERSION_DATA", path.display()).into())
 }
 
 #[cfg(test)]
@@ -330,21 +245,17 @@ mod tests {
     }
 
     #[test]
-    fn reads_metadata_red_distributions() {
+    fn reads_package_version() {
         let dir = std::env::temp_dir().join(format!("aeon-refdata-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("metadata.txt");
         fs::write(
             &path,
-            "VERSION_DATA=r232\nRED_DIST_BAC_DICT={\"p__\": 0.35, \"c__\": 0.49}\nRED_DIST_ARC_DICT={\"p__\": 0.27, \"c__\":0.42852344844350987}\n",
+            "VERSION_DATA=r232\nRED_DIST_BAC_DICT={\"p__\": 0.35}\n",
         )
         .unwrap();
-        let (version, bac, arc) = read_metadata(&path).unwrap();
+        let version = read_version(&path).unwrap();
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(version, "r232");
-        assert_eq!(bac["c__"], 0.49);
-        assert_eq!(arc["p__"], 0.27);
-        // Needs correctly rounded parsing to print back as Python does.
-        assert_eq!(arc["c__"].to_string(), "0.42852344844350987");
     }
 }

@@ -1,7 +1,7 @@
-//! Tier 3 preparation: find the GTDB bac120/ar53 marker genes with HMMER,
-//! classify their copy number, pick each genome's domain, and build the
-//! masked concatenated marker alignment, following GTDB-Tk 2.8's `identify`
-//! and `align` steps.
+//! Marker genes: find the GTDB bac120/ar53 markers with HMMER, classify their
+//! copy number, pick each genome's domain, and build the masked concatenated
+//! marker alignment, following GTDB-Tk 2.8's `identify` and `align` steps.
+//! The alignment's residues are what the marker index sketches.
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -584,6 +584,8 @@ fn write_pfam_table(
 
 /// Run TIGRFAM and Pfam HMM searches for one genome's proteins, writing
 /// GTDB-Tk's `{id}_tigrfam.tsv`, `{id}_pfam.tsv` and top-hit files.
+/// TIGRFAM and Pfam top hits of one proteome. The two hmmsearch runs go
+/// side by side, each with `cpus` threads.
 pub(crate) fn search_markers(
     hmmsearch: &Path,
     data_root: &Path,
@@ -591,14 +593,36 @@ pub(crate) fn search_markers(
     genome_id: &str,
     protein_faa: &Path,
     genome_dir: &Path,
+    cpus: usize,
 ) -> Result<(TopHits, TopHits), Box<dyn Error>> {
     let path = |suffix: &str| genome_dir.join(format!("{genome_id}{suffix}"));
+    let cpus = cpus.max(1).to_string();
+    let (pfam, tigrfam) = rayon::join(
+        || {
+            search_pfam(hmmsearch, data_root, pfam_info, protein_faa, &path, &cpus)
+                .map_err(|error| error.to_string())
+        },
+        || {
+            search_tigrfam(hmmsearch, data_root, protein_faa, &path, &cpus)
+                .map_err(|error| error.to_string())
+        },
+    );
+    Ok((pfam?, tigrfam?))
+}
+
+fn search_tigrfam(
+    hmmsearch: &Path,
+    data_root: &Path,
+    protein_faa: &Path,
+    path: &dyn Fn(&str) -> PathBuf,
+    cpus: &str,
+) -> Result<TopHits, Box<dyn Error>> {
     run(Command::new(hmmsearch)
         .arg("-o")
         .arg(path("_tigrfam.out"))
         .arg("--tblout")
         .arg(path("_tigrfam.tsv"))
-        .args(["--noali", "--notextw", "--cut_nc", "--cpu", "1"])
+        .args(["--noali", "--notextw", "--cut_nc", "--cpu", cpus])
         .arg(data_root.join("markers/tigrfam/tigrfam.hmm"))
         .arg(protein_faa))?;
     let mut tigrfam = TopHits::default();
@@ -619,11 +643,21 @@ pub(crate) fn search_markers(
         });
     }
     tigrfam.write(&path("_tigrfam_tophit.tsv"))?;
+    Ok(tigrfam)
+}
 
+fn search_pfam(
+    hmmsearch: &Path,
+    data_root: &Path,
+    pfam_info: &PfamInfo,
+    protein_faa: &Path,
+    path: &dyn Fn(&str) -> PathBuf,
+    cpus: &str,
+) -> Result<TopHits, Box<dyn Error>> {
     let domtbl = path("_pfam.domtblout");
     let pfam_hmm = data_root.join("markers/pfam/Pfam-A.hmm");
     run(Command::new(hmmsearch)
-        .args(["--notextw", "--cut_ga", "--cpu", "1", "-o", "/dev/null"])
+        .args(["--notextw", "--cut_ga", "--cpu", cpus, "-o", "/dev/null"])
         .arg("--domtblout")
         .arg(&domtbl)
         .arg(&pfam_hmm)
@@ -648,7 +682,7 @@ pub(crate) fn search_markers(
         });
     }
     pfam.write(&path("_pfam_tophit.tsv"))?;
-    Ok((pfam, tigrfam))
+    Ok(pfam)
 }
 
 fn longest_sequence_id(fasta: &Path) -> Result<usize, Box<dyn Error>> {
@@ -968,35 +1002,84 @@ pub(crate) fn apply_mask(
     ))
 }
 
-/// GTDB's concatenated reference MSA (`msa/gtdb_{release}_{marker_set}.faa`).
-pub(crate) fn read_reference_msa(
-    root: &Path,
-    release: &str,
-    marker_set: &str,
-) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
-    read_msa(
-        &root
-            .join("msa")
-            .join(format!("gtdb_{release}_{marker_set}.faa")),
-    )
+/// The marker search's sequence for a masked alignment: its residues
+/// without gap columns.
+pub(crate) fn marker_sequence(masked: &str) -> String {
+    masked.chars().filter(char::is_ascii_alphabetic).collect()
 }
 
-/// An aligned FASTA file, plain or gzipped, keyed by sequence ID.
-pub(crate) fn read_msa(path: &Path) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
-    let mut msa = BTreeMap::new();
-    // Test packages may ship an empty MSA, which needletail rejects.
-    if fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0) {
-        return Ok(msa);
-    }
-    let mut reader = parse_fastx_file(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    while let Some(record) = reader.next() {
-        let record = record?;
-        let id = String::from_utf8_lossy(record.id());
-        let id = id.split_whitespace().next().unwrap_or_default().to_owned();
-        msa.insert(id, String::from_utf8_lossy(&record.seq()).into_owned());
-    }
-    Ok(msa)
+/// HMMER and the GTDB-Tk package files needed to extract markers.
+pub(crate) struct MarkerTools<'a> {
+    pub(crate) hmmsearch: &'a Path,
+    pub(crate) hmmalign: &'a Path,
+    pub(crate) root: &'a Path,
+    pub(crate) pfam_info: &'a PfamInfo,
+}
+
+/// GTDB-Tk's identify step for proteomes `(genome ID, protein FASTA)`:
+/// hmmsearch into `out_dir/{id}/`, then copy numbers for ar53 and bac120 (in
+/// `MARKER_SETS` order). `threads` are split across the genomes.
+pub(crate) fn identify_markers(
+    tools: &MarkerTools,
+    proteomes: &[(String, PathBuf)],
+    out_dir: &Path,
+    threads: usize,
+) -> Result<Vec<(String, [CopyNumber; 2])>, String> {
+    // Each genome runs two hmmsearch processes at once.
+    let cpus = (threads / (2 * proteomes.len().max(1))).max(1);
+    proteomes
+        .par_iter()
+        .map(|(id, faa)| {
+            let genome_dir = out_dir.join(id);
+            fs::create_dir_all(&genome_dir).map_err(|error| error.to_string())?;
+            let (pfam, tigrfam) = search_markers(
+                tools.hmmsearch,
+                tools.root,
+                tools.pfam_info,
+                id,
+                faa,
+                &genome_dir,
+                cpus,
+            )
+            .map_err(|error| format!("marker search failed for {id}: {error}"))?;
+            let proteins = read_proteins(faa).map_err(|error| format!("{id}: {error}"))?;
+            let copies = MARKER_SETS.map(|set| copy_number(set, &proteins, &pfam, &tigrfam));
+            Ok((id.clone(), copies))
+        })
+        .collect()
+}
+
+/// Masked `marker_set` alignments of proteomes `(genome ID, protein FASTA)`,
+/// as GTDB-Tk's identify and align steps would build them. Genomes without a
+/// single-copy marker of the set are absent.
+pub(crate) fn extract_masked_markers(
+    tools: &MarkerTools,
+    mask: &[bool],
+    marker_set: &str,
+    proteomes: &[(String, PathBuf)],
+    work_dir: &Path,
+    threads: usize,
+) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    let index = MARKER_SETS
+        .iter()
+        .position(|set| *set == marker_set)
+        .expect("known marker set");
+    let copies = identify_markers(tools, proteomes, work_dir, threads)?
+        .into_iter()
+        .map(|(id, copies)| (id, copies[index].clone()))
+        .collect::<BTreeMap<_, _>>();
+    let hmms = marker_hmms(tools.root, marker_set)?;
+    let aligned = align_markers(tools.hmmalign, &hmms, &copies, &work_dir.join("hmmalign"))?;
+    aligned
+        .into_iter()
+        .map(|(id, alignment)| Ok((id, apply_mask(&alignment, mask)?.0)))
+        .collect()
+}
+
+/// GTDB's concatenated reference MSA (`msa/gtdb_{release}_{marker_set}.faa`).
+pub(crate) fn reference_msa_path(root: &Path, release: &str, marker_set: &str) -> PathBuf {
+    root.join("msa")
+        .join(format!("gtdb_{release}_{marker_set}.faa"))
 }
 
 /// Write sorted records gzip-compressed, as GTDB-Tk's `_write_msa`: GTDB
@@ -1146,7 +1229,7 @@ mod gtdbtk_comparison {
             fs::create_dir_all(&dir).unwrap();
             let faa = input.join(&id).join(format!("{id}_protein.faa"));
             let (pfam, tigrfam) =
-                search_markers(&hmmsearch, &data, &info, &id, &faa, &dir).unwrap();
+                search_markers(&hmmsearch, &data, &info, &id, &faa, &dir, 1).unwrap();
             let proteins = read_proteins(&faa).unwrap();
             for set in MARKER_SETS {
                 summaries
@@ -1193,11 +1276,6 @@ mod gtdbtk_comparison {
                 &gtdb,
             )
             .unwrap();
-            let mut all = masked.clone();
-            for (id, alignment) in read_reference_msa(&data, &gtdb.version, set).unwrap() {
-                all.insert(id, apply_mask(&alignment, &mask).unwrap().0);
-            }
-            write_msa_gz(&out.join(format!("gtdbtk.{set}.msa.fasta.gz")), &all, &gtdb).unwrap();
         }
     }
 }

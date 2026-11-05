@@ -143,38 +143,124 @@ Search options:
 
 ### Classify
 
-`aeon classify` assigns GTDB taxonomy and writes GTDB-Tk 2.8 `classify_wf` outputs: `{prefix}.bac120.summary.tsv`, `{prefix}.ar53.summary.tsv`, and the `identify/`, `align/` and `classify/` directories with the same file names and columns. Each genome stops at the first tier that resolves it:
+`aeon classify` assigns GTDB taxonomy and writes GTDB-Tk 2.8 `classify_wf` outputs: `{prefix}.bac120.summary.tsv`, `{prefix}.ar53.summary.tsv`, and the `identify/`, `align/` and `classify/` directories with GTDB-Tk's file names and columns. Results should be close to GTDB-Tk's, but the method differs. aeon has no pplacer, RED or reference-tree step. Below species it classifies by AAI and by a search of marker genes.
 
-1. **ANI.** DiskANN sketch search proposes `--candidates` GTDB representatives and TurboANI computes their exact ANI and AF. A genome within the closest AF-passing reference's species radius gets that species, as in the GTDB-Tk ANI screen. A genome with at least `--genus-ani` ANI and `--min_af` AF to a strict majority of references in one genus gets that genus.
-2. **AAI.** pyrodigal calls genes (run as a separate program, translation table 11 or 4 as in GTDB-Tk). Protein sketch search proposes candidate reference proteomes, and DIAMOND reciprocal best hits (≥30% identity, ≥70% of the shorter protein) give AAI. The best hit's genus (`--genus-aai`), or else its family (`--family-aai`), is assigned when it is the strict majority among the `--aai-top` closest references above that threshold.
-3. **Markers.** The remaining genomes go through GTDB-Tk's pipeline, ported natively:
-   - hmmsearch against the bac120/ar53 markers, with the same copy-number and domain calls;
-   - hmmalign and the masked concatenated alignment;
-   - pplacer placement and RED-based classification. Bacteria use the backbone tree followed by a class-level tree unless `--full_tree` is set.
+**Three indexes.** `aeon classify-db` builds three aeon indexes over the GTDB species representatives, and every classify run uses all three:
+
+| Index | Sequences | k-mers | Sketch size |
+|---|---|---|---|
+| `nt` | reference genomes | nucleotide, k=16 (`-k`) | 15,000 (`-s`) |
+| `aa` | reference proteomes | amino acid, k=7 (`--aa-kmer-size`) | 10,000 (`--aa-sketch-size`) |
+| `markers` | concatenated bac120/ar53 marker genes (masked GTDB-Tk alignment, gaps removed) | amino acid, k=5 (`--marker-kmer-size`) | 3,000 (`--marker-sketch-size`) |
+
+All three graphs are built with max degree 128 (`--max-degree`), construction beam 512 (`--build-beam-width`) and alpha 1.2 (`--alpha`).
+
+Marker genes for references come from the GTDB-Tk package's reference MSA. References missing from it get theirs from hmmsearch and hmmalign on their proteomes.
+
+**Cascade.** Each genome stops at the first step that resolves it:
+
+1. **nt search, then TurboANI when candidates span species.** The genome sketch search proposes `--candidates` (10) species representatives with a sketch-estimated ANI.
+   - **One candidate at or above `--min-sketch-ani` (90%):** if its estimate clears that species' radius by at least 1 point, the genome gets the species without TurboANI.
+   - **Several candidates at or above 90%, or one without that margin:** TurboANI computes their exact ANI and AF, and GTDB-Tk's ANI screen rule decides. The closest reference with AF ≥ `--min_af` (0.5) gives its species if the ANI is within that species' GTDB radius (95% for most species).
+   - **No candidate at or above 90%:** the genome goes to step 2.
+2. **FragGeneScanRs, aa search, DIAMOND AAI.**
+   - Genes are called with FragGeneScanRs's complete-genome model (`-t complete -w 1`).
+   - The proteome sketch search proposes candidate reference proteomes.
+   - DIAMOND reciprocal best hits give AAI. The implementation is inspired by the enveomics collection (Rodriguez-R LM & Konstantinidis KT (2016). The enveomics collection: a toolbox for specialized analyses of microbial genomes and metagenomes. *PeerJ Preprints* 4:e1900v1, [doi:10.7287/peerj.preprints.1900v1](https://doi.org/10.7287/peerj.preprints.1900v1)):
+     - `diamond blastp` runs in both directions in DIAMOND's default (fast) mode, with its default e-value (0.001).
+     - Each protein's best hit is its top hit with ≥20% identity. There is no alignment-length or coverage filter.
+     - AAI is the unweighted mean identity of the reciprocal best hits. A reference needs at least 50 of them to get an AAI.
+     - A query is searched against all its candidates in one database. Each hit's e-value is rescaled to its own reference proteome's size, and each protein keeps its best hit per reference, so the result matches separate searches of each genome pair.
+   - The closest reference by AAI gives the call:
+     - **Genus:** its genus is assigned if its AAI is ≥ `--genus-aai` (65%) and beats every reference of another genus by at least `--aai-margin` (5) points.
+     - **Family:** failing that, its family is assigned under the same rule with ≥ `--family-aai` (45%).
+     - **Otherwise** the genome goes to step 3.
+3. **hmmer marker extraction, marker search.**
+   - hmmsearch and hmmalign extract the bac120/ar53 markers exactly as GTDB-Tk's `identify` and `align` steps do, with the same copy-number rules, domain call, mask and `--min_perc_aa` filter.
+   - The masked concatenated markers are searched against the marker index.
+   - Only hits from the genome's own domain (bac120 or ar53) count, and only at or above `--min-marker-identity` (25% estimated identity).
+   - The genome gets the closest such reference's lineage down to order.
+   - A genome with no such hit is left unclassified below its domain.
+
+**Design decisions:**
+- **pplacer is replaced by AAI and the marker search.** This removes the reference tree and its large memory requirement.
+- **FragGeneScanRs replaces Prodigal/pyrodigal.** It is faster, and accurate enough for AAI and marker extraction. It runs as a separate program because it is GPL-3.0 and aeon is MIT. It translates with table 11 only, so `translation_table` is always 11.
+- **Species calls use GTDB's species radius**, so they match GTDB-Tk's ANI screen. 95% applies to most species.
+- **TurboANI runs only when the sketch search cannot settle the species on its own.**
+  - A species call made from the sketch estimate alone reports `closest_genome_af` as `N/A`. Its Jaccard-based estimate already drops with the shared fraction.
+  - The 1-point margin sends borderline genomes to TurboANI. These include chimeras whose AF would fail, because the sketch cannot check AF.
+- **Genus 65% AAI and family 45% AAI** are the defaults, the genus and family boundaries proposed by Konstantinidis, Rosselló-Móra & Amann ([ISME J 2017](https://doi.org/10.1038/ismej.2017.113)). With the AAI margin below, they made 3 wrong calls in 104 holdout queries.
+- **AAI calls use a margin, not a vote.** A novel genus sits about equally far from several genera in its family, so its closest reference leads the next genus by only a point or two. A genus that is in the database stands out from its neighbours. Unlike a majority vote among the closest references, the margin doesn't penalise genera with few representatives; many GTDB genera have only one.
+- **Marker-search calls stop at order**, using the closest marker reference's lineage.
+  - The 25% floor only rejects chance k-mer matches. Random marker sequences share almost no 5-mers (J ≈ 0.001).
+  - It does not separate distant phyla from real but fast-evolving relatives. In the holdouts, other phyla reached up to 56% estimated identity, and Mycoplasmatales matched their own order at 42–50%.
+  - So a genome from a phylum missing from the database still gets the order of its closest phylum.
+
+**Output differences from GTDB-Tk:**
+- `pplacer_taxonomy` and `red_value` are always `N/A`.
+- For marker-search calls, `closest_placement_reference`, `closest_placement_radius` and `closest_placement_taxonomy` describe the closest marker reference.
+- `classification_method` is one of:
+  - `ani_screen`;
+  - `taxonomic classification defined by AAI`;
+  - `taxonomic classification defined by marker gene search`.
+- Extra files:
+  - `classify/aai/{prefix}.aai_summary.tsv`: every AAI hit, with the SD of the reciprocal-best-hit identities, their count, and the smaller proteome's protein count;
+  - `classify/markers/{prefix}.marker_summary.tsv`: every marker-index hit, with an estimated marker identity.
+- `align/` holds the user MSA only, not the full reference MSA.
 
 ```bash
-# Reference database. Genomes and proteome files are named by GTDB accession.
+# External tools: DIAMOND and HMMER (environment.yml), and FragGeneScanRs.
+conda env create -f environment.yml && conda activate aeon-classify
+cargo install frag_gene_scan_rs
+
+# Reference database. Genomes and proteomes are named by GTDB accession.
 aeon classify-db --db gtdb_db --gtdbtk-data $GTDBTK_DATA_PATH \
-  -r gtdb_reps.txt --call-genes
+  -r gtdb_reps.txt --protein-list gtdb_protein_reps.txt   # or --call-genes
 
 aeon classify --db gtdb_db --genome_dir genomes -x fna.gz --out_dir out --cpus 8
 ```
 
-Tier 3 requires a classify-db built with `--gtdbtk-data`, plus `hmmsearch`, `hmmalign`, `pplacer` and `guppy` on `PATH` (or in `--bin-dir`). `classify-db` takes `--protein-list` for precomputed proteomes (e.g. GTDB `protein_faa_reps`) instead of `--call-genes`.
+`--call-genes` calls reference genes with FragGeneScanRs instead of reading `--protein-list` (e.g. GTDB `protein_faa_reps`). aeon finds FragGeneScanRs's `train/` models next to the executable or in the sources `cargo install` keeps. Otherwise, pass `--fgs-train-dir`.
 
-**Agreement with GTDB-Tk 2.8.** On development packages pruned from R232, aeon's tier-3 output matched GTDB-Tk byte for byte: marker summaries, alignments, classification trees, RED dictionaries, split-tree mapping, and summary rows for genomes without ANI hits. Where genomes do have ANI hits, the ANI and AF values in summary rows differ slightly between TurboANI and skani.
+**Holdout results.** Holdouts of GTDB R232 species representatives were used, each with the query's species, whole genus or whole family withheld from the database.
 
-**Threshold calibration.** The AAI and ANI defaults were set on holdouts of GTDB R232 species representatives. The training set covered five orders: Lactobacillales, Campylobacterales, Bacteroidales, Flavobacteriales and Oscillospirales. It had 272 references, and its 55 queries were 20 species, 15 genera and 20 whole families withheld from the database. The validation set covered five different orders: Enterobacterales, Rhodobacterales, Lachnospirales, Mycoplasmatales and Actinomycetales. It had 221 references and 49 queries.
+| Set | Orders | References | Queries (species / genus / family withheld) |
+|---|---|---|---|
+| Training | Lactobacillales, Campylobacterales, Bacteroidales, Flavobacteriales, Oscillospirales | 272 | 55 (20 / 15 / 20) |
+| Validation | Enterobacterales, Rhodobacterales, Lachnospirales, Mycoplasmatales, Actinomycetales | 221 | 49 (20 / 13 / 16) |
 
-The highest AAI values the wrong answers reached were:
-- 73.6% for a genome to a genus in its own family when its own genus was withheld;
-- 62.9% for a genome to another family when its own family was withheld.
+A genus or family holdout has no reference of its true taxon, so the right answer is to stop one rank higher. A "wrong" call assigns a neighbouring genus or family; in every case the ranks above it were right.
 
-The defaults (`--genus-ani 80`, `--genus-aai 75`, `--family-aai 65`, `--aai-top 10`) made no wrong ANI or AAI calls on either set. Those tiers resolved 26/55 and 24/49 genomes, and the rest went to tier 3. The earlier 65%/52% cutoffs made 21 and 9 wrong calls respectively. Most of these errors were withheld families assigned to a neighbouring family.
+All rules below use 65%/45% AAI. Results are over both sets (104 queries):
 
-**Runtime.** With only a few hundred references, these runs show nothing about index scaling. The machine was also under heavy unrelated load, so wall times are not comparable between tools. CPU time was 828 s for aeon and 720 s for GTDB-Tk on 55 genomes with 8 threads.
+| AAI rule | Wrong calls | Species holdouts given their genus (of 40) | Genus holdouts given their family (of 28) | Family holdouts stopped at order (of 36) |
+|---|---|---|---|---|
+| Margin 5 points (default) | 3 | 35 | 20 | 35 |
+| Margin 3 points | 5 | 36 | 23 | 33 |
+| Margin 7 points | 1 | 32 | 20 | 36 |
+| Margin 10 points | 1 | 30 | 17 | 36 |
+| Strict majority of the 10 closest references | 18 | 22 | 20 | 23 |
+| Closest reference only, no margin | 46 | 37 | 18 | 0 |
 
-At this scale, aeon's ANI stage (11 s) is dominated by exact TurboANI on the candidates rather than by index search, and is slower than GTDB-Tk's skani screen (7 s). The AAI tier took 1.7 s per genome. GTDB-Tk's pplacer is cheap on pruned trees, but on full R232 it needs over 140 GB of RAM. Expect DiskANN search and the genomes resolved before tier 3 to matter at full GTDB scale; this has not been measured yet.
+The default row comes from full classify runs. The other rows replay the rule over the same AAI hits. The margin was chosen on these same queries.
+
+- **Marker search:** all 42 order-level calls were correct.
+- **Why a fixed AAI cutoff is not enough.** GTDB draws genus and family boundaries by relative evolutionary divergence, not AAI, so a fixed AAI cutoff cuts across them:
+
+  | Comparison (per query) | Min | Median | Max |
+  |---|---|---|---|
+  | Same genus (species holdouts vs references of their own genus) | 53.0 | 74.0 | 93.9 |
+  | Closest other genus in the same family (genus holdouts) | 54.0 | 61.6 | 73.0 |
+  | Closest other family in the same order (family holdouts) | 48.8 | 55.3 | 62.5 |
+
+  - 10 of 28 genus holdouts had a sister genus at ≥65% AAI, while 10% of same-genus pairs fell below 64.3%.
+  - Every family holdout (36 of 36) had another family at ≥45% AAI, so the 45% cutoff alone stops none of them.
+- **Why the margin works.** When the true taxon is absent, the closest reference led the next taxon by less than 3 points in 41 of 46 cases (the largest lead was 13.0). When the closest reference was right, it usually led by 6 points or more; 8 of 65 led by less than 5.
+- **Why a margin, not a majority vote.** The vote blocked 18 correct calls, 15 of them genera with only 2 references in the database that were outvoted by a larger neighbour.
+- **DIAMOND mode:** the default mode gives AAI about 2 points higher than `--sensitive` on the same pairs (median +2.2 and +2.3 on the two sets). It made about the same number of wrong calls under the majority vote (19 against 21) in about a third of the time.
+- **Species calls from the sketch alone:** reference genomes cut into 10 kb pieces, keeping 50–90% of them, were all assigned their own species, 24 of 24, with no TurboANI call.
+
+**Runtime.** On the 55-genome training set with 8 threads, classify took 80 s wall time and 570 CPU-seconds, with a peak RSS of 0.95 GB. Building the 272-reference database with `--call-genes` took 126 s, with a peak RSS of 1.7 GB. Index scaling at full GTDB size has not been measured yet.
 
 ## Update Semantics
 

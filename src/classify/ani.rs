@@ -1,5 +1,6 @@
-//! Tier 1: nucleotide ANI. DiskANN sketch-search candidates are re-scored
-//! with TurboANI, then GTDB-Tk's ANI screen rule decides species calls.
+//! Tier 1: nucleotide ANI. DiskANN sketch search proposes candidate species
+//! representatives; when more than one could be the query's species, TurboANI
+//! re-scores them, and GTDB-Tk's ANI screen rule decides the species call.
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -8,6 +9,7 @@ use std::path::PathBuf;
 use turboani::{AniConfig, compare_paths};
 
 use crate::classify::refdata::GtdbtkData;
+use crate::database::ani_from_jaccard;
 
 /// Largest number of distinct candidate references TurboANI indexes at once.
 const MAX_BATCH_REFERENCES: usize = 256;
@@ -30,8 +32,79 @@ pub(crate) struct AniHit {
     pub(crate) reference: u32,
     /// Percent identity, 0-100.
     pub(crate) ani: f64,
-    /// Larger of the query and reference aligned fractions, 0-1.
-    pub(crate) af: f64,
+    /// Larger of the query and reference aligned fractions, 0-1; `None` for
+    /// a sketch estimate, which TurboANI did not check.
+    pub(crate) af: Option<f64>,
+}
+
+impl AniHit {
+    /// Hits without an AF are sketch estimates, whose k-mer Jaccard already
+    /// falls with the shared fraction, so they pass the AF threshold.
+    pub(crate) fn passes_af(&self, min_af: f64) -> bool {
+        self.af.is_none_or(|af| af >= min_af)
+    }
+}
+
+/// A DiskANN neighbour with its sketch-estimated ANI.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Candidate {
+    pub(crate) reference: u32,
+    pub(crate) sketch_ani: f64,
+}
+
+/// A sketch estimate must clear the species radius by this many points to
+/// decide on its own: the estimate carries sketching error, and it cannot
+/// check AF, so borderline genomes (or chimeras) go to TurboANI.
+pub(crate) const SKETCH_RADIUS_MARGIN: f64 = 1.0;
+
+/// Sketch-estimated ANI (0-100) from a DiskANN Hamming distance.
+pub(crate) fn sketch_ani(distance: f32, kmer_size: usize) -> f64 {
+    f64::from(ani_from_jaccard(1.0 - distance, kmer_size)) * 100.0
+}
+
+/// How the ANI tier settles one query from its sketch candidates.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Screen {
+    /// The only plausible candidate is within its species radius by the
+    /// sketch estimate alone.
+    Estimated(AniHit),
+    /// These candidates need TurboANI; none means no candidate is plausible.
+    Exact(Vec<u32>),
+}
+
+/// Candidates with a sketch ANI of at least `min_sketch_ani` could be the
+/// query's species. When exactly one is, and its estimate clears its radius
+/// by `SKETCH_RADIUS_MARGIN`, the estimate decides; otherwise every plausible
+/// candidate goes to TurboANI. Incomplete genomes lower the estimate, so
+/// `min_sketch_ani` sits a few points below the radii.
+pub(crate) fn screen(
+    candidates: &[Candidate],
+    accessions: &[String],
+    data: &GtdbtkData,
+    min_sketch_ani: f64,
+) -> Screen {
+    let plausible = candidates
+        .iter()
+        .filter(|candidate| candidate.sketch_ani >= min_sketch_ani)
+        .collect::<Vec<_>>();
+    if let [only] = plausible[..] {
+        if data
+            .radius_of(&accessions[only.reference as usize])
+            .is_some_and(|radius| only.sketch_ani >= radius + SKETCH_RADIUS_MARGIN)
+        {
+            return Screen::Estimated(AniHit {
+                reference: only.reference,
+                ani: only.sketch_ani,
+                af: None,
+            });
+        }
+    }
+    Screen::Exact(
+        plausible
+            .iter()
+            .map(|candidate| candidate.reference)
+            .collect(),
+    )
 }
 
 fn turboani_config() -> AniConfig {
@@ -104,7 +177,11 @@ pub(crate) fn refine_candidates(
                         forward.get(&(query, reference)).copied(),
                         reverse.get(&(query, reference)).copied(),
                     )
-                    .map(|(ani, af)| AniHit { reference, ani, af })
+                    .map(|(ani, af)| AniHit {
+                        reference,
+                        ani,
+                        af: Some(af),
+                    })
                 })
                 .collect::<Vec<_>>();
             sort_hits(&mut query_hits);
@@ -132,7 +209,7 @@ pub(crate) fn sort_hits(hits: &mut [AniHit]) {
         right
             .ani
             .total_cmp(&left.ani)
-            .then(right.af.total_cmp(&left.af))
+            .then(right.af.unwrap_or(1.0).total_cmp(&left.af.unwrap_or(1.0)))
             .then(left.reference.cmp(&right.reference))
     });
 }
@@ -168,61 +245,27 @@ fn reference_batches(candidates: &[Vec<u32>], limit: usize) -> Vec<Vec<usize>> {
 pub(crate) enum AniDecision {
     /// Within the closest AF-passing reference's species radius.
     Species { hit: AniHit },
-    /// Outside every radius but close enough for a consensus genus.
-    Genus {
-        genus_taxonomy: String,
-        supporting: usize,
-        considered: usize,
-    },
-    /// Too distant for a nucleotide-level call.
+    /// No species call; left for the AAI tier.
     Unresolved,
 }
 
 /// Apply GTDB-Tk 2.8's ANI screen to sorted hits: only the closest hit with
-/// `af >= min_af` is checked against its own radius. Failing that, assign the
-/// best hit's genus when it is also the strict-majority genus among hits with
-/// ANI at or above `genus_ani` and `af >= min_af`.
+/// `af >= min_af` is checked against its own radius.
 pub(crate) fn decide(
     hits: &[AniHit],
     accessions: &[String],
     data: &GtdbtkData,
     min_af: f64,
-    genus_ani: f64,
 ) -> AniDecision {
-    if let Some(top) = hits.iter().find(|hit| hit.af >= min_af) {
-        let accession = &accessions[top.reference as usize];
-        if data
-            .radius_of(accession)
-            .is_some_and(|radius| top.ani >= radius)
+    match hits.iter().find(|hit| hit.passes_af(min_af)) {
+        Some(top)
+            if data
+                .radius_of(&accessions[top.reference as usize])
+                .is_some_and(|radius| top.ani >= radius) =>
         {
-            return AniDecision::Species { hit: *top };
+            AniDecision::Species { hit: *top }
         }
-    }
-
-    let genus_of = |hit: &AniHit| {
-        data.taxonomy_of(&accessions[hit.reference as usize])
-            .map(|ranks| ranks[..6].join(";"))
-    };
-    // A high ANI over a small aligned fraction (shared operons, mobile
-    // elements) is a poor genus signal, so only hits passing the AF
-    // threshold vote.
-    let close = hits
-        .iter()
-        .filter(|hit| hit.ani >= genus_ani && hit.af >= min_af)
-        .filter_map(genus_of)
-        .collect::<Vec<_>>();
-    let Some(best_genus) = close.first() else {
-        return AniDecision::Unresolved;
-    };
-    let supporting = close.iter().filter(|genus| *genus == best_genus).count();
-    if supporting * 2 > close.len() {
-        AniDecision::Genus {
-            genus_taxonomy: best_genus.clone(),
-            supporting,
-            considered: close.len(),
-        }
-    } else {
-        AniDecision::Unresolved
+        _ => AniDecision::Unresolved,
     }
 }
 
@@ -260,7 +303,11 @@ mod tests {
     }
 
     fn hit(reference: u32, ani: f64, af: f64) -> AniHit {
-        AniHit { reference, ani, af }
+        AniHit {
+            reference,
+            ani,
+            af: Some(af),
+        }
     }
 
     #[test]
@@ -268,13 +315,13 @@ mod tests {
         let (data, accessions) = data();
         let hits = [hit(0, 96.0, 0.8), hit(1, 95.5, 0.9)];
         assert_eq!(
-            decide(&hits, &accessions, &data, 0.5, 80.0),
+            decide(&hits, &accessions, &data, 0.5),
             AniDecision::Species { hit: hits[0] }
         );
         // Low AF on the closest hit moves the check to the next hit.
         let hits = [hit(0, 99.0, 0.3), hit(1, 97.5, 0.6)];
         assert_eq!(
-            decide(&hits, &accessions, &data, 0.5, 80.0),
+            decide(&hits, &accessions, &data, 0.5),
             AniDecision::Species { hit: hits[1] }
         );
     }
@@ -284,41 +331,55 @@ mod tests {
         let (data, accessions) = data();
         // Closest AF-passing hit (radius 97) fails; GCF_1 (radius 95) would pass.
         let hits = [hit(1, 96.5, 0.8), hit(0, 95.2, 0.8)];
-        assert!(matches!(
-            decide(&hits, &accessions, &data, 0.5, 80.0),
-            AniDecision::Genus {
-                supporting: 2,
-                considered: 2,
-                ..
-            }
-        ));
+        assert_eq!(
+            decide(&hits, &accessions, &data, 0.5),
+            AniDecision::Unresolved
+        );
     }
 
     #[test]
-    fn genus_requires_majority_agreement() {
+    fn turboani_runs_only_when_the_sketch_is_ambiguous() {
         let (data, accessions) = data();
-        let hits = [hit(0, 88.0, 0.6), hit(1, 85.0, 0.5), hit(2, 84.0, 0.5)];
+        let candidate = |reference, sketch_ani| Candidate {
+            reference,
+            sketch_ani,
+        };
+        // One plausible candidate within its radius: the estimate decides.
         assert_eq!(
-            decide(&hits, &accessions, &data, 0.5, 80.0),
-            AniDecision::Genus {
-                genus_taxonomy: "d__Bacteria;p__P;c__C;o__O;f__F;g__A".into(),
-                supporting: 2,
-                considered: 3,
-            }
+            screen(
+                &[candidate(0, 97.0), candidate(2, 85.0)],
+                &accessions,
+                &data,
+                90.0
+            ),
+            Screen::Estimated(AniHit {
+                reference: 0,
+                ani: 97.0,
+                af: None,
+            })
         );
-        let split = [hit(0, 88.0, 0.6), hit(2, 85.0, 0.5)];
+        // Two plausible species, or one without a clear margin over its
+        // radius, need TurboANI.
         assert_eq!(
-            decide(&split, &accessions, &data, 0.5, 80.0),
-            AniDecision::Unresolved
+            screen(
+                &[candidate(0, 97.0), candidate(1, 93.0)],
+                &accessions,
+                &data,
+                90.0
+            ),
+            Screen::Exact(vec![0, 1])
         );
         assert_eq!(
-            decide(&[hit(0, 79.0, 0.6)], &accessions, &data, 0.5, 80.0),
-            AniDecision::Unresolved
+            screen(&[candidate(1, 96.0)], &accessions, &data, 90.0),
+            Screen::Exact(vec![1])
         );
-        // Hits below the AF threshold do not vote.
         assert_eq!(
-            decide(&[hit(0, 90.0, 0.1)], &accessions, &data, 0.5, 80.0),
-            AniDecision::Unresolved
+            screen(&[candidate(0, 95.5)], &accessions, &data, 90.0),
+            Screen::Exact(vec![0])
+        );
+        assert_eq!(
+            screen(&[candidate(0, 80.0)], &accessions, &data, 90.0),
+            Screen::Exact(vec![])
         );
     }
 
