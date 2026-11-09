@@ -140,6 +140,9 @@ Search options:
 | `--k <N>` | `10` | Nearest neighbors reported for each query. |
 | `--beam-width <N>` | `512` | Graph-search beam. Larger values generally improve recall but reduce throughput. |
 | `--output <FILE>` | stdout | Write tab-separated results to a file. |
+| `--no-preload` | off | Search the index straight from disk without first reading it into the page cache (see below). |
+
+**Index warm-up.** Search memory-maps the index and walks its graph in random order, so on a cold page cache every step waits on a random disk read. On GTDB-sized indexes on HPC storage a cold search ran about 240 times slower than a warm one, while reading the whole file in order took about 3 s. Search therefore reads the index front to back into the page cache in a background thread while the queries are sketched, then searches it from memory; `aeon classify` does the same for its three indexes, in the order it searches them. On Linux the read is skipped when the index does not fit in the memory available to the process (`MemAvailable`, capped by the job's cgroup limit, e.g. under Slurm; cached files count as free), and the search then reads pages on demand as before. Elsewhere it always runs. Results are the same either way. Use `--no-preload` to turn it off, e.g. when the index is already cached or memory is better spent on other work.
 
 ### Classify
 
@@ -286,7 +289,7 @@ The default row comes from full classify runs. The other rows replay the rule ov
 - **DIAMOND mode:** the default mode gives AAI about 2 points higher than `--sensitive` on the same pairs (median +2.2 and +2.3 on the two sets). It made about the same number of wrong calls under the majority vote (19 against 21) in about a third of the time.
 - **Species calls from the sketch alone:** reference genomes cut into 10 kb pieces, keeping 50–90% of them, were all assigned their own species, 24 of 24, with no TurboANI call.
 
-**Runtime.** On the 55-genome training set with 8 threads, classify took 80 s wall time and 570 CPU-seconds, with a peak RSS of 0.95 GB. Building the 272-reference database with FragGeneScanRs gene calls (no `--protein-list`) took 124 s, with a peak RSS of 1.7 GB. Index scaling at full GTDB size has not been measured yet.
+**Runtime.** On the 55-genome training set with 8 threads, classify took 80 s wall time and 570 CPU-seconds, with a peak RSS of 0.95 GB. Building the 272-reference database with FragGeneScanRs gene calls (no `--protein-list`) took 124 s, with a peak RSS of 1.7 GB. Index scaling at full GTDB size has not been measured yet. Indexes are warmed before searching (see [Search](#search)); `--no-preload` turns this off.
 
 ## Update Semantics
 

@@ -14,6 +14,7 @@ use crate::metadata::{
 };
 use crate::sketch::sketch_from_params;
 use crate::utils::{read_list_file, write_genome_list, write_idmap_tsv};
+use crate::warmup::Warmup;
 
 pub(crate) fn build_database(
     prefix: &str,
@@ -237,6 +238,7 @@ pub(crate) fn search_database(
     k: usize,
     beam: usize,
     output_path: Option<&str>,
+    preload: bool,
 ) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let params = load_params(prefix)?;
@@ -253,7 +255,10 @@ pub(crate) fn search_database(
         k,
         beam
     );
+    // Warm the index while the queries are sketched.
+    let warmup = Warmup::start(&[prefix], preload)?;
     let vectors = sketch_from_params(&queries, &params);
+    eprintln!("{}", warmup.wait(prefix)?);
     let hits = search_vectors(prefix, references.len(), &vectors, k, beam)?
         .into_iter()
         .enumerate()

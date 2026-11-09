@@ -3,6 +3,7 @@ mod database;
 mod metadata;
 mod sketch;
 mod utils;
+mod warmup;
 
 use std::error::Error;
 
@@ -33,6 +34,13 @@ fn threads_arg() -> Arg {
         .value_parser(clap::value_parser!(usize))
         .visible_alias("cpus")
         .help("Worker threads [default: all logical CPUs]")
+}
+
+fn no_preload_arg() -> Arg {
+    Arg::new("no_preload")
+        .long("no-preload")
+        .action(ArgAction::SetTrue)
+        .help("Do not read each index into the page cache before searching it (on by default; skipped automatically when the index does not fit in available memory)")
 }
 
 fn fgs_args() -> [Arg; 2] {
@@ -280,6 +288,7 @@ fn build_cli() -> Command {
                         .value_name("FILE")
                         .help("Write TSV results to FILE instead of standard output"),
                 )
+                .arg(no_preload_arg())
                 .arg(threads_arg()),
         )
         .subcommand(
@@ -544,6 +553,7 @@ fn build_cli() -> Command {
                         .value_parser(clap::value_parser!(usize))
                         .help("DiskANN search beam"),
                 )
+                .arg(no_preload_arg())
                 .arg(threads_arg()),
         )
 }
@@ -604,6 +614,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             *args.get_one::<usize>("k").unwrap(),
             *args.get_one::<usize>("beam_width").unwrap(),
             args.get_one::<String>("output").map(String::as_str),
+            !args.get_flag("no_preload"),
         )?,
         "classify-db" => build_classify_db(
             args.get_one::<String>("db").unwrap(),
@@ -654,6 +665,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             diamond: args.get_one::<String>("diamond").unwrap().clone(),
             min_perc_aa: *args.get_one("min_perc_aa").unwrap(),
             bin_dir: args.get_one::<String>("bin_dir").cloned(),
+            preload: !args.get_flag("no_preload"),
             threads: requested_threads(args),
         })?,
         _ => unreachable!(),

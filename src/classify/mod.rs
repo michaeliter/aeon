@@ -33,7 +33,7 @@ use crate::classify::markers::{
     write_filtered, write_marker_info, write_markers_summary, write_msa_gz,
 };
 use crate::classify::refdata::{marker_set_for_taxonomy, standardise_taxonomy};
-use crate::classify::refdb::ClassifyDb;
+use crate::classify::refdb::{ClassifyDb, Index};
 use crate::classify::summary::{
     AniScreenRow, RelatedReference, SummaryRow, format_related_references, py_round,
     write_ani_summary, write_summary,
@@ -41,6 +41,7 @@ use crate::classify::summary::{
 use crate::database::search_vectors;
 use crate::sketch::sketch_from_params;
 use crate::utils::read_list_file;
+use crate::warmup::{Preload, Warmup};
 
 pub(crate) enum QueryInput {
     /// Every file in `dir` ending in `.{extension}`; IDs drop the extension.
@@ -67,6 +68,8 @@ pub(crate) struct ClassifyOptions {
     pub(crate) diamond: String,
     pub(crate) min_perc_aa: f64,
     pub(crate) bin_dir: Option<String>,
+    /// Read each index into the page cache before searching it.
+    pub(crate) preload: bool,
     pub(crate) threads: usize,
 }
 
@@ -217,6 +220,14 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
         db.nt.paths.len()
     ));
     log.info(format!("Identified {} genomes to classify", queries.len()));
+    // Warm all three indexes in search order while the queries are processed.
+    let warmup = Warmup::start(
+        &[&db.nt.prefix, &db.aa.prefix, &db.markers.prefix],
+        options.preload,
+    )?;
+    if !options.preload {
+        log.info(Preload::Disabled.to_string());
+    }
 
     log.info("Running ANI screen with DiskANN candidate search and TurboANI");
     let query_paths = queries
@@ -224,30 +235,24 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
         .map(|genome| genome.path.clone())
         .collect::<Vec<_>>();
     let vectors = sketch_from_params(&query_paths, &db.nt.params);
-    let screens = search_vectors(
-        &db.nt.prefix,
-        db.nt.len(),
-        &vectors,
-        options.candidates,
-        options.beam_width,
-    )?
-    .into_iter()
-    .map(|neighbors| {
-        let candidates = neighbors
-            .into_iter()
-            .map(|(reference, distance)| Candidate {
-                reference,
-                sketch_ani: sketch_ani(distance, db.nt.params.kmer_size),
-            })
-            .collect::<Vec<_>>();
-        screen(
-            &candidates,
-            &db.nt.accessions,
-            &db.data,
-            options.min_sketch_ani,
-        )
-    })
-    .collect::<Vec<_>>();
+    let screens = search_index(&db.nt, &warmup, &vectors, options, &log)?
+        .into_iter()
+        .map(|neighbors| {
+            let candidates = neighbors
+                .into_iter()
+                .map(|(reference, distance)| Candidate {
+                    reference,
+                    sketch_ani: sketch_ani(distance, db.nt.params.kmer_size),
+                })
+                .collect::<Vec<_>>();
+            screen(
+                &candidates,
+                &db.nt.accessions,
+                &db.data,
+                options.min_sketch_ani,
+            )
+        })
+        .collect::<Vec<_>>();
     let exact = screens
         .iter()
         .map(|screen| match screen {
@@ -311,8 +316,8 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
     ));
     let mut results = results;
     call_query_genes(&mut results, options, &out_dir, &log)?;
-    run_aai_tier(&mut results, &db, options, &out_dir, &log)?;
-    run_marker_tier(&mut results, &db, options, &out_dir, &log)?;
+    run_aai_tier(&mut results, &db, &warmup, options, &out_dir, &log)?;
+    run_marker_tier(&mut results, &db, &warmup, options, &out_dir, &log)?;
 
     write_identify_files(&results, &out_dir, &options.prefix)?;
     let mut rows: BTreeMap<&'static str, Vec<SummaryRow>> = BTreeMap::new();
@@ -408,11 +413,34 @@ fn call_query_genes(
     Ok(())
 }
 
+/// Search `index` for each sketch's `--candidates` nearest references, once
+/// the index's warm-up has finished.
+fn search_index(
+    index: &Index,
+    warmup: &Warmup,
+    vectors: &[Vec<u16>],
+    options: &ClassifyOptions,
+    log: &ClassifyLog,
+) -> Result<Vec<Vec<(u32, f32)>>, Box<dyn Error>> {
+    match warmup.wait(&index.prefix)? {
+        Preload::Disabled => {}
+        preload => log.info(preload.to_string()),
+    }
+    search_vectors(
+        &index.prefix,
+        index.len(),
+        vectors,
+        options.candidates,
+        options.beam_width,
+    )
+}
+
 /// Classify genomes the ANI tier left unresolved by AAI against candidate
 /// reference proteomes.
 fn run_aai_tier(
     results: &mut [QueryResult],
     db: &ClassifyDb,
+    warmup: &Warmup,
     options: &ClassifyOptions,
     out_dir: &Path,
     log: &ClassifyLog,
@@ -440,16 +468,10 @@ fn run_aai_tier(
         .map(|(_, faa)| faa.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     let vectors = sketch_from_params(&proteome_paths, &db.aa.params);
-    let candidates = search_vectors(
-        &db.aa.prefix,
-        db.aa.len(),
-        &vectors,
-        options.candidates,
-        options.beam_width,
-    )?
-    .into_iter()
-    .map(|neighbors| neighbors.into_iter().map(|(id, _)| id).collect::<Vec<_>>())
-    .collect::<Vec<_>>();
+    let candidates = search_index(&db.aa, warmup, &vectors, options, log)?
+        .into_iter()
+        .map(|neighbors| neighbors.into_iter().map(|(id, _)| id).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
     let proteomes = called
         .iter()
         .map(|(_, faa)| faa.as_path())
@@ -513,6 +535,7 @@ fn run_aai_tier(
 fn run_marker_tier(
     results: &mut [QueryResult],
     db: &ClassifyDb,
+    warmup: &Warmup,
     options: &ClassifyOptions,
     out_dir: &Path,
     log: &ClassifyLog,
@@ -699,7 +722,7 @@ fn run_marker_tier(
             aligned.insert(id, (masked, msa_percent, set));
         }
     }
-    let closest = search_marker_index(&aligned, db, options, out_dir, log)?;
+    let closest = search_marker_index(&aligned, db, warmup, options, out_dir, log)?;
     for (id, (_, msa_percent, _)) in aligned {
         outcomes.insert(
             id.clone(),
@@ -741,6 +764,7 @@ fn run_marker_tier(
 fn search_marker_index(
     aligned: &BTreeMap<String, (String, f64, &'static str)>,
     db: &ClassifyDb,
+    warmup: &Warmup,
     options: &ClassifyOptions,
     out_dir: &Path,
     log: &ClassifyLog,
@@ -762,13 +786,7 @@ fn search_marker_index(
         paths.push(path.to_string_lossy().into_owned());
     }
     let vectors = sketch_from_params(&paths, &db.markers.params);
-    let neighbors = search_vectors(
-        &db.markers.prefix,
-        db.markers.len(),
-        &vectors,
-        options.candidates,
-        options.beam_width,
-    )?;
+    let neighbors = search_index(&db.markers, warmup, &vectors, options, log)?;
     let mut output = BufWriter::new(File::create(
         dir.join(format!("{}.marker_summary.tsv", options.prefix)),
     )?);
