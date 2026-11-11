@@ -231,6 +231,8 @@ All three graphs are built with max degree 128 (`--max-degree`), construction be
   - `classify/aai/{prefix}.aai_summary.tsv`: every AAI hit, with the SD of the reciprocal-best-hit identities, their count, and the smaller proteome's protein count;
   - `classify/markers/{prefix}.marker_summary.tsv`: every marker-index hit, with an estimated marker identity.
 - `align/` holds the user MSA only, not the full reference MSA.
+- `classify/ani_screen/{prefix}.ani_screen_unassigned_hits.tsv.gz` lists the TurboANI hits of genomes the ANI screen did not assign, so it covers only genomes whose sketch search found candidates.
+- `{prefix}.json` records aeon's steps under GTDB-Tk's four step names, so GTDB-Tk can read it. Gene calling and the marker HMM search count as `identify`; AAI and the marker-index search count as `classify`. Each step's duration is the time spent in it, and its `starts_at` and `ends_at` are its first start and last end.
 
 ```bash
 # External tools: DIAMOND and HMMER (environment.yml), and FragGeneScanRs.

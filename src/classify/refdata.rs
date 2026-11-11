@@ -33,21 +33,37 @@ pub(crate) fn strip_db_prefix(gid: &str) -> &str {
         .unwrap_or(gid)
 }
 
+/// Extensions of the compressed FASTA formats aeon reads.
+const COMPRESSION_SUFFIXES: [&str; 4] = [".gz", ".xz", ".bz2", ".zst"];
+
+/// Whether `path` names a gzip, xz, bzip2 or zstd file.
+pub(crate) fn is_compressed(path: &str) -> bool {
+    COMPRESSION_SUFFIXES
+        .iter()
+        .any(|suffix| path.ends_with(suffix))
+}
+
+/// The file name of `path` without its compression extension and then,
+/// in order, each of `suffixes` it ends with.
+pub(crate) fn file_stem<'a>(path: &'a str, suffixes: &[&str]) -> &'a str {
+    let mut stem = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    for suffix in COMPRESSION_SUFFIXES.iter().chain(suffixes) {
+        stem = stem.strip_suffix(suffix).unwrap_or(stem);
+    }
+    stem
+}
+
 /// Derive a genome ID from a file path such as
 /// `.../GCF_000005845.2_genomic.fna.gz`, `.../GCA_000006155.2_protein.faa`
 /// or `.../G000005825.fna.xz`.
 pub(crate) fn accession_from_path(path: &str) -> String {
-    let name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(path);
-    let mut stem = name;
-    for suffix in [
-        ".gz", ".xz", ".bz2", ".zst", ".fna", ".faa", ".fa", ".fasta", "_genomic", "_protein",
-    ] {
-        stem = stem.strip_suffix(suffix).unwrap_or(stem);
-    }
-    let stem = strip_db_prefix(stem);
+    let stem = strip_db_prefix(file_stem(
+        path,
+        &[".fna", ".faa", ".fa", ".fasta", "_genomic", "_protein"],
+    ));
     // GCF_000005845.2_ASM584v2 -> GCF_000005845.2
     if stem.starts_with("GCA_") || stem.starts_with("GCF_") {
         if let Some(dot) = stem.find('.') {
@@ -62,22 +78,12 @@ pub(crate) fn accession_from_path(path: &str) -> String {
 
 /// Pad an incomplete taxonomy string to seven ranks, like GTDB-Tk's
 /// `standardise_taxonomy`.
-pub(crate) fn standardise_taxonomy(taxonomy: &str, marker_set: Option<&str>) -> String {
+pub(crate) fn standardise_taxonomy(taxonomy: &str) -> String {
     let mut ranks = taxonomy
         .split(';')
         .filter(|rank| !rank.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let domain = match marker_set {
-        Some("bac120") => Some("d__Bacteria"),
-        Some("ar53") => Some("d__Archaea"),
-        _ => None,
-    };
-    if let Some(domain) = domain {
-        if ranks.first().map(String::as_str) != Some(domain) {
-            ranks.insert(0, domain.to_owned());
-        }
-    }
     ranks.extend(
         RANK_PREFIXES[ranks.len().min(RANK_PREFIXES.len())..]
             .iter()
@@ -296,16 +302,12 @@ mod tests {
     #[test]
     fn taxonomy_is_padded_to_seven_ranks() {
         assert_eq!(
-            standardise_taxonomy("d__Bacteria;p__Bacillota;c__Bacilli", None),
+            standardise_taxonomy("d__Bacteria;p__Bacillota;c__Bacilli"),
             "d__Bacteria;p__Bacillota;c__Bacilli;o__;f__;g__;s__"
         );
         assert_eq!(
-            standardise_taxonomy("p__Halobacteriota", Some("ar53")),
+            standardise_taxonomy("d__Archaea;p__Halobacteriota;;"),
             "d__Archaea;p__Halobacteriota;c__;o__;f__;g__;s__"
-        );
-        assert_eq!(
-            standardise_taxonomy("", Some("bac120")),
-            "d__Bacteria;p__;c__;o__;f__;g__;s__"
         );
     }
 

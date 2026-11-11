@@ -9,17 +9,11 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::classify::external::{find_program, run};
+use crate::classify::external::{find_program, run_with_input};
 
 /// FragGeneScanRs translates with the standard bacterial code.
 pub(crate) const TRANSLATION_TABLE: u8 = 11;
 const TRAINING_MODEL: &str = "complete";
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct GeneCalls {
-    pub(crate) protein_faa: PathBuf,
-    pub(crate) proteins: usize,
-}
 
 /// FragGeneScanRs and the directory holding its training models.
 pub(crate) struct GeneCaller {
@@ -53,47 +47,46 @@ impl GeneCaller {
     }
 
     /// Call genes for one genome into `out_dir/{genome_id}/`, writing
-    /// `{id}_protein.faa`, `{id}_protein.fna` and `{id}_protein.gff` like
-    /// GTDB-Tk's `identify` step. Returns `None` for a genome without
-    /// sequence or genes. FragGeneScanRs splits the contigs over `threads`.
+    /// `{id}_protein.faa` and, with `gene_files`, `{id}_protein.fna` and
+    /// `{id}_protein.gff` like GTDB-Tk's `identify` step. Returns the protein
+    /// FASTA, or `None` for a genome without sequence or genes.
+    /// FragGeneScanRs reads the genome from its standard input and splits
+    /// the contigs over `threads`.
     pub(crate) fn call(
         &self,
         genome_path: &str,
         genome_id: &str,
         out_dir: &Path,
         threads: usize,
-    ) -> Result<Option<GeneCalls>, Box<dyn Error>> {
+        gene_files: bool,
+    ) -> Result<Option<PathBuf>, Box<dyn Error>> {
         let genome_dir = out_dir.join(genome_id);
         fs::create_dir_all(&genome_dir)?;
-        let input = genome_dir.join(format!("{genome_id}.input.fna"));
-        let total_bases = write_plain_fasta(genome_path, &input)?;
-        if total_bases == 0 {
-            fs::remove_file(&input)?;
-            return Ok(None);
-        }
         // Genome IDs such as GCF_000005845.2 contain dots, so names are built
         // explicitly rather than with `Path::with_extension`.
         let output = |suffix: &str| genome_dir.join(format!("{genome_id}{suffix}"));
         let protein_faa = output("_protein.faa");
-        run(Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(["-w", "1", "-t", TRAINING_MODEL])
             .args(["-p", &threads.max(1).to_string()])
             .arg("-r")
             .arg(&self.train_dir)
-            .arg("-s")
-            .arg(&input)
             .arg("-a")
-            .arg(&protein_faa)
-            .arg("-n")
-            .arg(output("_protein.fna"))
-            .arg("-g")
-            .arg(output("_protein.gff")))?;
-        fs::remove_file(&input)?;
-        let proteins = count_records(&protein_faa)?;
-        Ok((proteins > 0).then_some(GeneCalls {
-            protein_faa,
-            proteins,
-        }))
+            .arg(&protein_faa);
+        if gene_files {
+            command
+                .arg("-n")
+                .arg(output("_protein.fna"))
+                .arg("-g")
+                .arg(output("_protein.gff"));
+        }
+        let mut bases = 0;
+        run_with_input(&mut command, |stdin| {
+            bases = write_plain_fasta(genome_path, stdin)?;
+            Ok(())
+        })?;
+        Ok((bases > 0 && count_records(&protein_faa)? > 0).then_some(protein_faa))
     }
 }
 
@@ -133,23 +126,39 @@ fn default_train_dirs(program: &Path) -> Vec<PathBuf> {
 }
 
 /// Decompress and normalise a FASTA/FASTQ file to plain FASTA; returns its base count.
-pub(crate) fn write_plain_fasta(input: &str, output: &Path) -> Result<usize, Box<dyn Error>> {
+pub(crate) fn write_plain_fasta(
+    input: &str,
+    output: &mut dyn Write,
+) -> Result<usize, Box<dyn Error>> {
     let mut reader =
         parse_fastx_file(input).map_err(|error| format!("invalid FASTA {input}: {error}"))?;
-    let mut writer = BufWriter::new(File::create(output)?);
     let mut total = 0;
     while let Some(record) = reader.next() {
         let record = record.map_err(|error| format!("error reading {input}: {error}"))?;
         let sequence = record.seq();
         total += sequence.len();
-        writer.write_all(b">")?;
-        writer.write_all(record.id())?;
-        writer.write_all(b"\n")?;
-        writer.write_all(&sequence)?;
-        writer.write_all(b"\n")?;
+        write_fasta_record(output, record.id(), &sequence)?;
     }
-    writer.flush()?;
+    output.flush()?;
     Ok(total)
+}
+
+/// `write_plain_fasta` into the file `output`.
+pub(crate) fn write_plain_fasta_file(input: &str, output: &Path) -> Result<usize, Box<dyn Error>> {
+    write_plain_fasta(input, &mut BufWriter::new(File::create(output)?))
+}
+
+/// One FASTA record: `>id`, then the sequence on one line.
+pub(crate) fn write_fasta_record(
+    writer: &mut (impl Write + ?Sized),
+    id: &[u8],
+    sequence: &[u8],
+) -> std::io::Result<()> {
+    writer.write_all(b">")?;
+    writer.write_all(id)?;
+    writer.write_all(b"\n")?;
+    writer.write_all(sequence)?;
+    writer.write_all(b"\n")
 }
 
 pub(crate) fn count_records(fasta: &Path) -> Result<usize, Box<dyn Error>> {

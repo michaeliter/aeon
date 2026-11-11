@@ -19,6 +19,7 @@ use needletail::parse_fastx_file;
 use rayon::prelude::*;
 
 use crate::classify::external::run;
+use crate::classify::genes::write_fasta_record;
 use crate::classify::refdata::GtdbtkData;
 
 /// DIAMOND threads per query job; small searches scale poorly past a few.
@@ -241,7 +242,7 @@ fn write_tagged_proteins(
             let id = format!("{genome}|{count}");
             count += 1;
             letters += sequence.len();
-            write_record(&mut writer, &id, &sequence)?;
+            write_fasta_record(&mut writer, id.as_bytes(), &sequence)?;
             proteins.insert(id, sequence.into_owned());
         }
         if count > 0 {
@@ -262,16 +263,10 @@ fn write_selected_proteins(
     let mut ids = ids.iter().copied().collect::<Vec<_>>();
     ids.sort_unstable();
     for id in ids {
-        write_record(&mut writer, id, &proteins[id])?;
+        write_fasta_record(&mut writer, id.as_bytes(), &proteins[id])?;
     }
     writer.flush()?;
     Ok(())
-}
-
-fn write_record(writer: &mut impl Write, id: &str, sequence: &[u8]) -> std::io::Result<()> {
-    writeln!(writer, ">{id}")?;
-    writer.write_all(sequence)?;
-    writer.write_all(b"\n")
 }
 
 /// DIAMOND `blastp` of `queries` against the FASTA `subjects`
@@ -369,19 +364,23 @@ fn reciprocal_aai(
     reverse: &[ProteinHit],
 ) -> HashMap<u32, Identities> {
     let reverse_best = best_hits(reverse);
+    // The reverse search's identity is averaged; the forward one is the
+    // same alignment up to DIAMOND's heuristics.
+    let mut reciprocal = forward_best
+        .iter()
+        .filter_map(|(&(query_protein, reference), hit)| {
+            let back = reverse_best.get(&(hit.subject.as_str(), genome_of(query_protein)))?;
+            (back.subject == query_protein).then_some((reference, query_protein, back.identity))
+        })
+        .collect::<Vec<_>>();
+    // Sum in a fixed order, not hash order, so rounded AAIs are reproducible.
+    reciprocal.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
     let mut sums: HashMap<u32, Identities> = HashMap::new();
-    for (&(query_protein, reference), hit) in forward_best {
-        // The reverse search's identity is averaged; the forward one is the
-        // same alignment up to DIAMOND's heuristics.
-        let Some(back) = reverse_best.get(&(hit.subject.as_str(), genome_of(query_protein))) else {
-            continue;
-        };
-        if back.subject == query_protein {
-            let entry = sums.entry(reference).or_default();
-            entry.sum += back.identity;
-            entry.sum_squares += back.identity.powi(2);
-            entry.count += 1;
-        }
+    for (reference, _, identity) in reciprocal {
+        let entry = sums.entry(reference).or_default();
+        entry.sum += identity;
+        entry.sum_squares += identity.powi(2);
+        entry.count += 1;
     }
     sums
 }

@@ -1,5 +1,7 @@
 //! Writers for GTDB-Tk-compatible classification output files.
 
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -237,6 +239,30 @@ pub(crate) fn write_ani_summary(path: &Path, rows: &[AniScreenRow]) -> io::Resul
         )?;
     }
     output.flush()
+}
+
+/// GTDB-Tk 2.8's `classify/ani_screen/{prefix}.ani_screen_unassigned_hits.tsv.gz`:
+/// every `(user_genome, reference_genome, ani, af)` hit of the genomes the
+/// ANI screen did not assign, given in genome order, with floats written as
+/// Python's `repr` so they round-trip. GTDB-Tk writes it even when empty.
+pub(crate) fn write_unassigned_hits<'a>(
+    path: &Path,
+    hits: impl IntoIterator<Item = (&'a str, &'a str, f64, f64)>,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut output = GzEncoder::new(BufWriter::new(File::create(path)?), Compression::default());
+    writeln!(output, "user_genome\treference_genome\tani\taf")?;
+    for (user_genome, reference_genome, ani, af) in hits {
+        writeln!(
+            output,
+            "{user_genome}\t{reference_genome}\t{}\t{}",
+            py_float(ani),
+            py_float(af)
+        )?;
+    }
+    output.finish()?.flush()
 }
 
 #[cfg(test)]

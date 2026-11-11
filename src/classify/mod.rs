@@ -9,6 +9,7 @@ pub(crate) mod log;
 pub(crate) mod markers;
 pub(crate) mod refdata;
 pub(crate) mod refdb;
+pub(crate) mod run_record;
 pub(crate) mod summary;
 
 use rayon::prelude::*;
@@ -25,7 +26,7 @@ use crate::classify::ani::{
     sketch_ani,
 };
 use crate::classify::external::{find_program, find_tool};
-use crate::classify::genes::{GeneCaller, GeneCalls, TRANSLATION_TABLE};
+use crate::classify::genes::{GeneCaller, TRANSLATION_TABLE};
 use crate::classify::log::ClassifyLog;
 use crate::classify::markers::{
     CopyNumber, MARKER_SETS, MarkerTools, PfamInfo, align_markers, apply_mask, filtered_reason,
@@ -34,9 +35,10 @@ use crate::classify::markers::{
 };
 use crate::classify::refdata::{marker_set_for_taxonomy, standardise_taxonomy};
 use crate::classify::refdb::{ClassifyDb, Index};
+use crate::classify::run_record::{ALIGN, ANI_SCREEN, CLASSIFY, IDENTIFY, RunInfo, RunRecord};
 use crate::classify::summary::{
-    AniScreenRow, RelatedReference, SummaryRow, format_related_references, py_round,
-    write_ani_summary, write_summary,
+    AniScreenRow, NONE_VALUE, RelatedReference, SummaryRow, format_related_references, py_round,
+    write_ani_summary, write_summary, write_unassigned_hits,
 };
 use crate::database::search_vectors;
 use crate::sketch::sketch_from_params;
@@ -132,26 +134,32 @@ pub(crate) fn resolve_queries(input: &QueryInput) -> Result<Vec<QueryGenome>, Bo
 
 /// File name without directories or FASTA/compression extensions.
 fn file_stem(path: &str) -> String {
-    let mut name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(path);
-    for suffix in [".gz", ".fna", ".fa", ".fasta", ".fas"] {
-        name = name.strip_suffix(suffix).unwrap_or(name);
-    }
-    name.to_owned()
+    refdata::file_stem(path, &[".fna", ".fa", ".fasta", ".fas"]).to_owned()
 }
 
 /// Everything known about one query after each tier it reached.
 struct QueryResult<'a> {
     genome: &'a QueryGenome,
+    /// The ANI screen's hits, reported for every genome.
     hits: Vec<AniHit>,
-    decision: AniDecision,
-    /// Gene calls for genomes the ANI tier left unresolved; the inner
-    /// `None` means FragGeneScanRs called no genes.
-    genes: Option<Option<GeneCalls>>,
-    aai: Option<AaiResult>,
-    markers: Option<MarkerResult>,
+    stage: Stage,
+}
+
+/// How far down the cascade a genome went.
+enum Stage {
+    /// The ANI screen assigned a species.
+    Species(AniHit),
+    /// The ANI screen left it unresolved and genes are not yet called.
+    Unresolved,
+    /// FragGeneScanRs called no genes.
+    NoGenes,
+    /// Genes were called; the AAI and marker tiers fill in their results
+    /// as each runs.
+    Called {
+        protein_faa: PathBuf,
+        aai: Option<AaiResult>,
+        markers: Option<MarkerResult>,
+    },
 }
 
 struct AaiResult {
@@ -188,19 +196,19 @@ struct MarkerHit {
     identity: f64,
 }
 
-impl QueryResult<'_> {
-    fn called_genes(&self) -> Option<&GeneCalls> {
-        self.genes.as_ref().and_then(Option::as_ref)
+impl Stage {
+    /// The proteins of a genome whose genes were called.
+    fn protein_faa(&self) -> Option<&Path> {
+        match self {
+            Self::Called { protein_faa, .. } => Some(protein_faa),
+            _ => None,
+        }
     }
 
-    /// Unresolved by ANI and, where it ran, by AAI.
+    /// Genes called, and unresolved by AAI where it ran.
     fn needs_markers(&self) -> bool {
-        self.decision == AniDecision::Unresolved
-            && self.called_genes().is_some()
-            && self
-                .aai
-                .as_ref()
-                .is_none_or(|aai| aai.decision == AaiDecision::Unresolved)
+        matches!(self, Self::Called { aai, markers: None, .. }
+            if aai.as_ref().is_none_or(|aai| aai.decision == AaiDecision::Unresolved))
     }
 }
 
@@ -229,105 +237,216 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
         log.info(Preload::Disabled.to_string());
     }
 
+    let mut record = RunRecord::start();
+    let mut results = run_ani_tier(&queries, &db, &warmup, options, &out_dir, &log, &mut record)?;
+    record.mark(ANI_SCREEN);
+    call_query_genes(&mut results, options, &out_dir, &log)?;
+    if results
+        .iter()
+        .any(|result| !matches!(result.stage, Stage::Species(_)))
+    {
+        record.mark(IDENTIFY);
+    }
+    run_aai_tier(
+        &mut results,
+        &db,
+        &warmup,
+        options,
+        &out_dir,
+        &log,
+        &mut record,
+    )?;
+    record.mark(CLASSIFY);
+    run_marker_tier(
+        &mut results,
+        &db,
+        &warmup,
+        options,
+        &out_dir,
+        &log,
+        &mut record,
+    )?;
+
+    write_identify_files(&results, &out_dir, &options.prefix, &mut record)?;
+    write_summaries(&results, &db, options, &out_dir, &log, &mut record)?;
+    record.mark(CLASSIFY);
+    let (genome_dir, extension, batchfile) = match &options.input {
+        QueryInput::GenomeDir { dir, extension } => {
+            (Some(dir.clone()), Some(extension.clone()), None)
+        }
+        QueryInput::Batchfile(path) => (None, None, Some(path.clone())),
+    };
+    record.write(&RunInfo {
+        command_line: std::iter::once("aeon".to_owned())
+            .chain(std::env::args().skip(1))
+            .collect::<Vec<_>>()
+            .join(" "),
+        database_version: db.manifest.gtdb_release.clone(),
+        database_path: PathBuf::from(&options.db),
+        out_dir: out_dir.clone(),
+        prefix: options.prefix.clone(),
+        genome_dir,
+        batchfile,
+        extension,
+        min_af: options.min_af,
+        min_perc_aa: options.min_perc_aa,
+    })?;
+    log.info(format!(
+        "Done. Classified {} genomes in {:.3}s",
+        queries.len(),
+        started.elapsed().as_secs_f64()
+    ));
+    Ok(())
+}
+
+const NO_GENES: &str = "No genes were called by FragGeneScanRs";
+const NO_MARKERS: &str = "No bacterial or archaeal marker";
+
+fn marker_genes_dir(out_dir: &Path) -> PathBuf {
+    out_dir
+        .join("identify")
+        .join("intermediate_results")
+        .join("marker_genes")
+}
+
+/// Screen every query against the nucleotide index: a species from the
+/// sketch alone when the candidates name one species, else TurboANI against
+/// the candidates and GTDB-Tk's radius rule.
+fn run_ani_tier<'a>(
+    queries: &'a [QueryGenome],
+    db: &ClassifyDb,
+    warmup: &Warmup,
+    options: &ClassifyOptions,
+    out_dir: &Path,
+    log: &ClassifyLog,
+    record: &mut RunRecord,
+) -> Result<Vec<QueryResult<'a>>, Box<dyn Error>> {
     log.info("Running ANI screen with DiskANN candidate search and TurboANI");
     let query_paths = queries
         .iter()
         .map(|genome| genome.path.clone())
         .collect::<Vec<_>>();
     let vectors = sketch_from_params(&query_paths, &db.nt.params);
-    let screens = search_index(&db.nt, &warmup, &vectors, options, &log)?
-        .into_iter()
-        .map(|neighbors| {
-            let candidates = neighbors
-                .into_iter()
-                .map(|(reference, distance)| Candidate {
-                    reference,
-                    sketch_ani: sketch_ani(distance, db.nt.params.kmer_size),
-                })
-                .collect::<Vec<_>>();
-            screen(
-                &candidates,
-                &db.nt.accessions,
-                &db.data,
-                options.min_sketch_ani,
-            )
-        })
-        .collect::<Vec<_>>();
-    let exact = screens
-        .iter()
-        .map(|screen| match screen {
-            Screen::Exact(references) => references.clone(),
-            Screen::Estimated(_) => Vec::new(),
-        })
-        .collect::<Vec<_>>();
+    // Per query, the sketch-only species hit or the candidates for TurboANI.
+    let (estimated, exact): (Vec<_>, Vec<_>) =
+        search_index(&db.nt, warmup, &vectors, options, log)?
+            .into_iter()
+            .map(|neighbors| {
+                let candidates = neighbors
+                    .into_iter()
+                    .map(|(reference, distance)| Candidate {
+                        reference,
+                        sketch_ani: sketch_ani(distance, db.nt.params.kmer_size),
+                    })
+                    .collect::<Vec<_>>();
+                match screen(
+                    &candidates,
+                    &db.nt.accessions,
+                    &db.data,
+                    options.min_sketch_ani,
+                ) {
+                    Screen::Estimated(hit) => (Some(hit), Vec::new()),
+                    Screen::Exact(references) => (None, references),
+                }
+            })
+            .unzip();
     let turboani = exact
         .iter()
         .filter(|references| !references.is_empty())
         .count();
     log.info(format!(
         "TurboANI checks candidates for {turboani} genome(s); {} matched one species by sketch alone.",
-        screens
-            .iter()
-            .filter(|screen| matches!(screen, Screen::Estimated(_)))
-            .count()
+        estimated.iter().flatten().count()
     ));
     let exact_hits = refine_candidates(&query_paths, &exact, &db.nt.paths)?;
     let results = queries
         .iter()
-        .zip(screens)
+        .zip(estimated)
         .zip(exact_hits)
-        .map(|((genome, screen), exact_hits)| {
-            let hits = match screen {
-                Screen::Estimated(hit) => vec![hit],
-                Screen::Exact(_) => exact_hits,
+        .map(|((genome, estimated), exact_hits)| {
+            let hits = estimated.map_or(exact_hits, |hit| vec![hit]);
+            let decision = decide(&hits, &db.nt.accessions, &db.data, options.min_af);
+            ::log::debug!(
+                "ani genome={} decision={decision:?} hits={}",
+                genome.id,
+                hits.iter()
+                    .map(|hit| format!(
+                        "{}:{:.2}/{:?}",
+                        db.nt.accessions[hit.reference as usize], hit.ani, hit.af
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let stage = match decision {
+                AniDecision::Species { hit } => Stage::Species(hit),
+                AniDecision::Unresolved => Stage::Unresolved,
             };
             QueryResult {
-                decision: decide(&hits, &db.nt.accessions, &db.data, options.min_af),
                 genome,
                 hits,
-                genes: None,
-                aai: None,
-                markers: None,
+                stage,
             }
         })
         .collect::<Vec<_>>();
-    for result in &results {
-        ::log::debug!(
-            "ani genome={} decision={:?} hits={}",
-            result.genome.id,
-            result.decision,
-            result
-                .hits
-                .iter()
-                .map(|hit| format!(
-                    "{}:{:.2}/{:?}",
-                    db.nt.accessions[hit.reference as usize], hit.ani, hit.af
-                ))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-    }
     let species = results
         .iter()
-        .filter(|result| matches!(result.decision, AniDecision::Species { .. }))
+        .filter(|result| matches!(result.stage, Stage::Species(_)))
         .count();
     log.info(format!(
         "{species} genome(s) have been classified using the ANI pre-screening step."
     ));
-    let mut results = results;
-    call_query_genes(&mut results, options, &out_dir, &log)?;
-    run_aai_tier(&mut results, &db, &warmup, options, &out_dir, &log)?;
-    run_marker_tier(&mut results, &db, &warmup, options, &out_dir, &log)?;
 
-    write_identify_files(&results, &out_dir, &options.prefix)?;
+    // The hits of unassigned genomes, kept by GTDB-Tk for its near-miss
+    // warnings; sketch estimates carry no AF and only ever assign species.
+    let mut unassigned = results
+        .iter()
+        .filter(|result| !matches!(result.stage, Stage::Species(_)))
+        .collect::<Vec<_>>();
+    unassigned.sort_by(|left, right| left.genome.id.cmp(&right.genome.id));
+    let path = out_dir.join("classify").join("ani_screen").join(format!(
+        "{}.ani_screen_unassigned_hits.tsv.gz",
+        options.prefix
+    ));
+    write_unassigned_hits(
+        &path,
+        unassigned.iter().flat_map(|result| {
+            result.hits.iter().filter_map(|hit| {
+                Some((
+                    result.genome.id.as_str(),
+                    db.nt.accessions[hit.reference as usize].as_str(),
+                    hit.ani,
+                    hit.af?,
+                ))
+            })
+        }),
+    )?;
+    log.info(format!(
+        "ANI hits of {} genome(s) not assigned by the ANI screen saved to: {}",
+        unassigned.len(),
+        path.display()
+    ));
+    record.output(ANI_SCREEN, "all", &path);
+    Ok(results)
+}
+
+/// Write the `{prefix}.{marker_set}.summary.tsv` files, linked from the
+/// output directory, and the ANI screen's summaries.
+fn write_summaries(
+    results: &[QueryResult],
+    db: &ClassifyDb,
+    options: &ClassifyOptions,
+    out_dir: &Path,
+    log: &ClassifyLog,
+    record: &mut RunRecord,
+) -> Result<(), Box<dyn Error>> {
     let mut rows: BTreeMap<&'static str, Vec<SummaryRow>> = BTreeMap::new();
     let mut ani_rows: BTreeMap<&'static str, Vec<AniScreenRow>> = BTreeMap::new();
-    for result in &results {
-        let (marker_set, row) = summary_row(result, &db, options);
+    for result in results {
+        let (marker_set, row) = summary_row(result, db, options);
         if row.warnings.iter().any(|warning| !warning.is_empty()) {
             log.warn(format!("{}: {}", row.user_genome, row.warnings.join(";")));
         }
-        if let AniDecision::Species { hit } = &result.decision {
+        if let Stage::Species(hit) = &result.stage {
             ani_rows.entry(marker_set).or_default().push(AniScreenRow {
                 user_genome: result.genome.id.clone(),
                 reference_genome: db.nt.accessions[hit.reference as usize].clone(),
@@ -346,32 +465,21 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
             .join("ani_screen")
             .join(format!("{}.{marker_set}.ani_summary.tsv", options.prefix));
         write_ani_summary(&path, rows)?;
+        record.output(ANI_SCREEN, marker_set, &path);
     }
     for (marker_set, rows) in &rows {
         let name = format!("{}.{marker_set}.summary.tsv", options.prefix);
-        write_summary(&out_dir.join("classify").join(&name), rows)?;
-        link_summary(&out_dir, &name)?;
+        let path = out_dir.join("classify").join(&name);
+        write_summary(&path, rows)?;
+        record.output(CLASSIFY, marker_set, &path);
+        link_summary(out_dir, &name)?;
         log.info(format!(
             "{} {marker_set} summary written to: {}",
             rows.len(),
             out_dir.join(&name).display()
         ));
     }
-    log.info(format!(
-        "Done. Classified {} genomes in {:.3}s",
-        queries.len(),
-        started.elapsed().as_secs_f64()
-    ));
     Ok(())
-}
-
-const NO_GENES: &str = "No genes were called by FragGeneScanRs";
-
-fn marker_genes_dir(out_dir: &Path) -> PathBuf {
-    out_dir
-        .join("identify")
-        .join("intermediate_results")
-        .join("marker_genes")
 }
 
 /// Call genes with FragGeneScanRs for genomes the ANI tier left unresolved.
@@ -384,7 +492,7 @@ fn call_query_genes(
     let pending = results
         .iter()
         .enumerate()
-        .filter(|(_, result)| result.decision == AniDecision::Unresolved)
+        .filter(|(_, result)| matches!(result.stage, Stage::Unresolved))
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if pending.is_empty() {
@@ -403,12 +511,19 @@ fn call_query_genes(
         .map(|&index| {
             let genome = results[index].genome;
             caller
-                .call(&genome.path, &genome.id, &marker_dir, job_threads)
+                .call(&genome.path, &genome.id, &marker_dir, job_threads, true)
                 .map_err(|error| format!("gene calling failed for {}: {error}", genome.id))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for (index, calls) in pending.into_iter().zip(genes) {
-        results[index].genes = Some(calls);
+    for (index, protein_faa) in pending.into_iter().zip(genes) {
+        results[index].stage = match protein_faa {
+            Some(protein_faa) => Stage::Called {
+                protein_faa,
+                aai: None,
+                markers: None,
+            },
+            None => Stage::NoGenes,
+        };
     }
     Ok(())
 }
@@ -444,15 +559,16 @@ fn run_aai_tier(
     options: &ClassifyOptions,
     out_dir: &Path,
     log: &ClassifyLog,
+    record: &mut RunRecord,
 ) -> Result<(), Box<dyn Error>> {
     let called = results
         .iter()
         .enumerate()
-        .filter(|(_, result)| result.decision == AniDecision::Unresolved)
         .filter_map(|(index, result)| {
             result
-                .called_genes()
-                .map(|calls| (index, calls.protein_faa.clone()))
+                .stage
+                .protein_faa()
+                .map(|faa| (index, faa.to_path_buf()))
         })
         .collect::<Vec<_>>();
     if called.is_empty() {
@@ -488,15 +604,9 @@ fn run_aai_tier(
         options.threads,
     )?;
 
-    let mut hits_by_index = called
-        .iter()
-        .map(|(index, _)| *index)
-        .zip(aai_hits)
-        .collect::<BTreeMap<_, _>>();
     let mut resolved = 0;
-    let indices = called.iter().map(|(index, _)| *index).collect::<Vec<_>>();
-    for index in indices {
-        let hits = hits_by_index.remove(&index).unwrap_or_default();
+    for ((index, _), hits) in called.iter().zip(aai_hits) {
+        let index = *index;
         let decision = aai::decide(
             &hits,
             &db.nt.accessions,
@@ -520,12 +630,16 @@ fn run_aai_tier(
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        results[index].aai = Some(AaiResult { hits, decision });
+        if let Stage::Called { aai, .. } = &mut results[index].stage {
+            *aai = Some(AaiResult { hits, decision });
+        }
     }
     log.info(format!(
         "{resolved} genome(s) have been classified using AAI."
     ));
-    write_aai_summary(results, db, out_dir, &options.prefix)
+    let path = write_aai_summary(results, db, out_dir, &options.prefix)?;
+    record.output(CLASSIFY, "all", &path);
+    Ok(())
 }
 
 /// GTDB-Tk's `identify` and `align` steps for genomes neither ANI nor AAI
@@ -539,13 +653,14 @@ fn run_marker_tier(
     options: &ClassifyOptions,
     out_dir: &Path,
     log: &ClassifyLog,
+    record: &mut RunRecord,
 ) -> Result<(), Box<dyn Error>> {
     let pending = results
         .iter()
         .enumerate()
-        .filter(|(_, result)| result.needs_markers())
+        .filter(|(_, result)| result.stage.needs_markers())
         .map(|(index, result)| {
-            let faa = result.called_genes().expect("genes").protein_faa.clone();
+            let faa = result.stage.protein_faa().expect("genes").to_path_buf();
             (index, result.genome.id.clone(), faa)
         })
         .collect::<Vec<_>>();
@@ -595,12 +710,12 @@ fn run_marker_tier(
     }
     let identify_dir = out_dir.join("identify");
     for (set, genomes) in &summaries {
-        write_markers_summary(
-            &identify_dir.join(format!("{}.{set}.markers_summary.tsv", options.prefix)),
-            genomes,
-        )?;
+        let path = identify_dir.join(format!("{}.{set}.markers_summary.tsv", options.prefix));
+        write_markers_summary(&path, genomes)?;
+        record.output(IDENTIFY, set, &path);
     }
     log.info("Done.");
+    record.mark(IDENTIFY);
 
     let align_dir = out_dir.join("align");
     let align_tmp = align_dir.join("intermediate_results");
@@ -629,7 +744,7 @@ fn run_marker_tier(
         }
         let domain_copies = if set == "bac120" { bac120 } else { ar53 };
         warnings.extend(multihit_warning(domain_copies, set));
-        domains.insert(id.clone(), (*index, set, domain_copies.clone(), warnings));
+        domains.insert(id.clone(), (*index, set, domain_copies, warnings));
     }
 
     log.info(format!(
@@ -643,7 +758,7 @@ fn run_marker_tier(
         let genomes = domains
             .iter()
             .filter(|(_, (_, domain, _, _))| *domain == set)
-            .map(|(id, (_, _, copies, _))| (id.clone(), copies.clone()))
+            .map(|(id, (_, _, copies, _))| (id.clone(), (*copies).clone()))
             .collect::<BTreeMap<_, _>>();
         if genomes.is_empty() {
             continue;
@@ -668,7 +783,7 @@ fn run_marker_tier(
         for (id, alignment) in user {
             let (masked, valid, msa_percent) = apply_mask(&alignment, mask.as_deref())?;
             if valid < options.min_perc_aa / 100.0 {
-                pruned.insert(id, masked);
+                pruned.insert(id, msa_percent);
             } else {
                 kept.insert(id, (masked, msa_percent));
             }
@@ -691,38 +806,39 @@ fn run_marker_tier(
                 options.min_perc_aa
             ));
         }
-        write_filtered(
-            &align_dir.join(format!("{}.{set}.filtered.tsv", options.prefix)),
-            &pruned,
-        )?;
+        let filtered_path = align_dir.join(format!("{}.{set}.filtered.tsv", options.prefix));
+        write_filtered(&filtered_path, &pruned)?;
+        record.output(ALIGN, set, &filtered_path);
 
-        let user_msa = kept
-            .iter()
-            .map(|(id, (masked, _))| (id.clone(), masked.clone()))
-            .collect::<BTreeMap<_, _>>();
-        if !user_msa.is_empty() {
+        if !kept.is_empty() {
             log.info(format!(
                 "Creating concatenated alignment for {} {domain_name} user genomes.",
-                thousands(user_msa.len())
+                thousands(kept.len())
             ));
-            write_msa_gz(
-                &align_dir.join(format!("{}.{set}.user_msa.fasta.gz", options.prefix)),
-                &user_msa,
-                &db.data,
-            )?;
+            let msa_path = align_dir.join(format!("{}.{set}.user_msa.fasta.gz", options.prefix));
+            write_msa_gz(&msa_path, kept.iter().map(|(id, (masked, _))| (id, masked)))?;
+            record.output(ALIGN, set, &msa_path);
         } else {
             log.info(format!(
                 "All {domain_name} user genomes have been filtered out."
             ));
         }
-        for (id, masked) in &pruned {
-            outcomes.insert(id.clone(), MarkerOutcome::Filtered(filtered_reason(masked)));
+        for (id, msa_percent) in pruned {
+            outcomes.insert(id, MarkerOutcome::Filtered(filtered_reason(msa_percent)));
         }
         for (id, (masked, msa_percent)) in kept {
             aligned.insert(id, (masked, msa_percent, set));
         }
     }
+    record.mark(ALIGN);
     let closest = search_marker_index(&aligned, db, warmup, options, out_dir, log)?;
+    if !aligned.is_empty() {
+        record.output(
+            CLASSIFY,
+            "all",
+            &marker_summary_path(out_dir, &options.prefix),
+        );
+    }
     for (id, (_, msa_percent, _)) in aligned {
         outcomes.insert(
             id.clone(),
@@ -742,17 +858,19 @@ fn run_marker_tier(
             align_tmp.join(format!("{}.align.failed.tsv", options.prefix)),
         )?);
         for id in no_markers {
-            writeln!(output, "{id}\tNo bacterial or archaeal marker")?;
+            writeln!(output, "{id}\t{NO_MARKERS}")?;
         }
         output.flush()?;
     }
     for (id, (index, set, _, warnings)) in domains {
         let outcome = outcomes.remove(&id).unwrap_or(MarkerOutcome::NoMarkers);
-        results[index].markers = Some(MarkerResult {
-            marker_set: set,
-            outcome,
-            warnings,
-        });
+        if let Stage::Called { markers, .. } = &mut results[index].stage {
+            *markers = Some(MarkerResult {
+                marker_set: set,
+                outcome,
+                warnings,
+            });
+        }
     }
     Ok(())
 }
@@ -776,8 +894,8 @@ fn search_marker_index(
         "Searching the marker index for {} genome(s).",
         thousands(aligned.len())
     ));
-    let dir = out_dir.join("classify").join("markers");
-    let sequence_dir = dir.join("intermediate_results");
+    let summary_path = marker_summary_path(out_dir, &options.prefix);
+    let sequence_dir = summary_path.with_file_name("intermediate_results");
     fs::create_dir_all(&sequence_dir)?;
     let mut paths = Vec::with_capacity(aligned.len());
     for (id, (masked, _, _)) in aligned {
@@ -787,9 +905,7 @@ fn search_marker_index(
     }
     let vectors = sketch_from_params(&paths, &db.markers.params);
     let neighbors = search_index(&db.markers, warmup, &vectors, options, log)?;
-    let mut output = BufWriter::new(File::create(
-        dir.join(format!("{}.marker_summary.tsv", options.prefix)),
-    )?);
+    let mut output = BufWriter::new(File::create(&summary_path)?);
     writeln!(
         output,
         "user_genome\treference_genome\testimated_marker_identity\treference_taxonomy"
@@ -823,6 +939,13 @@ fn search_marker_index(
     Ok(closest)
 }
 
+fn marker_summary_path(out_dir: &Path, prefix: &str) -> PathBuf {
+    out_dir
+        .join("classify")
+        .join("markers")
+        .join(format!("{prefix}.marker_summary.tsv"))
+}
+
 fn domain_adjective(marker_set: &str) -> &'static str {
     if marker_set == "ar53" {
         "archaeal"
@@ -850,10 +973,11 @@ fn write_aai_summary(
     db: &ClassifyDb,
     out_dir: &Path,
     prefix: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<PathBuf, Box<dyn Error>> {
     let dir = out_dir.join("classify").join("aai");
     fs::create_dir_all(&dir)?;
-    let mut output = BufWriter::new(File::create(dir.join(format!("{prefix}.aai_summary.tsv")))?);
+    let path = dir.join(format!("{prefix}.aai_summary.tsv"));
+    let mut output = BufWriter::new(File::create(&path)?);
     writeln!(
         output,
         "user_genome\treference_genome\taai\taai_sd\treciprocal_best_hits\tsmaller_proteome\treference_taxonomy"
@@ -861,7 +985,9 @@ fn write_aai_summary(
     let mut sorted = results.iter().collect::<Vec<_>>();
     sorted.sort_by(|left, right| left.genome.id.cmp(&right.genome.id));
     for result in sorted {
-        let Some(aai) = &result.aai else { continue };
+        let Stage::Called { aai: Some(aai), .. } = &result.stage else {
+            continue;
+        };
         for hit in &aai.hits {
             let accession = &db.nt.accessions[hit.reference as usize];
             writeln!(
@@ -875,12 +1001,12 @@ fn write_aai_summary(
                 hit.min_proteins,
                 db.data
                     .taxonomy_of(accession)
-                    .map_or_else(|| "N/A".to_owned(), |taxonomy| taxonomy.join(";"))
+                    .map_or_else(|| NONE_VALUE.to_owned(), |taxonomy| taxonomy.join(";"))
             )?;
         }
     }
     output.flush()?;
-    Ok(())
+    Ok(path)
 }
 
 /// GTDB-Tk's `identify/{prefix}.translation_table_summary.tsv` and
@@ -889,42 +1015,41 @@ fn write_identify_files(
     results: &[QueryResult],
     out_dir: &Path,
     prefix: &str,
+    record: &mut RunRecord,
 ) -> Result<(), Box<dyn Error>> {
-    let called = results
-        .iter()
-        .filter_map(|result| result.genes.as_ref().map(|genes| (result.genome, genes)))
-        .collect::<Vec<_>>();
-    if called.is_empty() {
+    let mut tables = BTreeMap::new();
+    let mut failed = BTreeMap::new();
+    for result in results {
+        let id = result.genome.id.as_str();
+        match result.stage {
+            Stage::Called { .. } => {
+                tables.insert(id, TRANSLATION_TABLE);
+            }
+            Stage::NoGenes => {
+                failed.insert(id, NO_GENES);
+            }
+            Stage::Species(_) | Stage::Unresolved => {}
+        }
+    }
+    if tables.is_empty() && failed.is_empty() {
         return Ok(());
     }
     let dir = out_dir.join("identify");
     fs::create_dir_all(&dir)?;
-    let mut tables = BTreeMap::new();
-    let mut failed = BTreeMap::new();
-    for (genome, genes) in called {
-        match genes {
-            Some(_) => {
-                tables.insert(genome.id.as_str(), TRANSLATION_TABLE);
-            }
-            None => {
-                failed.insert(genome.id.as_str(), NO_GENES);
-            }
-        }
-    }
-    let mut output = BufWriter::new(File::create(
-        dir.join(format!("{prefix}.translation_table_summary.tsv")),
-    )?);
+    let failed_path = dir.join(format!("{prefix}.failed_genomes.tsv"));
+    let tables_path = dir.join(format!("{prefix}.translation_table_summary.tsv"));
+    let mut output = BufWriter::new(File::create(&tables_path)?);
     for (id, table) in tables {
         writeln!(output, "{id}\t{table}")?;
     }
     output.flush()?;
-    let mut output = BufWriter::new(File::create(
-        dir.join(format!("{prefix}.failed_genomes.tsv")),
-    )?);
+    let mut output = BufWriter::new(File::create(&failed_path)?);
     for (id, reason) in failed {
         writeln!(output, "{id}\t{reason}")?;
     }
     output.flush()?;
+    record.output(IDENTIFY, "all", &failed_path);
+    record.output(IDENTIFY, "all", &tables_path);
     Ok(())
 }
 
@@ -976,11 +1101,11 @@ fn summary_row(
         .as_deref()
         .map_or("bac120", marker_set_for_taxonomy);
 
-    match &result.decision {
-        AniDecision::Species { hit } => {
+    match &result.stage {
+        Stage::Species(hit) => {
             let accession = &db.nt.accessions[hit.reference as usize];
             let taxonomy = taxonomy_of(hit).unwrap_or_default().join(";");
-            row.classification = Some(standardise_taxonomy(&taxonomy, None));
+            row.classification = Some(standardise_taxonomy(&taxonomy));
             row.closest_genome_reference = Some(accession.clone());
             row.closest_genome_reference_radius = db.data.radius_of(accession);
             row.closest_genome_taxonomy = Some(taxonomy.clone());
@@ -995,18 +1120,21 @@ fn summary_row(
                 .map_or(marker_set, marker_set_for_taxonomy);
             (marker_set, row)
         }
-        AniDecision::Unresolved => {
+        stage => {
             row.other_related_references = format_related_references(&related, &[], &db.data);
             row.warnings = radius_warnings(&result.hits, db, options.min_af);
-            match (&result.genes, &result.markers, &result.aai) {
+            match stage {
                 // GTDB-Tk reports genomes without genes in the bac120 summary.
-                (Some(None), _, _) => {
+                Stage::NoGenes => {
                     row.classification = Some("Unclassified".into());
                     row.warnings.push(NO_GENES.into());
                     ("bac120", row)
                 }
-                (Some(Some(_)), Some(markers), _) => marker_summary_row(row, markers, db),
-                (Some(Some(_)), None, Some(aai)) => aai_summary_row(row, aai, marker_set, db),
+                Stage::Called {
+                    markers: Some(markers),
+                    ..
+                } => marker_summary_row(row, markers, db),
+                Stage::Called { aai: Some(aai), .. } => aai_summary_row(row, aai, marker_set, db),
                 _ => {
                     row.classification = Some(unclassified(marker_set, best_taxonomy.is_some()));
                     (marker_set, row)
@@ -1045,7 +1173,7 @@ fn aai_summary_row(
             return (marker_set, row);
         }
     };
-    row.classification = Some(standardise_taxonomy(&call.taxonomy, None));
+    row.classification = Some(standardise_taxonomy(&call.taxonomy));
     row.classification_method = Some("taxonomic classification defined by AAI".into());
     let lead = call.lead.map_or_else(
         || format!("no other {rank} among the AAI hits"),
@@ -1069,7 +1197,7 @@ fn marker_summary_row(
     match &markers.outcome {
         MarkerOutcome::NoMarkers => {
             row.classification = Some("Unclassified".into());
-            row.warnings.push("No bacterial or archaeal marker".into());
+            row.warnings.push(NO_MARKERS.into());
             ("bac120", row)
         }
         MarkerOutcome::Filtered(reason) => {
@@ -1092,7 +1220,7 @@ fn marker_summary_row(
                 row.classification = Some(unclassified(markers.marker_set, true));
                 return (markers.marker_set, row);
             };
-            row.classification = Some(standardise_taxonomy(&taxonomy[..4].join(";"), None));
+            row.classification = Some(standardise_taxonomy(&taxonomy[..4].join(";")));
             row.closest_placement_reference = Some(hit.accession.clone());
             row.closest_placement_radius = db.data.radius_of(&hit.accession);
             row.closest_placement_taxonomy = Some(taxonomy.join(";"));
@@ -1120,7 +1248,7 @@ fn radius_warnings(hits: &[AniHit], db: &ClassifyDb, min_af: f64) -> Vec<String>
             warnings.push(format!(
                 "Genome not assigned to closest species as it falls outside its pre-defined ANI radius (closest {accession} ANI={}%, AF={}, radius={radius}%)",
                 py_round(best.ani, 2),
-                best.af.map_or_else(|| "N/A".to_owned(), |af| py_round(af, 3))
+                best.af.map_or_else(|| NONE_VALUE.to_owned(), |af| py_round(af, 3))
             ));
         }
     } else if let Some(top) = hits.first() {
@@ -1129,7 +1257,7 @@ fn radius_warnings(hits: &[AniHit], db: &ClassifyDb, min_af: f64) -> Vec<String>
                 "Closest reference {} has ANI={}% but alignment fraction AF={} below the {} threshold; no species assignment",
                 db.nt.accessions[top.reference as usize],
                 py_round(top.ani, 2),
-                top.af.map_or_else(|| "N/A".to_owned(), |af| py_round(af, 3)),
+                top.af.map_or_else(|| NONE_VALUE.to_owned(), |af| py_round(af, 3)),
                 summary::py_float(min_af)
             ));
         }

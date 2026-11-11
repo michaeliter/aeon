@@ -17,8 +17,8 @@ use needletail::parse_fastx_file;
 use crate::classify::external::find_tool;
 use crate::classify::genes::GeneCaller;
 use crate::classify::markers::{
-    MARKER_SETS, MarkerTools, PfamInfo, apply_mask, extract_masked_markers, marker_sequence,
-    read_mask, reference_msa_path, write_marker_data,
+    MARKER_SETS, MarkerTools, PfamInfo, apply_mask, extract_masked_markers, read_mask,
+    reference_msa_path, write_marker_data, write_marker_fasta,
 };
 use crate::classify::refdata::{
     DEFAULT_RADIUS, GtdbtkData, Radius, accession_from_path, canonical_gid,
@@ -315,14 +315,8 @@ fn write_reference_markers(
     let marker_dir = db.join(MARKER_DIR);
     fs::create_dir_all(&marker_dir)?;
     let file_of = |accession: &str| marker_dir.join(format!("{accession}.faa"));
-    let write = |accession: &str, masked: &str| -> std::io::Result<bool> {
-        let sequence = marker_sequence(masked);
-        if sequence.is_empty() {
-            return Ok(false);
-        }
-        fs::write(file_of(accession), format!(">{accession}\n{sequence}\n"))?;
-        Ok(true)
-    };
+    let write =
+        |accession: &str, masked: &str| write_marker_fasta(&file_of(accession), accession, masked);
     let mut with_markers = HashSet::new();
     let mut from_package = 0;
     for set in MARKER_SETS {
@@ -464,19 +458,15 @@ fn call_reference_genes(
         .par_iter()
         .zip(accessions)
         .map(|(genome, accession)| -> Result<String, String> {
-            let calls = caller
-                .call(genome, accession, &protein_dir, threads)
+            let protein_faa = caller
+                .call(genome, accession, &protein_dir, threads, false)
                 .map_err(|error| format!("gene calling failed for {genome}: {error}"))?
                 .ok_or_else(|| format!("no genes were called for reference genome {genome}"))?;
-            let genome_dir = protein_dir.join(accession);
-            for suffix in ["_protein.fna", "_protein.gff"] {
-                let _ = fs::remove_file(genome_dir.join(format!("{accession}{suffix}")));
-            }
             let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
             if finished % 100 == 0 {
                 eprintln!("Called genes for {finished}/{} references", genomes.len());
             }
-            Ok(calls.protein_faa.to_string_lossy().into_owned())
+            Ok(protein_faa.to_string_lossy().into_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
     eprintln!(
