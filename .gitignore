@@ -1,3 +1,4 @@
 /target/
 *.gswap-work-*
 *.gswap-next-*
+.DS_Store
