@@ -49,7 +49,7 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("todisk")
                 .about("Build a new static diskANN index using the Vamana graph construction algorithm")
-                .long_about("Sketch every sequence file in the reference list, construct a Vamana graph, and write the static mmap-searchable index plus its genome-name mapping and parameter metadata.")
+                .long_about("Read and kmerutils-compress every sequence file in the reference list, retain only the first genome for each exact SHA-256 genome-content hash, sketch the retained genomes, construct a Vamana graph, and write the static mmap-searchable index plus genome-name, content-hash, and parameter metadata.")
                 .arg(prefix_arg())
                 .arg(
                     Arg::new("reference_list")
@@ -140,7 +140,7 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("insert")
                 .about("Insert sketch vectors into an existing diskANN index/Vamana graph after sketching new genomes")
-                .long_about("Sketch new genome files with the original database parameters, connect them to a temporary dynamic Vamana graph, and commit a compact static index.")
+                .long_about("Read and kmerutils-compress new genome files with the original database parameters, discard exact genome-content duplicates already represented by a surviving database record or an earlier input record, sketch and connect only unique genomes to a temporary dynamic Vamana graph, and commit a compact static index.")
                 .arg(prefix_arg())
                 .arg(
                     Arg::new("genome_list")
