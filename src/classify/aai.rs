@@ -1,9 +1,10 @@
-//! Tier 2: amino-acid identity. Amino-acid sketch search proposes candidate
-//! reference proteomes, DIAMOND reciprocal best hits give AAI, and the
-//! closest reference's genus or family is assigned when it leads every other
-//! genus or family by a margin.
+//! Tier 2: amino-acid identity. AAI is estimated from the amino-acid sketch
+//! search over the closest reference proteomes, or with `--diamond-aai` from
+//! DIAMOND reciprocal best hits against them, and the closest reference's
+//! genus or family is assigned when it leads every other genus or family by a
+//! margin.
 //!
-//! AAI comes from DIAMOND `blastp` in both directions with DIAMOND's default
+//! DIAMOND AAI comes from `blastp` in both directions with DIAMOND's default
 //! e-value: each protein's first hit of at least 20% identity is its best
 //! hit, and AAI is the unweighted mean identity of reciprocal best hits,
 //! reported only when there are at least 50 of them.
@@ -398,16 +399,28 @@ pub(crate) struct AaiCall {
     pub(crate) taxonomy: String,
     /// AAI to the closest reference, which gives the taxon.
     pub(crate) aai: f64,
-    /// Points by which it beats the closest reference of another taxon at
-    /// the same rank; `None` when every hit shares the taxon.
-    pub(crate) lead: Option<f64>,
+    pub(crate) lead: Lead,
+}
+
+/// How far the closest reference beats every reference of another taxon at
+/// the same rank.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Lead {
+    /// Points above the closest reference of another taxon among the hits.
+    Next(f64),
+    /// Every hit shares the taxon, and references beyond the hits are no
+    /// closer than the last hit: at least this many points.
+    AtLeast(f64),
+    /// Every hit shares the taxon and no other reference was compared.
+    Unopposed,
 }
 
 /// Assign the closest reference's genus (or else family) when its AAI
 /// reaches the rank's threshold and beats every other genus (family) among
 /// the hits by at least `margin` points. Unlike a vote, the margin does not
 /// depend on how many references a taxon has. `hits` are sorted by
-/// descending AAI.
+/// descending AAI. `beyond` bounds the AAI of every reference not among the
+/// hits, when known, so a taxon that fills all the hits must also lead it.
 pub(crate) fn decide(
     hits: &[AaiHit],
     accessions: &[String],
@@ -415,6 +428,7 @@ pub(crate) fn decide(
     genus_aai: f64,
     family_aai: f64,
     margin: f64,
+    beyond: Option<f64>,
 ) -> AaiDecision {
     let ranked = hits
         .iter()
@@ -433,11 +447,15 @@ pub(crate) fn decide(
         if taxon[ranks - 1].len() <= 3 {
             return None;
         }
-        let lead = rest
-            .iter()
-            .find(|(_, other)| other[..ranks] != *taxon)
-            .map(|(other, _)| aai - other);
-        lead.is_none_or(|lead| lead >= margin).then(|| AaiCall {
+        let lead = match rest.iter().find(|(_, other)| other[..ranks] != *taxon) {
+            Some((other, _)) => Lead::Next(aai - other),
+            None => beyond.map_or(Lead::Unopposed, |beyond| Lead::AtLeast(aai - beyond)),
+        };
+        let clear = match lead {
+            Lead::Next(points) | Lead::AtLeast(points) => points >= margin,
+            Lead::Unopposed => true,
+        };
+        clear.then(|| AaiCall {
             taxonomy: taxon.join(";"),
             aai: *aai,
             lead,
@@ -449,31 +467,19 @@ pub(crate) fn decide(
     call(family_aai, 5).map_or(AaiDecision::Unresolved, AaiDecision::Family)
 }
 
-/// `decide`'s genus rule applied to the proteome sketch estimates of the
-/// candidates, so a genome with a clearly closest genus skips DIAMOND.
-/// Family calls always need DIAMOND. `candidates` are sorted by ascending
-/// sketch distance.
-pub(crate) fn decide_from_sketch(
-    candidates: &[(u32, f32)],
-    kmer_size: usize,
-    accessions: &[String],
-    data: &GtdbtkData,
-    genus_aai: f64,
-    margin: f64,
-) -> Option<(Vec<AaiHit>, AaiDecision)> {
-    let hits = candidates
+/// Proteome sketch candidates, sorted by ascending sketch distance, as AAI
+/// hits: Mash's k-mer survival model at the proteome sketch's k.
+pub(crate) fn sketch_hits(candidates: &[(u32, f32)], kmer_size: usize) -> Vec<AaiHit> {
+    candidates
         .iter()
         .map(|&(reference, distance)| AaiHit {
             reference,
-            // Mash's k-mer survival model at the proteome sketch's k.
             aai: sketch_ani(distance, kmer_size),
             sd: f64::NAN,
             reciprocal_hits: 0,
             min_proteins: 0,
         })
-        .collect::<Vec<_>>();
-    let decision = decide(&hits, accessions, data, genus_aai, f64::INFINITY, margin);
-    matches!(decision, AaiDecision::Genus(_)).then_some((hits, decision))
+        .collect()
 }
 
 #[cfg(test)]
@@ -529,22 +535,11 @@ mod tests {
     }
 
     #[test]
-    fn sketch_assigns_only_a_clearly_closest_genus() {
-        let (accessions, data) = genera();
-        let decide = |candidates: &[(u32, f32)]| {
-            decide_from_sketch(candidates, 7, &accessions, &data, 80.0, 5.0)
-                .map(|(_, decision)| decision)
-        };
-        // Jaccard 0.5 at k=7 estimates 94.2%; 0.05 estimates 66.4%.
-        let Some(AaiDecision::Genus(call)) = decide(&[(0, 0.5), (1, 0.95)]) else {
-            panic!("expected a genus call");
-        };
-        assert_eq!(call.taxonomy, "d__Bacteria;p__P;c__C;o__O;f__F;g__A");
-        assert!((call.aai - 94.2).abs() < 0.1);
-        // Another genus within the margin, or a lone family-level estimate,
-        // leaves the call to DIAMOND.
-        assert_eq!(decide(&[(0, 0.5), (1, 0.52)]), None);
-        assert_eq!(decide(&[(0, 0.9)]), None);
+    fn sketch_hits_convert_distance_with_mash_formula() {
+        // Jaccard 0.5 at k=7 estimates 94.2%.
+        let hits = sketch_hits(&[(3, 0.5)], 7);
+        assert_eq!(hits[0].reference, 3);
+        assert!((hits[0].aai - 94.2).abs() < 0.1);
     }
 
     fn genera() -> (Vec<String>, GtdbtkData) {
@@ -577,7 +572,7 @@ mod tests {
             reciprocal_hits: 500,
             min_proteins: 2000,
         };
-        let decide = |hits: &[AaiHit]| decide(hits, &accessions, &data, 65.0, 45.0, 5.0);
+        let decide = |hits: &[AaiHit]| decide(hits, &accessions, &data, 65.0, 45.0, 5.0, None);
         let call = |taxonomy: &str, aai, lead| AaiCall {
             taxonomy: format!("d__Bacteria;p__P;c__C;o__O;{taxonomy}"),
             aai,
@@ -586,12 +581,12 @@ mod tests {
         // A genus with one reference still wins on its lead.
         assert_eq!(
             decide(&[aai(0, 80.0), aai(1, 70.0), aai(1, 69.0), aai(2, 60.0)]),
-            AaiDecision::Genus(call("f__F;g__A", 80.0, Some(10.0)))
+            AaiDecision::Genus(call("f__F;g__A", 80.0, Lead::Next(10.0)))
         );
         // Too close to genus B for a genus, but well ahead of family G.
         assert_eq!(
             decide(&[aai(0, 72.0), aai(1, 70.0), aai(2, 60.0)]),
-            AaiDecision::Family(call("f__F", 72.0, Some(12.0)))
+            AaiDecision::Family(call("f__F", 72.0, Lead::Next(12.0)))
         );
         assert_eq!(
             decide(&[aai(0, 72.0), aai(2, 70.0)]),
@@ -600,8 +595,21 @@ mod tests {
         // An unopposed taxon needs only the threshold.
         assert_eq!(
             decide(&[aai(0, 60.0)]),
-            AaiDecision::Family(call("f__F", 60.0, None))
+            AaiDecision::Family(call("f__F", 60.0, Lead::Unopposed))
         );
         assert_eq!(decide(&[aai(0, 40.0)]), AaiDecision::Unresolved);
+        // With the references beyond the hits bounded, a taxon that fills the
+        // hits must lead the bound too.
+        let bounded = |hits: &[AaiHit], beyond| {
+            super::decide(hits, &accessions, &data, 65.0, 45.0, 5.0, Some(beyond))
+        };
+        assert_eq!(
+            bounded(&[aai(0, 80.0), aai(0, 78.0)], 74.0),
+            AaiDecision::Genus(call("f__F;g__A", 80.0, Lead::AtLeast(6.0)))
+        );
+        assert_eq!(
+            bounded(&[aai(0, 80.0), aai(0, 78.0)], 77.0),
+            AaiDecision::Unresolved
+        );
     }
 }

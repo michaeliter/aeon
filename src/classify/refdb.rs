@@ -26,7 +26,7 @@ use crate::classify::refdata::{
 };
 use crate::database::build_database;
 use crate::metadata::{PrefixParams, genomes_path, load_params};
-use crate::utils::read_list_file;
+use crate::utils::{read_list_file, write_genome_list};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -107,7 +107,7 @@ pub(crate) struct ClassifyDb {
     reference_dir: PathBuf,
     /// Reference genomes.
     pub(crate) nt: Index,
-    /// Reference proteomes, aligned with `nt` vector IDs.
+    /// Reference proteomes, named by their genomes' accessions.
     pub(crate) aa: Index,
     /// Concatenated marker genes of the references that have them.
     pub(crate) markers: Index,
@@ -130,15 +130,20 @@ impl ClassifyDb {
                 dir.display()
             )
         })?;
-        let (nt, aa) = (Index::open(&dir, NT_PREFIX)?, Index::open(&dir, AA_PREFIX)?);
-        // Proteome hits are named through the nucleotide index, so the two
-        // must list the same references in the same order. Index builds drop
-        // exact-content duplicates, which could leave them out of step.
-        if nt.accessions != aa.accessions {
-            return Err(
-                "amino-acid and nucleotide indexes list different references; rebuild the database"
-                    .into(),
-            );
+        let nt = Index::open(&dir, NT_PREFIX)?;
+        let mut aa = Index::open(&dir, AA_PREFIX)?;
+        // Proteome file names may write an accession differently from the
+        // genome's (`RS_` prefix, GenBank or RefSeq form), so name each
+        // proteome by its genome's accession.
+        let genome_accessions = nt
+            .accessions
+            .iter()
+            .map(|accession| (canonical_gid(accession), accession))
+            .collect::<HashMap<_, _>>();
+        for accession in &mut aa.accessions {
+            if let Some(genome) = genome_accessions.get(&canonical_gid(accession)) {
+                accession.clone_from(genome);
+            }
         }
         let reference_dir = dir.join(REFERENCE_DIR);
         let file = |name: &str| reference_dir.join(name).to_string_lossy().into_owned();
@@ -148,10 +153,10 @@ impl ClassifyDb {
                 &[file(TAXONOMY_FILE)],
                 Some(&file(RADII_FILE)),
             )?,
-            markers: Index::open(&dir, MARKER_PREFIX)?,
-            reference_dir,
             nt,
             aa,
+            markers: Index::open(&dir, MARKER_PREFIX)?,
+            reference_dir,
             manifest,
         })
     }
@@ -237,7 +242,7 @@ pub(crate) fn build_classify_db(
     // The nucleotide index needs only the genomes, so it builds while the
     // proteomes, protein index and marker index are prepared.
     let (nt, rest) = rayon::join(
-        || build_index(&db.join(NT_PREFIX), &genomes, params.nt).map_err(|error| error.to_string()),
+        || build_index(&db.join(NT_PREFIX), &genomes, params.nt),
         || -> Result<_, String> {
             let proteomes = match proteins {
                 ProteinSource::List(list) => read_list_file(&list)
@@ -250,10 +255,7 @@ pub(crate) fn build_classify_db(
             }
             .map_err(|error| error.to_string())?;
             let (aa, markers) = rayon::join(
-                || {
-                    build_index(&db.join(AA_PREFIX), &proteomes, params.aa)
-                        .map_err(|error| error.to_string())
-                },
+                || build_index(&db.join(AA_PREFIX), &proteomes, params.aa),
                 || {
                     let markers = write_reference_markers(
                         &reference_dir,
@@ -266,8 +268,6 @@ pub(crate) fn build_classify_db(
                     )
                     .map_err(|error| error.to_string())?;
                     build_index(&db.join(MARKER_PREFIX), &markers, params.markers)
-                        .map_err(|error| error.to_string())?;
-                    Ok::<_, String>(markers)
                 },
             );
             aa?;
@@ -275,13 +275,18 @@ pub(crate) fn build_classify_db(
         },
     );
     nt?;
-    let markers = rest?;
+    rest?;
+    // Index builds drop exact-content duplicates, so count what was indexed.
+    let (references, marker_references) = (
+        Index::open(db, NT_PREFIX)?.len(),
+        Index::open(db, MARKER_PREFIX)?.len(),
+    );
     let manifest = Manifest {
         aeon_version: env!("CARGO_PKG_VERSION").into(),
         gtdb_release: data.version.clone(),
         gtdbtk_data: package.map(|(root, _)| root.to_string_lossy().into_owned()),
-        references: genomes.len(),
-        marker_references: markers.len(),
+        references,
+        marker_references,
     };
     fs::write(
         db.join(MANIFEST_FILE),
@@ -290,8 +295,8 @@ pub(crate) fn build_classify_db(
     eprintln!(
         "Built classify database: dir={}, references={}, with markers={}, elapsed={:.3}s",
         db_dir,
-        genomes.len(),
-        markers.len(),
+        references,
+        marker_references,
         started.elapsed().as_secs_f64()
     );
     Ok(())
@@ -413,29 +418,20 @@ fn write_reference_markers(
         .collect())
 }
 
-/// Paths stored in the database must not depend on the directory classify
-/// runs from.
 /// Build the aeon index at `prefix` over `paths`. `build_database` reads its
 /// inputs from a list file, so the paths are written to one beside the index
 /// for the build.
-fn build_index(
-    prefix: &Path,
-    paths: &[String],
-    params: PrefixParams,
-) -> Result<(), Box<dyn Error>> {
+fn build_index(prefix: &Path, paths: &[String], params: PrefixParams) -> Result<(), String> {
     let prefix = prefix.to_string_lossy();
     let list = format!("{prefix}.inputs.txt");
-    let mut writer = BufWriter::new(File::create(&list)?);
-    for path in paths {
-        writeln!(writer, "{path}")?;
-    }
-    writer.flush()?;
-    drop(writer);
-    let built = build_database(&prefix, &list, params);
-    fs::remove_file(&list)?;
+    write_genome_list(&list, paths).map_err(|error| error.to_string())?;
+    let built = build_database(&prefix, &list, params).map_err(|error| error.to_string());
+    fs::remove_file(&list).map_err(|error| error.to_string())?;
     built
 }
 
+/// Paths stored in the database must not depend on the directory classify
+/// runs from.
 fn absolute_paths(paths: Vec<String>) -> Result<Vec<String>, Box<dyn Error>> {
     paths
         .into_iter()

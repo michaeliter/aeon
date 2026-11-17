@@ -424,7 +424,7 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("classify")
                 .about("Classify genomes against an aeon classify-db reference database, with GTDB-Tk-compatible output")
-                .long_about("Classify genomes in a cascade over the three indexes of an aeon classify-db. (1) Genome sketch search proposes the closest reference genomes. When only one has a sketch ANI of at least --min-sketch-ani and that estimate reaches its species radius, the genome gets that species; when several do, or the estimate falls short, TurboANI computes their exact ANI and AF and GTDB-Tk's ANI screen rule decides (closest reference with AF >= --min_af, within its species radius, 95% by default). (2) Remaining genomes have genes called with FragGeneScanRs (complete-genome model); proteome sketch search proposes candidate reference proteomes and DIAMOND reciprocal best hits give AAI. The closest reference's genus (>= --genus-aai) or else family (>= --family-aai) is assigned when its AAI beats every reference of another genus (family) by at least --aai-margin points. (3) Genomes still unresolved have their bac120/ar53 marker genes extracted with hmmsearch and hmmalign as in GTDB-Tk; the masked concatenated markers are searched against the marker index, and the closest reference's lineage down to order is assigned. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, identify/, align/, classify/, and {prefix}.log.")
+                .long_about("Classify genomes in a cascade over the three indexes of an aeon classify-db. (1) Genome sketch search proposes the closest reference genomes. When only one has a sketch ANI of at least --min-sketch-ani and that estimate reaches its species radius, the genome gets that species; when several do, or the estimate falls short, TurboANI computes their exact ANI and AF and GTDB-Tk's ANI screen rule decides (closest reference with AF >= --min_af, within its species radius, 95% by default). (2) Remaining genomes have genes called with FragGeneScanRs (complete-genome model); proteome sketch search finds the --aai-candidates closest reference proteomes and estimates AAI from the sketch (with --diamond-aai, DIAMOND reciprocal best hits against the --candidates closest give AAI instead). The closest reference's genus (>= --genus-aai) or else family (>= --family-aai) is assigned when its AAI beats every reference of another genus (family) by at least --aai-margin points; when the candidates all share its taxon, it must lead the last candidate by the margin. (3) Genomes still unresolved have their bac120/ar53 marker genes extracted with hmmsearch and hmmalign as in GTDB-Tk; the masked concatenated markers are searched against the marker index, and the closest reference's lineage down to order is assigned. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, identify/, align/, classify/, and {prefix}.log.")
                 .arg(
                     Arg::new("db")
                         .long("db")
@@ -520,11 +520,18 @@ fn build_cli() -> Command {
                         .help("AAI points by which the closest reference must beat every other genus (or family) to assign it"),
                 )
                 .arg(
-                    Arg::new("sketch_genus_aai")
-                        .long("sketch-genus-aai")
-                        .value_name("PERCENT")
-                        .value_parser(clap::value_parser!(f64))
-                        .help("Assign the genus without DIAMOND when the closest reference's proteome sketch estimate reaches PERCENT (80 tested) and beats every other genus by --aai-margin [default: off]"),
+                    Arg::new("aai_candidates")
+                        .long("aai-candidates")
+                        .default_value("50")
+                        .value_name("N")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Proteome sketch candidates per genome compared by the AAI call (without --diamond-aai)"),
+                )
+                .arg(
+                    Arg::new("diamond_aai")
+                        .long("diamond-aai")
+                        .action(ArgAction::SetTrue)
+                        .help("Compute AAI with DIAMOND reciprocal best hits against the --candidates closest proteomes instead of using proteome sketch estimates: more precise AAI, at more CPU time"),
                 )
                 .args(fgs_args())
                 .arg(
@@ -532,7 +539,7 @@ fn build_cli() -> Command {
                         .long("diamond")
                         .default_value("diamond")
                         .value_name("PATH")
-                        .help("DIAMOND executable used for AAI"),
+                        .help("DIAMOND executable used by --diamond-aai"),
                 )
                 .arg(
                     Arg::new("min_perc_aa")
@@ -550,7 +557,7 @@ fn build_cli() -> Command {
                         .default_value("10")
                         .value_name("N")
                         .value_parser(clap::value_parser!(usize))
-                        .help("Sketch-search candidates per genome in each index"),
+                        .help("Sketch-search candidates per genome in the genome and marker indexes, and in the proteome index with --diamond-aai"),
                 )
                 .arg(
                     Arg::new("beam_width")
@@ -667,7 +674,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             genus_aai: *args.get_one("genus_aai").unwrap(),
             family_aai: *args.get_one("family_aai").unwrap(),
             aai_margin: *args.get_one("aai_margin").unwrap(),
-            sketch_genus_aai: args.get_one("sketch_genus_aai").copied(),
+            aai_candidates: *args.get_one("aai_candidates").unwrap(),
+            diamond_aai: args.get_flag("diamond_aai"),
             fgs: args.get_one::<String>("fgs").unwrap().clone(),
             fgs_train_dir: args.get_one::<String>("fgs_train_dir").cloned(),
             diamond: args.get_one::<String>("diamond").unwrap().clone(),

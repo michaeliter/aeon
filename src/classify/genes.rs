@@ -5,7 +5,7 @@ use needletail::parse_fastx_file;
 use std::env;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -94,12 +94,12 @@ impl GeneCaller {
         if stretches.is_empty() {
             return Ok(None);
         }
-        restore_coordinates(&protein_faa, &stretches)?;
+        let genes = restore_coordinates(&protein_faa, &stretches)?;
         if gene_files {
             restore_coordinates(&output("_protein.fna"), &stretches)?;
             restore_coordinates(&output("_protein.gff"), &stretches)?;
         }
-        Ok((count_records(&protein_faa)? > 0).then_some(protein_faa))
+        Ok((genes > 0).then_some(protein_faa))
     }
 }
 
@@ -123,9 +123,7 @@ fn write_stretches(input: &str, output: &mut dyn Write) -> Result<Vec<Stretch>, 
         let contig = id.split(u8::is_ascii_whitespace).next().unwrap_or(id);
         let contig = String::from_utf8_lossy(contig).into_owned();
         let sequence = record.seq();
-        for (offset, bases) in
-            acgt_stretches(&sequence).filter(|(_, bases)| bases.len() >= MIN_STRETCH)
-        {
+        for (offset, bases) in acgt_stretches(&sequence, MIN_STRETCH) {
             write_fasta_record(output, stretches.len().to_string().as_bytes(), bases)?;
             stretches.push(Stretch {
                 contig: contig.clone(),
@@ -137,9 +135,9 @@ fn write_stretches(input: &str, output: &mut dyn Write) -> Result<Vec<Stretch>, 
     Ok(stretches)
 }
 
-/// The non-empty maximal runs of A, C, G and T (either case) in `sequence`,
-/// with their offsets.
-fn acgt_stretches(sequence: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
+/// The maximal runs of at least `min_len` A, C, G and T (either case) in
+/// `sequence`, with their offsets.
+fn acgt_stretches(sequence: &[u8], min_len: usize) -> impl Iterator<Item = (usize, &[u8])> {
     sequence
         .split(|base| !matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T'))
         .scan(0, |start, bases| {
@@ -147,16 +145,18 @@ fn acgt_stretches(sequence: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
             *start += bases.len() + 1;
             Some((offset, bases))
         })
-        .filter(|(_, bases)| !bases.is_empty())
+        .filter(move |(_, bases)| bases.len() >= min_len.max(1))
 }
 
 /// Rewrite FragGeneScanRs's FASTA headers and GFF rows from stretch records
-/// to contig names and coordinates.
-fn restore_coordinates(path: &Path, stretches: &[Stretch]) -> Result<(), Box<dyn Error>> {
+/// to contig names and coordinates; returns the number of FASTA records.
+fn restore_coordinates(path: &Path, stretches: &[Stretch]) -> Result<usize, Box<dyn Error>> {
     let text = fs::read_to_string(path)?;
     let mut out = BufWriter::new(File::create(path)?);
+    let mut records = 0;
     for line in text.lines() {
         if let Some(gene) = line.strip_prefix('>') {
+            records += 1;
             writeln!(out, ">{}", contig_gene_id(gene, stretches)?)?;
         } else if line.contains('\t') {
             // record, source, type, start, end, score, strand, phase, `ID={gene};...`
@@ -177,7 +177,8 @@ fn restore_coordinates(path: &Path, stretches: &[Stretch]) -> Result<(), Box<dyn
             writeln!(out, "{line}")?;
         }
     }
-    Ok(out.flush()?)
+    out.flush()?;
+    Ok(records)
 }
 
 /// `{record}_{start}_{end}_{strand}` from FragGeneScanRs, with the record a
@@ -236,27 +237,16 @@ fn default_train_dirs(program: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Decompress and normalise a FASTA/FASTQ file to plain FASTA; returns its base count.
-pub(crate) fn write_plain_fasta(
-    input: &str,
-    output: &mut dyn Write,
-) -> Result<usize, Box<dyn Error>> {
+/// Decompress and normalise a FASTA/FASTQ file to the plain FASTA file `output`.
+pub(crate) fn write_plain_fasta_file(input: &str, output: &Path) -> Result<(), Box<dyn Error>> {
     let mut reader =
         parse_fastx_file(input).map_err(|error| format!("invalid FASTA {input}: {error}"))?;
-    let mut total = 0;
+    let mut output = BufWriter::new(File::create(output)?);
     while let Some(record) = reader.next() {
         let record = record.map_err(|error| format!("error reading {input}: {error}"))?;
-        let sequence = record.seq();
-        total += sequence.len();
-        write_fasta_record(output, record.id(), &sequence)?;
+        write_fasta_record(&mut output, record.id(), &record.seq())?;
     }
-    output.flush()?;
-    Ok(total)
-}
-
-/// `write_plain_fasta` into the file `output`.
-pub(crate) fn write_plain_fasta_file(input: &str, output: &Path) -> Result<usize, Box<dyn Error>> {
-    write_plain_fasta(input, &mut BufWriter::new(File::create(output)?))
+    Ok(output.flush()?)
 }
 
 /// One FASTA record: `>id`, then the sequence on one line.
@@ -272,23 +262,13 @@ pub(crate) fn write_fasta_record(
     writer.write_all(b"\n")
 }
 
-pub(crate) fn count_records(fasta: &Path) -> Result<usize, Box<dyn Error>> {
-    let mut count = 0;
-    for line in BufReader::new(File::open(fasta)?).lines() {
-        if line?.starts_with('>') {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn stretches_skip_ambiguous_bases() {
-        let stretches = acgt_stretches(b"NNacGTNRTTANN").collect::<Vec<_>>();
+        let stretches = acgt_stretches(b"NNacGTNRTTANN", 1).collect::<Vec<_>>();
         assert_eq!(stretches, [(2, &b"acGT"[..]), (8, &b"TTA"[..])]);
     }
 

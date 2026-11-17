@@ -20,7 +20,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::classify::aai::{AaiDecision, AaiHit, compute_aai};
+use crate::classify::aai::{AaiDecision, AaiHit, Lead, compute_aai};
 use crate::classify::ani::{
     AniDecision, AniHit, Candidate, MIN_SPECIES_RADIUS, Screen, decide, refine_candidates, screen,
     sketch_ani,
@@ -65,9 +65,11 @@ pub(crate) struct ClassifyOptions {
     pub(crate) genus_aai: f64,
     pub(crate) family_aai: f64,
     pub(crate) aai_margin: f64,
-    /// Proteome sketch estimate at which a clearly closest genus is
-    /// assigned without DIAMOND; `None` always runs DIAMOND.
-    pub(crate) sketch_genus_aai: Option<f64>,
+    /// Proteome sketch candidates the AAI call compares without DIAMOND.
+    pub(crate) aai_candidates: usize,
+    /// Compute AAI with DIAMOND over the `candidates` closest proteomes
+    /// instead of using their proteome sketch estimates.
+    pub(crate) diamond_aai: bool,
     pub(crate) fgs: String,
     pub(crate) fgs_train_dir: Option<String>,
     pub(crate) diamond: String,
@@ -334,7 +336,7 @@ fn run_ani_tier<'a>(
     let vectors = sketch_from_params(&query_paths, &db.nt.params);
     // Per query, the sketch-only species hit or the candidates for TurboANI.
     let (estimated, exact): (Vec<_>, Vec<_>) =
-        search_index(&db.nt, warmup, &vectors, options, log)?
+        search_index(&db.nt, warmup, &vectors, options.candidates, options, log)?
             .into_iter()
             .map(|neighbors| {
                 let candidates = neighbors
@@ -533,12 +535,13 @@ fn call_query_genes(
     Ok(())
 }
 
-/// Search `index` for each sketch's `--candidates` nearest references, once
-/// the index's warm-up has finished.
+/// Search `index` for each sketch's `k` nearest references, once the
+/// index's warm-up has finished.
 fn search_index(
     index: &Index,
     warmup: &Warmup,
     vectors: &[Vec<u16>],
+    k: usize,
     options: &ClassifyOptions,
     log: &ClassifyLog,
 ) -> Result<Vec<Vec<(u32, f32)>>, Box<dyn Error>> {
@@ -546,13 +549,7 @@ fn search_index(
         Preload::Disabled => {}
         preload => log.info(preload.to_string()),
     }
-    search_vectors(
-        &index.prefix,
-        index.len(),
-        vectors,
-        options.candidates,
-        options.beam_width,
-    )
+    search_vectors(&index.prefix, index.len(), vectors, k, options.beam_width)
 }
 
 /// Classify genomes the ANI tier left unresolved by AAI against candidate
@@ -579,96 +576,98 @@ fn run_aai_tier(
     if called.is_empty() {
         return Ok(());
     }
-    let diamond = find_program(&options.diamond)?;
-    log.info(format!(
-        "Running AAI search with DiskANN candidate search and DIAMOND for {} genome(s)",
-        called.len()
-    ));
     let proteome_paths = called
         .iter()
         .map(|(_, faa)| faa.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     let vectors = sketch_from_params(&proteome_paths, &db.aa.params);
-    let searched = search_index(&db.aa, warmup, &vectors, options, log)?;
-
-    // Genomes whose sketch estimates settle the genus skip DIAMOND.
-    let mut results_by_query = Vec::with_capacity(called.len());
-    let mut pending = Vec::new();
-    for ((index, faa), neighbors) in called.iter().zip(&searched) {
-        let from_sketch = options.sketch_genus_aai.and_then(|genus_aai| {
-            aai::decide_from_sketch(
-                neighbors,
-                db.aa.params.kmer_size,
-                &db.nt.accessions,
-                &db.data,
-                genus_aai,
-                options.aai_margin,
-            )
-        });
-        if from_sketch.is_none() {
-            pending.push((faa.as_path(), neighbors.iter().map(|&(id, _)| id).collect()));
-        }
-        results_by_query.push((*index, from_sketch));
-    }
-    if options.sketch_genus_aai.is_some() {
+    let diamond = options
+        .diamond_aai
+        .then(|| find_program(&options.diamond))
+        .transpose()?;
+    let k = if diamond.is_some() {
         log.info(format!(
-            "{} genome(s) assigned a genus from the proteome sketch without DIAMOND",
-            called.len() - pending.len()
+            "Running AAI search with DiskANN candidate search and DIAMOND for {} genome(s)",
+            called.len()
         ));
-    }
-    let (proteomes, candidates): (Vec<&Path>, Vec<Vec<u32>>) = pending.into_iter().unzip();
-    let mut aai_hits = if proteomes.is_empty() {
-        Vec::new()
+        options.candidates
     } else {
-        compute_aai(
-            &diamond,
-            &out_dir
-                .join("classify")
-                .join("aai")
-                .join("intermediate_results"),
-            &proteomes,
-            &candidates,
-            &db.aa.paths,
-            options.threads,
-        )?
-    }
-    .into_iter();
+        log.info(format!(
+            "Estimating AAI from the proteome sketch search for {} genome(s)",
+            called.len()
+        ));
+        options.aai_candidates
+    };
+    let searched = search_index(&db.aa, warmup, &vectors, k, options, log)?;
+    // Each genome's hits, with the AAI no reference outside them can exceed:
+    // sketch candidates are the closest proteomes, so when the search left
+    // references out, every one of them is no closer than its last.
+    let hits = match &diamond {
+        Some(diamond) => {
+            let proteomes = called
+                .iter()
+                .map(|(_, faa)| faa.as_path())
+                .collect::<Vec<_>>();
+            let candidates = searched
+                .iter()
+                .map(|neighbors| neighbors.iter().map(|&(id, _)| id).collect())
+                .collect::<Vec<_>>();
+            compute_aai(
+                diamond,
+                &out_dir
+                    .join("classify")
+                    .join("aai")
+                    .join("intermediate_results"),
+                &proteomes,
+                &candidates,
+                &db.aa.paths,
+                options.threads,
+            )?
+            .into_iter()
+            .map(|hits| (hits, None))
+            .collect::<Vec<_>>()
+        }
+        None => searched
+            .iter()
+            .map(|neighbors| {
+                let hits = aai::sketch_hits(neighbors, db.aa.params.kmer_size);
+                let beyond = hits
+                    .last()
+                    .filter(|_| hits.len() < db.aa.len())
+                    .map(|hit| hit.aai);
+                (hits, beyond)
+            })
+            .collect(),
+    };
+    let from_sketch = diamond.is_none();
 
     let mut resolved = 0;
-    for (index, from_sketch) in results_by_query {
-        let (hits, decision, from_sketch) = match from_sketch {
-            Some((hits, decision)) => (hits, decision, true),
-            None => {
-                let hits = aai_hits
-                    .next()
-                    .expect("one DIAMOND result per pending genome");
-                let decision = aai::decide(
-                    &hits,
-                    &db.nt.accessions,
-                    &db.data,
-                    options.genus_aai,
-                    options.family_aai,
-                    options.aai_margin,
-                );
-                (hits, decision, false)
-            }
-        };
+    for ((index, _), (hits, beyond)) in called.iter().zip(hits) {
+        let decision = aai::decide(
+            &hits,
+            &db.aa.accessions,
+            &db.data,
+            options.genus_aai,
+            options.family_aai,
+            options.aai_margin,
+            beyond,
+        );
         if decision != AaiDecision::Unresolved {
             resolved += 1;
         }
         ::log::debug!(
             "aai genome={} decision={:?} hits={}",
-            results[index].genome.id,
+            results[*index].genome.id,
             decision,
             hits.iter()
                 .map(|hit| format!(
                     "{}:{:.2}/{}",
-                    db.nt.accessions[hit.reference as usize], hit.aai, hit.reciprocal_hits
+                    db.aa.accessions[hit.reference as usize], hit.aai, hit.reciprocal_hits
                 ))
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        if let Stage::Called { aai, .. } = &mut results[index].stage {
+        if let Stage::Called { aai, .. } = &mut results[*index].stage {
             *aai = Some(AaiResult {
                 hits,
                 decision,
@@ -946,7 +945,14 @@ fn search_marker_index(
         paths.push(path.to_string_lossy().into_owned());
     }
     let vectors = sketch_from_params(&paths, &db.markers.params);
-    let neighbors = search_index(&db.markers, warmup, &vectors, options, log)?;
+    let neighbors = search_index(
+        &db.markers,
+        warmup,
+        &vectors,
+        options.candidates,
+        options,
+        log,
+    )?;
     let mut output = BufWriter::new(File::create(&summary_path)?);
     writeln!(
         output,
@@ -1031,7 +1037,7 @@ fn write_aai_summary(
             continue;
         };
         for hit in &aai.hits {
-            let accession = &db.nt.accessions[hit.reference as usize];
+            let accession = &db.aa.accessions[hit.reference as usize];
             // Sketch estimates have no DIAMOND statistics.
             let (sd, reciprocal_hits, min_proteins) = if aai.from_sketch {
                 (
@@ -1218,7 +1224,7 @@ fn aai_summary_row(
     row.translation_table = Some(TRANSLATION_TABLE);
     let best_taxonomy = aai.hits.first().and_then(|hit| {
         db.data
-            .taxonomy_of(&db.nt.accessions[hit.reference as usize])
+            .taxonomy_of(&db.aa.accessions[hit.reference as usize])
     });
     let marker_set = best_taxonomy.map_or(ani_marker_set, marker_set_for_taxonomy);
     let (call, rank) = match &aai.decision {
@@ -1231,10 +1237,14 @@ fn aai_summary_row(
     };
     row.classification = Some(standardise_taxonomy(&call.taxonomy));
     row.classification_method = Some("taxonomic classification defined by AAI".into());
-    let lead = call.lead.map_or_else(
-        || format!("no other {rank} among the AAI hits"),
-        |lead| format!("{} points above the next {rank}", py_round(lead, 2)),
-    );
+    let lead = match call.lead {
+        Lead::Next(points) => format!("{} points above the next {rank}", py_round(points, 2)),
+        Lead::AtLeast(points) => format!(
+            "at least {} points above any other {rank}",
+            py_round(points, 2)
+        ),
+        Lead::Unopposed => format!("no other {rank} among the AAI hits"),
+    };
     let measure = if aai.from_sketch {
         "proteome sketch AAI estimate"
     } else {
