@@ -14,6 +14,9 @@ use crate::classify::external::{find_program, run_with_input};
 /// FragGeneScanRs translates with the standard bacterial code.
 pub(crate) const TRANSLATION_TABLE: u8 = 11;
 const TRAINING_MODEL: &str = "complete";
+/// FragGeneScanRs reports no gene shorter than this in complete genomes, and
+/// fails on records of one or two bases.
+const MIN_STRETCH: usize = 120;
 
 /// FragGeneScanRs and the directory holding its training models.
 pub(crate) struct GeneCaller {
@@ -51,7 +54,9 @@ impl GeneCaller {
     /// `{id}_protein.gff` like GTDB-Tk's `identify` step. Returns the protein
     /// FASTA, or `None` for a genome without sequence or genes.
     /// FragGeneScanRs reads the genome from its standard input and splits
-    /// the contigs over `threads`.
+    /// the contigs over `threads`. It stops calling genes on a record at its
+    /// first non-ACGT base, so each stretch between ambiguous bases is fed as
+    /// its own record and the gene coordinates are mapped back to the contigs.
     pub(crate) fn call(
         &self,
         genome_path: &str,
@@ -81,13 +86,119 @@ impl GeneCaller {
                 .arg("-g")
                 .arg(output("_protein.gff"));
         }
-        let mut bases = 0;
+        let mut stretches = Vec::new();
         run_with_input(&mut command, |stdin| {
-            bases = write_plain_fasta(genome_path, stdin)?;
+            stretches = write_stretches(genome_path, stdin)?;
             Ok(())
         })?;
-        Ok((bases > 0 && count_records(&protein_faa)? > 0).then_some(protein_faa))
+        if stretches.is_empty() {
+            return Ok(None);
+        }
+        restore_coordinates(&protein_faa, &stretches)?;
+        if gene_files {
+            restore_coordinates(&output("_protein.fna"), &stretches)?;
+            restore_coordinates(&output("_protein.gff"), &stretches)?;
+        }
+        Ok((count_records(&protein_faa)? > 0).then_some(protein_faa))
     }
+}
+
+/// A run of unambiguous bases within a contig, fed to FragGeneScanRs as the
+/// record named by its index.
+struct Stretch {
+    contig: String,
+    offset: usize,
+}
+
+/// Write the ACGT stretches long enough to hold a gene of every contig in
+/// `input` as records named by their index, and return them.
+fn write_stretches(input: &str, output: &mut dyn Write) -> Result<Vec<Stretch>, Box<dyn Error>> {
+    let mut reader =
+        parse_fastx_file(input).map_err(|error| format!("invalid FASTA {input}: {error}"))?;
+    let mut stretches = Vec::new();
+    while let Some(record) = reader.next() {
+        let record = record.map_err(|error| format!("error reading {input}: {error}"))?;
+        // FragGeneScanRs names genes after the first word of the header.
+        let id = record.id();
+        let contig = id.split(u8::is_ascii_whitespace).next().unwrap_or(id);
+        let contig = String::from_utf8_lossy(contig).into_owned();
+        let sequence = record.seq();
+        for (offset, bases) in
+            acgt_stretches(&sequence).filter(|(_, bases)| bases.len() >= MIN_STRETCH)
+        {
+            write_fasta_record(output, stretches.len().to_string().as_bytes(), bases)?;
+            stretches.push(Stretch {
+                contig: contig.clone(),
+                offset,
+            });
+        }
+    }
+    output.flush()?;
+    Ok(stretches)
+}
+
+/// The non-empty maximal runs of A, C, G and T (either case) in `sequence`,
+/// with their offsets.
+fn acgt_stretches(sequence: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
+    sequence
+        .split(|base| !matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T'))
+        .scan(0, |start, bases| {
+            let offset = *start;
+            *start += bases.len() + 1;
+            Some((offset, bases))
+        })
+        .filter(|(_, bases)| !bases.is_empty())
+}
+
+/// Rewrite FragGeneScanRs's FASTA headers and GFF rows from stretch records
+/// to contig names and coordinates.
+fn restore_coordinates(path: &Path, stretches: &[Stretch]) -> Result<(), Box<dyn Error>> {
+    let text = fs::read_to_string(path)?;
+    let mut out = BufWriter::new(File::create(path)?);
+    for line in text.lines() {
+        if let Some(gene) = line.strip_prefix('>') {
+            writeln!(out, ">{}", contig_gene_id(gene, stretches)?)?;
+        } else if line.contains('\t') {
+            // record, source, type, start, end, score, strand, phase, `ID={gene};...`
+            let mut fields = line.split('\t').map(str::to_owned).collect::<Vec<_>>();
+            let stretch = stretch(&fields[0], stretches)?;
+            fields[0] = stretch.contig.clone();
+            for position in &mut fields[3..5] {
+                *position = (position.parse::<usize>()? + stretch.offset).to_string();
+            }
+            if let Some((gene, rest)) = fields[8]
+                .strip_prefix("ID=")
+                .and_then(|a| a.split_once(';'))
+            {
+                fields[8] = format!("ID={};{rest}", contig_gene_id(gene, stretches)?);
+            }
+            writeln!(out, "{}", fields.join("\t"))?;
+        } else {
+            writeln!(out, "{line}")?;
+        }
+    }
+    Ok(out.flush()?)
+}
+
+/// `{record}_{start}_{end}_{strand}` from FragGeneScanRs, with the record a
+/// stretch index, as `{contig}_{start}_{end}_{strand}` in contig coordinates.
+fn contig_gene_id(gene: &str, stretches: &[Stretch]) -> Result<String, Box<dyn Error>> {
+    let fields = gene.splitn(4, '_').collect::<Vec<_>>();
+    let [record, start, end, strand] = fields[..] else {
+        return Err(format!("unexpected FragGeneScanRs gene ID {gene}").into());
+    };
+    let stretch = stretch(record, stretches)?;
+    let start = start.parse::<usize>()? + stretch.offset;
+    let end = end.parse::<usize>()? + stretch.offset;
+    Ok(format!("{}_{start}_{end}_{strand}", stretch.contig))
+}
+
+fn stretch<'a>(record: &str, stretches: &'a [Stretch]) -> Result<&'a Stretch, Box<dyn Error>> {
+    record
+        .parse::<usize>()
+        .ok()
+        .and_then(|index| stretches.get(index))
+        .ok_or_else(|| format!("unexpected FragGeneScanRs record {record}").into())
 }
 
 fn is_train_dir(dir: &Path) -> bool {
@@ -169,4 +280,34 @@ pub(crate) fn count_records(fasta: &Path) -> Result<usize, Box<dyn Error>> {
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stretches_skip_ambiguous_bases() {
+        let stretches = acgt_stretches(b"NNacGTNRTTANN").collect::<Vec<_>>();
+        assert_eq!(stretches, [(2, &b"acGT"[..]), (8, &b"TTA"[..])]);
+    }
+
+    #[test]
+    fn gene_ids_are_restored_to_contig_coordinates() {
+        let stretches = [
+            Stretch {
+                contig: "contig_1".into(),
+                offset: 0,
+            },
+            Stretch {
+                contig: "contig_1".into(),
+                offset: 120,
+            },
+        ];
+        assert_eq!(
+            contig_gene_id("1_5_310_-", &stretches).unwrap(),
+            "contig_1_125_430_-"
+        );
+        assert!(contig_gene_id("2_5_310_-", &stretches).is_err());
+    }
 }
