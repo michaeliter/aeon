@@ -211,14 +211,14 @@ All three graphs are built with max degree 128 (`--max-degree`), construction be
 
 **Design decisions:**
 - **pplacer is replaced by AAI and the marker search.** This removes the reference tree and its large memory requirement.
-- **FragGeneScanRs replaces Prodigal/pyrodigal.** It is faster, and accurate enough for AAI and marker extraction. It runs as a separate program because it is GPL-3.0 and aeon is MIT. It translates with table 11 only, so `translation_table` is always 11.
+- **FragGeneScanRs calls query genes in place of Prodigal/pyrodigal.** It is faster, and accurate enough for AAI and marker extraction. It runs as a separate program because it is GPL-3.0 and aeon is MIT. It translates with table 11 only, so `translation_table` is always 11. References use GTDB's precomputed Prodigal proteomes (`--protein-list`) when available; FragGeneScanRs calls their genes only when no proteomes are given.
   - FragGeneScanRs stops calling genes on a contig at its first ambiguous base (N or any other non-ACGT base). aeon therefore gives it each stretch of at least 120 unambiguous bases as a separate sequence, then maps gene IDs and GFF coordinates back to the contigs. Before this, a quarter of the holdout references lost genes this way, and a 4.5 Mb *Arthrobacter* genome with an N run 20 kb into its main contig gave 268 proteins instead of 4,145. Gene calling takes the same time either way.
 - **Species calls use each species' ANI radius**, by default 95%. With GTDB's radii (`--radii sp_clusters_r232.tsv`, or `--gtdbtk-data`) they match GTDB-Tk's ANI screen.
 - **TurboANI runs only when the sketch search cannot settle the species on its own.**
   - A species call made from the sketch estimate alone reports `closest_genome_af` as `N/A`. Its Jaccard-based estimate already drops with the shared fraction.
   - The 1-point margin sends borderline genomes to TurboANI. These include chimeras whose AF would fail, because the sketch cannot check AF.
 - **AAI comes from the proteome sketch by default.** DIAMOND measures AAI more precisely, but that does not make the calls better, because GTDB does not draw genus and family boundaries by AAI. On the holdouts below, the sketch estimate made as few or fewer wrong calls than DIAMOND, in about a sixth of the time. Sketch estimates run about 2 points above DIAMOND AAI, and fall by about 5 points at 50% completeness, against under 1 for DIAMOND. The margin compares references with each other, so a shift that affects them all alike barely changes the calls. `--diamond-aai` remains for when the AAI values themselves matter.
-- **Genus 65% AAI and family 45% AAI** are the defaults, the genus and family boundaries proposed by Konstantinidis, Rosselló-Móra & Amann ([ISME J 2017](https://doi.org/10.1038/ismej.2017.113)). With the AAI margin below, they made 3 wrong calls in the 104 training and validation queries, and 6 in the 103 independent ones.
+- **Genus 65% AAI and family 45% AAI** are the defaults, the genus and family boundaries proposed by Konstantinidis, Rosselló-Móra & Amann ([ISME J 2017](https://doi.org/10.1038/ismej.2017.113)). With the AAI margin below, they made 4 wrong calls in the 104 training and validation queries, and 5 in the 103 independent ones.
 - **AAI calls use a margin, not a vote.** A novel genus sits about equally far from several genera in its family, so its closest reference leads the next genus by only a point or two. A genus that is in the database stands out from its neighbours. Unlike a majority vote among the closest references, the margin doesn't penalise genera with few representatives; many GTDB genera have only one.
 - **Marker-search calls stop at order**, using the closest marker reference's lineage.
   - The 25% floor only rejects chance k-mer matches. Random marker sequences share almost no 5-mers (J ≈ 0.001).
@@ -258,7 +258,7 @@ aeon classify --db gtdb_db --genome_dir genomes -x fna.gz --out_dir out --cpus 8
 
 Without `--protein-list`, reference genes are called with FragGeneScanRs. aeon finds FragGeneScanRs's `train/` models next to the executable or in the sources `cargo install` keeps. Otherwise, pass `--fgs-train-dir`.
 
-**Holdout results.** Holdouts of GTDB R232 species representatives were used, each with the query's species, whole genus or whole family withheld from the database.
+**Holdout results.** Holdouts of GTDB R232 species representatives were used, each with the query's species, whole genus or whole family withheld from the database. Reference proteomes were called the way GTDB's `protein_faa_reps` are: Prodigal (here pyrodigal, which reproduces Prodigal 2.6.3) with GTDB-Tk's settings, masking N runs and choosing translation table 4 or 11 by coding density. Query genes were called with FragGeneScanRs, as in any classify run.
 
 | Set | Orders | References | Queries (species / genus / family withheld) |
 |---|---|---|---|
@@ -272,58 +272,58 @@ A genus or family holdout has no reference of its true taxon, so the right answe
 
 | AAI | Set (queries) | Completeness | Wrong | Right | Too shallow |
 |---|---|---|---|---|---|
-| Proteome sketch (default) | Training + validation (104) | 100% | 3 | 92 | 9 |
-| `--diamond-aai` | Training + validation (104) | 100% | 6 | 89 | 9 |
-| Proteome sketch (default) | Independent (103) | 100% | 6 | 85 | 12 |
+| Proteome sketch (default) | Training + validation (104) | 100% | 4 | 91 | 9 |
+| `--diamond-aai` | Training + validation (104) | 100% | 6 | 90 | 8 |
+| Proteome sketch (default) | Independent (103) | 100% | 5 | 86 | 12 |
 | `--diamond-aai` | Independent (103) | 100% | 7 | 86 | 10 |
-| Proteome sketch (default) | Independent (103) | 70% | 5 | 86 | 12 |
-| `--diamond-aai` | Independent (103) | 70% | 8 | 84 | 11 |
+| Proteome sketch (default) | Independent (103) | 70% | 5 | 87 | 11 |
+| `--diamond-aai` | Independent (103) | 70% | 8 | 85 | 10 |
 | Proteome sketch (default) | Independent (103) | 50% | 4 | 88 | 11 |
-| `--diamond-aai` | Independent (103) | 50% | 8 | 85 | 10 |
+| `--diamond-aai` | Independent (103) | 50% | 9 | 84 | 10 |
 
-The 100% rows come from full classify runs. The partial-genome rows keep a random 70% or 50% of each query in contig-sized pieces (median 15 kb). Their default rows replay the rule over the sketch hits of every reference. With 50 candidates and the bound on the last one, it gave the same calls as comparing all references on every set and completeness. Two of the independent set's wrong calls are species calls that GTDB-Tk's ANI screen would make too: the withheld species sits 95.47% and 95.00% ANI from a sister species whose radius is 95%.
+All rows come from full classify runs. The partial-genome rows keep a random 70% or 50% of each query in contig-sized pieces (median 15 kb). On the complete independent set, applying the margin over the sketch estimates of every reference, instead of the 50 candidates with the bound on the last one, gave the same counts. Two of the independent set's wrong calls are species calls that GTDB-Tk's ANI screen would make too: the withheld species sits 95.47% and 95.00% ANI from a sister species whose radius is 95%.
 
 The margin table below uses DIAMOND AAI (`--diamond-aai`) over the training and validation sets (104 queries):
 
 | AAI rule | Wrong calls | Species holdouts given their genus (of 40) | Genus holdouts given their family (of 28) | Family holdouts stopped at order (of 36) |
 |---|---|---|---|---|
-| Margin 5 points (default margin) | 6 | 36 | 20 | 33 |
-| Margin 3 points | 6 | 37 | 22 | 33 |
-| Margin 7 points | 6 | 33 | 19 | 33 |
-| Margin 10 points | 4 | 32 | 19 | 33 |
-| Strict majority of the 10 closest references | 14 | 22 | 22 | 26 |
+| Margin 5 points (default margin) | 6 | 36 | 21 | 33 |
+| Margin 3 points | 6 | 38 | 24 | 33 |
+| Margin 7 points | 6 | 34 | 20 | 33 |
+| Margin 10 points | 4 | 32 | 20 | 33 |
+| Strict majority of the 10 closest references | 18 | 22 | 22 | 22 |
 | Closest reference only, no margin | 47 | 38 | 17 | 0 |
 
 The 5-point row comes from full classify runs. The other rows replay the rule over the same AAI hits. The margin was chosen on these same queries while FragGeneScanRs was still losing genes at ambiguous bases (see the design decisions above). With complete proteomes, margins of 3, 5 and 7 points make the same number of wrong calls.
 
-- **Marker search:** all 39 order-level calls were correct.
+- **Marker search:** in the default runs, all 39 order-level calls on the training and validation sets and all 31 on the independent set were correct.
 - **Why a fixed AAI cutoff is not enough.** GTDB draws genus and family boundaries by relative evolutionary divergence, not AAI, so a fixed AAI cutoff cuts across them:
 
   | Comparison (per query) | Min | Median | Max |
   |---|---|---|---|
-  | Same genus (species holdouts vs references of their own genus) | 53.4 | 74.9 | 93.9 |
-  | Closest other genus in the same family (genus holdouts) | 54.0 | 62.3 | 73.3 |
-  | Closest other family in the same order (family holdouts) | 48.8 | 55.3 | 61.9 |
+  | Same genus (species holdouts vs references of their own genus) | 52.0 | 74.9 | 94.2 |
+  | Closest other genus in the same family (genus holdouts) | 51.2 | 61.6 | 73.3 |
+  | Closest other family in the same order (family holdouts) | 46.0 | 55.1 | 61.7 |
 
-  - 11 of 28 genus holdouts had a sister genus at ≥65% AAI, while 10% of same-genus pairs fell below 65.9%.
+  - 11 of 28 genus holdouts had a sister genus at ≥65% AAI, while 10% of same-genus pairs fell below 65.8%.
   - Every family holdout (36 of 36) had another family at ≥45% AAI, so the 45% cutoff alone stops none of them.
-- **Why the margin works.** When the true taxon is absent, the closest reference led the next taxon by less than 3 points in 41 of 47 cases (the largest lead was 13.3; in 3 cases no other taxon was among the hits). When the closest reference was right, it usually led by 6 points or more (49 of 57); 8 of 57 led by less than 5.
-- **Why a margin, not a majority vote.** The vote missed or got wrong 23 calls that the margin got right. 14 of them were genera with at most 2 references in the database, outvoted by a larger neighbour.
-  - Complete genera do not rescue the vote. On the independent set, GSearch's rule made 24 wrong calls: species at ≥95% sketch ANI, then a genus held by ≥5 of the 10 closest proteomes at ≥65%, else a family at ≥52%. The sketch margin made 6.
-  - Voting over every reference above the cutoff was worse still. For species holdouts a median of 12.5 references cleared 65%, only 40% of them from the query's own genus. For genus holdouts a median of 184 references, nearly the whole order, cleared 45%. A strict majority then made 13 wrong calls and left 47 too shallow, and a plurality made 72 wrong calls.
+- **Why the margin works.** When the true taxon is absent, the closest reference led the next taxon by less than 3 points in 41 of 47 cases (the largest lead was 13.4; in 3 cases no other taxon was among the hits). When the closest reference was right, it usually led by 6 points or more (50 of 57); 7 of 57 led by less than 5.
+- **Why a margin, not a majority vote.** The vote missed or got wrong 27 calls that the margin got right. 14 of them were genera with at most 2 references in the database, outvoted by a larger neighbour.
+  - Complete genera do not rescue the vote. On the independent set, GSearch's rule made 28 wrong calls: species at ≥95% sketch ANI, then a genus held by ≥5 of the 10 closest proteomes at ≥65%, else a family at ≥52%. The sketch margin made 5.
+  - Voting over every reference above the cutoff was worse still. For species holdouts a median of 12.5 references cleared 65%, only 40% of them from the query's own genus. For genus holdouts a median of 184 references, nearly the whole order, cleared 45%. A strict majority then made 15 wrong calls and left 45 too shallow, and a plurality made 73 wrong calls.
 - **DIAMOND mode:** the default mode gives AAI about 2 points higher than `--sensitive` on the same pairs (median +2.2 and +2.3 on the two sets). It made about the same number of wrong calls under the majority vote (19 against 21) in about a third of the time. This was measured before the gene-calling fix.
-- **Sketch estimates against DIAMOND AAI:** across 1,040 query–reference pairs of the training and validation sets, the sketch estimate ran a median 1.9 points above DIAMOND AAI, and pairs at ≥80% on the sketch were ≥75.5% by DIAMOND. On partial genomes the closest reference's sketch estimate fell by a median 0.7, 2.6 and 5.3 points at 90%, 70% and 50% completeness, and its DIAMOND AAI by 0.05, 0.4 and 0.7. The margin still matters at high AAI: a *Haemophilus* query had references of *Haemophilus_D* and *Rodentibacter* at 83–86% on the sketch (about 83% by DIAMOND), so with its own genus removed, the closest reference alone would give a wrong genus.
+- **Sketch estimates against DIAMOND AAI:** across 1,040 query–reference pairs of the training and validation sets, the sketch estimate ran a median 2.1 points above DIAMOND AAI, and pairs at ≥80% on the sketch were ≥75.2% by DIAMOND. On partial genomes the closest reference's sketch estimate fell by a median 0.7, 2.6 and 5.4 points at 90%, 70% and 50% completeness, and its DIAMOND AAI by 0.04, 0.4 and 0.7. The margin still matters at high AAI: a *Haemophilus* query had references of *Haemophilus_D* and *Rodentibacter* at 83–86% on the sketch (about 83% by DIAMOND), so with its own genus removed, the closest reference alone would give a wrong genus.
 - **Species calls from the sketch alone:** reference genomes cut into 10 kb pieces, keeping 50–90% of them, were all assigned their own species, 24 of 24, with no TurboANI call.
 
 **Runtime** with 8 threads:
 
 | Set | Genomes | References | Default: wall / CPU | `--diamond-aai`: wall / CPU | Peak RSS |
 |---|---|---|---|---|---|
-| Training | 55 | 272 | 15 s / 104 s | 80 s / 603 s | 0.94 GB |
-| Validation | 49 | 221 | 12 s / 82 s | 66 s / 496 s | 1.32 GB |
-| Independent | 103 | 891 | 21 s / 159 s | 142 s / 1,079 s | 1.15 GB |
+| Training | 55 | 272 | 15 s / 101 s | 85 s / 627 s | 0.94 GB |
+| Validation | 49 | 221 | 12 s / 83 s | 76 s / 537 s | 1.32 GB |
+| Independent | 103 | 891 | 23 s / 167 s | 156 s / 1,159 s | 1.15 GB |
 
-Building the 272-reference database with FragGeneScanRs gene calls (no `--protein-list`) took 134 s; the 891-reference one took 427 s, 364 s of it extracting marker genes, with a peak RSS of 1.6 GB. Index scaling at full GTDB size has not been measured yet. Indexes are warmed before searching (see [Search](#search)); `--no-preload` turns this off.
+Building the 272-reference database from Prodigal proteomes (`--protein-list`) took 123 s; the 891-reference one took 390 s, 387 s of it extracting marker genes, with a peak RSS of 0.73 GB. Calling the references' genes with FragGeneScanRs instead (no `--protein-list`) took 134 s and 427 s, with a peak RSS of 1.6 GB. Index scaling at full GTDB size has not been measured yet. Indexes are warmed before searching (see [Search](#search)); `--no-preload` turns this off.
 
 ## Update Semantics
 
