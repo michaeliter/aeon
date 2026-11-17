@@ -8,7 +8,7 @@
 ***"Built once, updated forever. Nodes and edges evolve like cells, while Aeon remains eternal."***
 
 
-Aeon is a dynamic genome similarity search platform built on mmap-backed DiskANN index, MERIT deletion repair, and b-bit one-permutation MinHash sketches. Search indexes remain in the ordinary static DiskANN format: updates use a temporary dynamic workspace and commit a compact static index.
+Aeon is a dynamic genome similarity search platform built on mmap-backed DiskANN index, MERIT deletion repair, and b-bit one-permutation MinHash sketches. Search indexes remain in the ordinary static DiskANN format: updates use a temporary dynamic workspace and commit a compact static index. Exact genome-content deduplication is performed before graph construction and insertion; approximate MinHash equality is never used as an identity test.
 
 ## Install
 
@@ -56,8 +56,10 @@ This creates:
 
 - `index_out.diskann`: static mmap-searchable DiskANN index.
 - `index_out.genomes.txt`: genome names in current vector-ID order.
-- `index_out.idmap.tsv`: vector ID to genome name mapping.
+- `index_out.idmap.tsv`: vector ID, genome path, and SHA-256 hash of normalized, compressed genome content in current vector-ID order.
 - `index_out.params.json`: sketch and graph parameters.
+
+After parsing each genome, Aeon uses the same kmerutils-normalized compressed sequence representation that feeds sketching to compute a per-genome SHA-256 digest. The digest includes contig boundaries but ignores FASTA headers, wrapping, case, and bases that kmerutils filters. Aeon retains only the first path for an identical content digest; only those genomes become Vamana nodes and appear in `.genomes.txt` / `.idmap.tsv`. Equal b-bit MinHash sketches are still retained when the underlying genome-content hashes differ.
 
 Important build options:
 
@@ -75,7 +77,7 @@ Important build options:
 
 ### Insert
 
-The insertion list must contain paths to genome files. Aeon sketches them with the database's original parameters.
+The insertion list must contain paths to genome files. Aeon parses, kmerutils-compresses, and SHA-256-hashes each genome with the database's original parameters before sketching. Only an input whose exact content hash is absent from both the surviving database and earlier records in the same insertion list reaches Vamana insertion. A copied genome or repeated list entry is skipped with the first canonical genome retained; genomes with only an equal b-bit MinHash sketch are not skipped. If an already stored path now produces different compressed genome content, Aeon rejects it rather than silently creating ambiguous metadata; delete it first if it is a replacement. Vectors scheduled for deletion in the same `update` command do not block a replacement insertion.
 
 ```bash
 aeon insert --prefix index_out --genome-list insert.txt
@@ -302,6 +304,8 @@ The default row comes from full classify runs. The other rows replay the rule ov
 - Vector IDs may change after deletion because live records are compacted.
 - Aeon rebuilds `.genomes.txt` and `.idmap.tsv` from rust-diskann's old-to-new ID mapping after every update.
 - `insert`, `delete`, and `update` finish with the same static format produced by `todisk`.
+- `todisk`, `insert`, and `update` exact-deduplicate normalized compressed genome content with the SHA-256 third field of `.idmap.tsv` before graph construction or insertion; canonical metadata retains the first supplied genome path. Equal approximate MinHash sketches remain separate nodes unless their genome-content hashes match.
+- An older index with a two-column `.idmap.tsv` remains searchable. Its first insertion recomputes hashes from the stored genome paths and upgrades the map to three columns; delete-only updates do not read genome files.
 - `delete` and deletion-containing `update` commands are admitted only when the temporary landmark probe preserves every route that was reachable before the proposed batch; a deferred batch writes no replacement index.
 
 ## Benchmark

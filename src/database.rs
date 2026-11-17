@@ -12,16 +12,20 @@ use std::time::Instant;
 use crate::metadata::{
     PrefixParams, genomes_path, idmap_path, index_path, load_params, save_params,
 };
-use crate::sketch::sketch_from_params;
-use crate::utils::{read_list_file, write_genome_list, write_idmap_tsv};
+use crate::sketch::{
+    GenomeContentHash, SketchedGenome, genome_content_hashes_from_params,
+    sketch_and_hash_from_params, sketch_from_params,
+};
+use crate::utils::{read_idmap_content_hashes, read_list_file, write_genome_list, write_idmap_tsv};
 use crate::warmup::Warmup;
 
 pub(crate) fn build_database(
     prefix: &str,
-    genomes: &[String],
+    reference_list: &str,
     params: PrefixParams,
 ) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
+    let genomes = read_list_file(reference_list)?;
     if genomes.is_empty() {
         return Err("reference list is empty".into());
     }
@@ -36,11 +40,7 @@ pub(crate) fn build_database(
         params.max_degree,
         params.build_beam_width
     );
-    let mut unique = HashSet::with_capacity(genomes.len());
-    for genome in genomes {
-        if !unique.insert(genome.as_str()) {
-            return Err(format!("reference list contains duplicate path: {genome}").into());
-        }
+    for genome in &genomes {
         if !Path::new(genome).is_file() {
             return Err(
                 format!("reference genome does not exist or is not a file: {genome}").into(),
@@ -48,7 +48,20 @@ pub(crate) fn build_database(
         }
     }
 
-    let vectors = sketch_from_params(&genomes, &params);
+    let records = sketch_and_hash_from_params(&genomes, &params);
+    let no_existing_hashes = HashSet::new();
+    let CanonicalGenomes {
+        paths: genomes,
+        vectors,
+        hashes,
+        report,
+    } = canonicalize_genomes(genomes, records, &no_existing_hashes);
+    if report.skipped_total() > 0 {
+        eprintln!(
+            "Deduplicated reference genomes by content hash: requested={}, unique={}, skipped_within_input={}",
+            report.requested, report.unique, report.skipped_within_input
+        );
+    }
     let diskann_params = DiskAnnParams {
         max_degree: params.max_degree,
         build_beam_width: params.build_beam_width,
@@ -63,7 +76,7 @@ pub(crate) fn build_database(
     )?;
     sanity_check_index_mapping(&index, &vectors, 3, params.build_beam_width);
     write_genome_list(&genomes_path(prefix), &genomes)?;
-    write_idmap_tsv(&idmap_path(prefix), &genomes)?;
+    write_idmap_tsv(&idmap_path(prefix), &genomes, Some(&hashes))?;
     save_params(prefix, &params)?;
     eprintln!(
         "Built database: prefix={}, genomes={}, elapsed={:.3}s",
@@ -94,21 +107,18 @@ pub(crate) fn update_database(
         .filter(|(id, _)| !deleted_ids.contains(&(*id as u32)))
         .map(|(_, name)| name.as_str())
         .collect::<HashSet<_>>();
-    let mut inserted = HashSet::with_capacity(insert_paths.len());
     for path in &insert_paths {
         if !Path::new(path).is_file() {
             return Err(format!("insert genome does not exist or is not a file: {path}").into());
         }
-        if !inserted.insert(path.as_str()) {
-            return Err(format!("insert list contains duplicate path: {path}").into());
-        }
-        if retained_names.contains(path.as_str()) {
-            return Err(format!("genome is already present and not being deleted: {path}").into());
-        }
     }
 
-    let insertion_count = insert_paths.len();
-    let insert_vectors = sketch_from_params(&insert_paths, &params);
+    let requested_insertion_count = insert_paths.len();
+    let insert_records = if insert_paths.is_empty() {
+        Vec::new()
+    } else {
+        sketch_and_hash_from_params(&insert_paths, &params)
+    };
     let source = DiskANN::<u16, DistHamming>::open_index_with(&index_path(prefix), DistHamming)?;
     if source.num_vectors != old_genomes.len() {
         return Err(format!(
@@ -118,7 +128,59 @@ pub(crate) fn update_database(
         )
         .into());
     }
-    let final_count = old_genomes.len() - delete_ids.len() + insert_paths.len();
+    let old_hashes = if insert_paths.is_empty() {
+        read_idmap_content_hashes(&idmap_path(prefix), &old_genomes)?
+    } else {
+        Some(load_or_recompute_genome_hashes(
+            prefix,
+            &old_genomes,
+            &params,
+        )?)
+    };
+    let retained_hashes = old_hashes
+        .as_ref()
+        .map(|hashes| {
+            hashes
+                .iter()
+                .enumerate()
+                .filter(|(id, _)| !deleted_ids.contains(&(*id as u32)))
+                .map(|(_, hash)| *hash)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let CanonicalGenomes {
+        paths: insert_paths,
+        vectors: insert_vectors,
+        hashes: insert_hashes,
+        report: insertion_dedup,
+    } = canonicalize_genomes(insert_paths, insert_records, &retained_hashes);
+    let insertion_count = insert_paths.len();
+    if let Some(path) = insert_paths
+        .iter()
+        .find(|path| retained_names.contains(path.as_str()))
+    {
+        return Err(format!(
+            "genome path is already present with different compressed genome content: {path}; delete it before inserting a replacement"
+        )
+        .into());
+    }
+    if insertion_dedup.skipped_total() > 0 {
+        eprintln!(
+            "Deduplicated insertion genomes by content hash: requested={}, unique={}, skipped_existing={}, skipped_within_input={}",
+            insertion_dedup.requested,
+            insertion_dedup.unique,
+            insertion_dedup.skipped_existing,
+            insertion_dedup.skipped_within_input
+        );
+    }
+    if delete_ids.is_empty() && insert_vectors.is_empty() {
+        eprintln!(
+            "No unique genome-content hashes to insert; database remains unchanged (requested={requested_insertion_count})"
+        );
+        return Ok(());
+    }
+
+    let final_count = old_genomes.len() - delete_ids.len() + insertion_count;
     if final_count == 0 {
         return Err("an update cannot produce an empty database".into());
     }
@@ -126,16 +188,22 @@ pub(crate) fn update_database(
     let work_path = format!("{prefix}.aeon-work-{}", std::process::id());
     let temporary_index = format!("{}.aeon-next-{}", index_path(prefix), std::process::id());
     eprintln!(
-        "Updating database: prefix={}, current={}, delete={}, insert={}, final={}",
+        "Updating database: prefix={}, current={}, delete={}, insert_requested={}, insert_unique={}, final={}",
         prefix,
         old_genomes.len(),
         delete_ids.len(),
+        requested_insertion_count,
         insertion_count,
         final_count
     );
     let mut update = source.begin_updates(capacity, params.alpha, &work_path)?;
     let mut slot_names = old_genomes.into_iter().map(Some).collect::<Vec<_>>();
     slot_names.resize(capacity, None);
+    let mut slot_hashes = old_hashes.map(|hashes| {
+        let mut slots = hashes.into_iter().map(Some).collect::<Vec<_>>();
+        slots.resize(capacity, None);
+        slots
+    });
 
     if !delete_ids.is_empty() {
         let guard = update.routability_guard_status()?;
@@ -169,6 +237,9 @@ pub(crate) fn update_database(
         };
         for id in &delete_ids {
             slot_names[*id as usize] = None;
+            if let Some(hashes) = &mut slot_hashes {
+                hashes[*id as usize] = None;
+            }
         }
         let recovered: usize = stats.iter().map(|stat| stat.recovered_in_neighbors).sum();
         let candidates: usize = stats.iter().map(|stat| stat.repair_candidates).sum();
@@ -183,10 +254,17 @@ pub(crate) fn update_database(
     if !insert_vectors.is_empty() {
         let beam = beam_width.unwrap_or(params.build_beam_width);
         let inserted_ids = update.insert_batch(insert_vectors, beam)?;
-        for (id, name) in inserted_ids.into_iter().zip(insert_paths) {
+        for ((id, name), hash) in inserted_ids
+            .into_iter()
+            .zip(insert_paths)
+            .zip(insert_hashes)
+        {
             slot_names[id as usize] = Some(name);
+            if let Some(hashes) = &mut slot_hashes {
+                hashes[id as usize] = Some(hash);
+            }
         }
-        eprintln!("Inserted {insertion_count} genomes with beam {beam}");
+        eprintln!("Inserted {insertion_count} unique genomes with beam {beam}");
     }
 
     let (committed, old_to_new) = update.commit_updates_to_static(&temporary_index)?;
@@ -198,8 +276,17 @@ pub(crate) fn update_database(
         .into());
     }
     let new_genomes = rebuild_genome_order(&slot_names, &old_to_new, final_count)?;
+    let new_hashes = match slot_hashes {
+        Some(slot_hashes) => Some(rebuild_hash_order(&slot_hashes, &old_to_new, final_count)?),
+        None => None,
+    };
     drop(committed);
-    install_updated_files(prefix, &temporary_index, &new_genomes)?;
+    install_updated_files(
+        prefix,
+        &temporary_index,
+        &new_genomes,
+        new_hashes.as_deref(),
+    )?;
     eprintln!(
         "Updated database: prefix={}, genomes={}, elapsed={:.3}s",
         prefix,
@@ -207,6 +294,89 @@ pub(crate) fn update_database(
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GenomeDedupReport {
+    requested: usize,
+    unique: usize,
+    skipped_existing: usize,
+    skipped_within_input: usize,
+}
+
+impl GenomeDedupReport {
+    fn skipped_total(&self) -> usize {
+        self.skipped_existing + self.skipped_within_input
+    }
+}
+
+#[derive(Debug)]
+struct CanonicalGenomes {
+    paths: Vec<String>,
+    vectors: Vec<Vec<u16>>,
+    hashes: Vec<GenomeContentHash>,
+    report: GenomeDedupReport,
+}
+
+/// Retains only the first appearance of a SHA-256 genome-content hash. Unlike
+/// b-bit MinHash equality, this does not merge merely similar genomes that
+/// happen to produce the same approximate sketch.
+fn canonicalize_genomes(
+    paths: Vec<String>,
+    records: Vec<SketchedGenome>,
+    existing_hashes: &HashSet<GenomeContentHash>,
+) -> CanonicalGenomes {
+    assert_eq!(
+        paths.len(),
+        records.len(),
+        "each path needs one sketch record"
+    );
+    let requested = paths.len();
+    let mut canonical_paths = Vec::with_capacity(requested);
+    let mut canonical_vectors = Vec::with_capacity(requested);
+    let mut canonical_hashes = Vec::with_capacity(requested);
+    let mut seen_in_input = HashSet::with_capacity(requested);
+    let mut report = GenomeDedupReport {
+        requested,
+        ..GenomeDedupReport::default()
+    };
+
+    for (path, record) in paths.into_iter().zip(records) {
+        if existing_hashes.contains(&record.content_hash) {
+            report.skipped_existing += 1;
+            continue;
+        }
+        if !seen_in_input.insert(record.content_hash) {
+            report.skipped_within_input += 1;
+            continue;
+        }
+        canonical_paths.push(path);
+        canonical_vectors.push(record.vector);
+        canonical_hashes.push(record.content_hash);
+    }
+    report.unique = canonical_paths.len();
+    CanonicalGenomes {
+        paths: canonical_paths,
+        vectors: canonical_vectors,
+        hashes: canonical_hashes,
+        report,
+    }
+}
+
+fn load_or_recompute_genome_hashes(
+    prefix: &str,
+    genomes: &[String],
+    params: &PrefixParams,
+) -> Result<Vec<GenomeContentHash>, Box<dyn Error>> {
+    if let Some(hashes) = read_idmap_content_hashes(&idmap_path(prefix), genomes)? {
+        return Ok(hashes);
+    }
+    eprintln!(
+        "Genome content hashes are absent from {}. Recomputing hashes from {} stored genomes",
+        idmap_path(prefix),
+        genomes.len()
+    );
+    Ok(genome_content_hashes_from_params(genomes, params))
 }
 
 fn discard_update_workspace(work_path: &str) {
@@ -364,16 +534,41 @@ fn rebuild_genome_order(
         .collect()
 }
 
+fn rebuild_hash_order(
+    slot_hashes: &[Option<GenomeContentHash>],
+    old_to_new: &[Option<u32>],
+    expected: usize,
+) -> Result<Vec<GenomeContentHash>, Box<dyn Error>> {
+    let mut hashes = vec![None; expected];
+    for (old_id, new_id) in old_to_new.iter().enumerate() {
+        if let Some(new_id) = new_id {
+            let hash = slot_hashes
+                .get(old_id)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| format!("missing genome content hash for live slot {old_id}"))?;
+            hashes[*new_id as usize] = Some(*hash);
+        }
+    }
+    hashes
+        .into_iter()
+        .enumerate()
+        .map(|(id, hash)| {
+            hash.ok_or_else(|| format!("missing genome content hash for new ID {id}").into())
+        })
+        .collect()
+}
+
 fn install_updated_files(
     prefix: &str,
     temporary_index: &str,
     genomes: &[String],
+    hashes: Option<&[GenomeContentHash]>,
 ) -> Result<(), Box<dyn Error>> {
     let suffix = format!("aeon-next-{}", std::process::id());
     let temporary_genomes = format!("{}.{}", genomes_path(prefix), suffix);
     let temporary_idmap = format!("{}.{}", idmap_path(prefix), suffix);
     write_genome_list(&temporary_genomes, genomes)?;
-    write_idmap_tsv(&temporary_idmap, genomes)?;
+    write_idmap_tsv(&temporary_idmap, genomes, hashes)?;
     fs::rename(&temporary_genomes, genomes_path(prefix))?;
     fs::rename(&temporary_idmap, idmap_path(prefix))?;
     fs::rename(temporary_index, index_path(prefix))?;
@@ -492,5 +687,68 @@ mod tests {
     fn ani_is_bounded_at_extreme_jaccards() {
         assert_eq!(ani_from_jaccard(0.0, 16), 0.0);
         assert_eq!(ani_from_jaccard(1.0, 16), 1.0);
+    }
+
+    fn content_hash(value: u8) -> GenomeContentHash {
+        [value; 32]
+    }
+
+    fn record(vector: Vec<u16>, hash: u8) -> SketchedGenome {
+        SketchedGenome {
+            vector,
+            content_hash: content_hash(hash),
+        }
+    }
+
+    #[test]
+    fn content_hash_dedup_preserves_first_without_merging_equal_sketches() {
+        let result = canonicalize_genomes(
+            vec![
+                "first".into(),
+                "different-content".into(),
+                "duplicate".into(),
+            ],
+            vec![
+                record(vec![1, 2, 3], 7),
+                record(vec![1, 2, 3], 8),
+                record(vec![9, 9, 9], 7),
+            ],
+            &HashSet::new(),
+        );
+
+        assert_eq!(result.paths, vec!["first", "different-content"]);
+        assert_eq!(result.vectors, vec![vec![1, 2, 3], vec![1, 2, 3]]);
+        assert_eq!(result.hashes, vec![content_hash(7), content_hash(8)]);
+        assert_eq!(
+            result.report,
+            GenomeDedupReport {
+                requested: 3,
+                unique: 2,
+                skipped_existing: 0,
+                skipped_within_input: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn existing_content_hash_is_not_reinserted() {
+        let existing = HashSet::from([content_hash(3)]);
+        let result = canonicalize_genomes(
+            vec!["existing-copy".into(), "new-genome".into()],
+            vec![record(vec![4, 5], 3), record(vec![4, 5], 4)],
+            &existing,
+        );
+
+        assert_eq!(result.paths, vec!["new-genome"]);
+        assert_eq!(result.hashes, vec![content_hash(4)]);
+        assert_eq!(
+            result.report,
+            GenomeDedupReport {
+                requested: 2,
+                unique: 1,
+                skipped_existing: 1,
+                skipped_within_input: 0,
+            }
+        );
     }
 }

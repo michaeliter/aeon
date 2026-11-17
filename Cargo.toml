@@ -1,6 +1,6 @@
 [package]
 name = "rust-aeon"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 authors = ["Jianshu Zhao <jianshuzhao@yahoo.com>"]
 repository = "https://github.com/jianshu93/aeon"
@@ -29,6 +29,7 @@ num-traits = "0.2.19"
 kmerutils = { git = "https://github.com/jianshu93/kmerutils", features = ["stdsimd"] }
 anndists = { version = "0.1.4", features = ["stdsimd"] }
 # anndists = { git = "https://github.com/jianshu93/anndists", features = ["stdsimd"] }
+sha2 = "0.10"
 xxhash-rust = { version = "0.8", features = [ "std", "xxh3" ] }
 rust-diskann = { git = "https://github.com/jianshu93/rust-diskann" }
 # rust-diskann = { git = "https://github.com/jianshu93/rust-diskann", rev = "1450b51c0094ddfe0b0af5afada266ad53a07aa8" }

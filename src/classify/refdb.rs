@@ -131,8 +131,14 @@ impl ClassifyDb {
             )
         })?;
         let (nt, aa) = (Index::open(&dir, NT_PREFIX)?, Index::open(&dir, AA_PREFIX)?);
-        if nt.len() != aa.len() {
-            return Err("amino-acid and nucleotide indexes have different sizes".into());
+        // Proteome hits are named through the nucleotide index, so the two
+        // must list the same references in the same order. Index builds drop
+        // exact-content duplicates, which could leave them out of step.
+        if nt.accessions != aa.accessions {
+            return Err(
+                "amino-acid and nucleotide indexes list different references; rebuild the database"
+                    .into(),
+            );
         }
         let reference_dir = dir.join(REFERENCE_DIR);
         let file = |name: &str| reference_dir.join(name).to_string_lossy().into_owned();
@@ -231,10 +237,7 @@ pub(crate) fn build_classify_db(
     // The nucleotide index needs only the genomes, so it builds while the
     // proteomes, protein index and marker index are prepared.
     let (nt, rest) = rayon::join(
-        || {
-            build_database(&db.join(NT_PREFIX).to_string_lossy(), &genomes, params.nt)
-                .map_err(|error| error.to_string())
-        },
+        || build_index(&db.join(NT_PREFIX), &genomes, params.nt).map_err(|error| error.to_string()),
         || -> Result<_, String> {
             let proteomes = match proteins {
                 ProteinSource::List(list) => read_list_file(&list)
@@ -248,7 +251,7 @@ pub(crate) fn build_classify_db(
             .map_err(|error| error.to_string())?;
             let (aa, markers) = rayon::join(
                 || {
-                    build_database(&db.join(AA_PREFIX).to_string_lossy(), &proteomes, params.aa)
+                    build_index(&db.join(AA_PREFIX), &proteomes, params.aa)
                         .map_err(|error| error.to_string())
                 },
                 || {
@@ -262,12 +265,8 @@ pub(crate) fn build_classify_db(
                         db,
                     )
                     .map_err(|error| error.to_string())?;
-                    build_database(
-                        &db.join(MARKER_PREFIX).to_string_lossy(),
-                        &markers,
-                        params.markers,
-                    )
-                    .map_err(|error| error.to_string())?;
+                    build_index(&db.join(MARKER_PREFIX), &markers, params.markers)
+                        .map_err(|error| error.to_string())?;
                     Ok::<_, String>(markers)
                 },
             );
@@ -416,6 +415,27 @@ fn write_reference_markers(
 
 /// Paths stored in the database must not depend on the directory classify
 /// runs from.
+/// Build the aeon index at `prefix` over `paths`. `build_database` reads its
+/// inputs from a list file, so the paths are written to one beside the index
+/// for the build.
+fn build_index(
+    prefix: &Path,
+    paths: &[String],
+    params: PrefixParams,
+) -> Result<(), Box<dyn Error>> {
+    let prefix = prefix.to_string_lossy();
+    let list = format!("{prefix}.inputs.txt");
+    let mut writer = BufWriter::new(File::create(&list)?);
+    for path in paths {
+        writeln!(writer, "{path}")?;
+    }
+    writer.flush()?;
+    drop(writer);
+    let built = build_database(&prefix, &list, params);
+    fs::remove_file(&list)?;
+    built
+}
+
 fn absolute_paths(paths: Vec<String>) -> Result<Vec<String>, Box<dyn Error>> {
     paths
         .into_iter()
