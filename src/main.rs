@@ -519,6 +519,13 @@ fn build_cli() -> Command {
                         .value_parser(clap::value_parser!(f64))
                         .help("AAI points by which the closest reference must beat every other genus (or family) to assign it"),
                 )
+                .arg(
+                    Arg::new("sketch_genus_aai")
+                        .long("sketch-genus-aai")
+                        .value_name("PERCENT")
+                        .value_parser(clap::value_parser!(f64))
+                        .help("Assign the genus without DIAMOND when the closest reference's proteome sketch estimate reaches PERCENT (80 tested) and beats every other genus by --aai-margin [default: off]"),
+                )
                 .args(fgs_args())
                 .arg(
                     Arg::new("diamond")
@@ -660,6 +667,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             genus_aai: *args.get_one("genus_aai").unwrap(),
             family_aai: *args.get_one("family_aai").unwrap(),
             aai_margin: *args.get_one("aai_margin").unwrap(),
+            sketch_genus_aai: args.get_one("sketch_genus_aai").copied(),
             fgs: args.get_one::<String>("fgs").unwrap().clone(),
             fgs_train_dir: args.get_one::<String>("fgs_train_dir").cloned(),
             diamond: args.get_one::<String>("diamond").unwrap().clone(),

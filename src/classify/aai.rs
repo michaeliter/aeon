@@ -18,6 +18,7 @@ use std::process::Command;
 use needletail::parse_fastx_file;
 use rayon::prelude::*;
 
+use crate::classify::ani::sketch_ani;
 use crate::classify::external::run;
 use crate::classify::genes::write_fasta_record;
 use crate::classify::refdata::GtdbtkData;
@@ -448,6 +449,33 @@ pub(crate) fn decide(
     call(family_aai, 5).map_or(AaiDecision::Unresolved, AaiDecision::Family)
 }
 
+/// `decide`'s genus rule applied to the proteome sketch estimates of the
+/// candidates, so a genome with a clearly closest genus skips DIAMOND.
+/// Family calls always need DIAMOND. `candidates` are sorted by ascending
+/// sketch distance.
+pub(crate) fn decide_from_sketch(
+    candidates: &[(u32, f32)],
+    kmer_size: usize,
+    accessions: &[String],
+    data: &GtdbtkData,
+    genus_aai: f64,
+    margin: f64,
+) -> Option<(Vec<AaiHit>, AaiDecision)> {
+    let hits = candidates
+        .iter()
+        .map(|&(reference, distance)| AaiHit {
+            reference,
+            // Mash's k-mer survival model at the proteome sketch's k.
+            aai: sketch_ani(distance, kmer_size),
+            sd: f64::NAN,
+            reciprocal_hits: 0,
+            min_proteins: 0,
+        })
+        .collect::<Vec<_>>();
+    let decision = decide(&hits, accessions, data, genus_aai, f64::INFINITY, margin);
+    matches!(decision, AaiDecision::Genus(_)).then_some((hits, decision))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,7 +529,25 @@ mod tests {
     }
 
     #[test]
-    fn margin_decides_genus_then_family() {
+    fn sketch_assigns_only_a_clearly_closest_genus() {
+        let (accessions, data) = genera();
+        let decide = |candidates: &[(u32, f32)]| {
+            decide_from_sketch(candidates, 7, &accessions, &data, 80.0, 5.0)
+                .map(|(_, decision)| decision)
+        };
+        // Jaccard 0.5 at k=7 estimates 94.2%; 0.05 estimates 66.4%.
+        let Some(AaiDecision::Genus(call)) = decide(&[(0, 0.5), (1, 0.95)]) else {
+            panic!("expected a genus call");
+        };
+        assert_eq!(call.taxonomy, "d__Bacteria;p__P;c__C;o__O;f__F;g__A");
+        assert!((call.aai - 94.2).abs() < 0.1);
+        // Another genus within the margin, or a lone family-level estimate,
+        // leaves the call to DIAMOND.
+        assert_eq!(decide(&[(0, 0.5), (1, 0.52)]), None);
+        assert_eq!(decide(&[(0, 0.9)]), None);
+    }
+
+    fn genera() -> (Vec<String>, GtdbtkData) {
         let mut data = GtdbtkData::default();
         let taxa = [
             ("GCF_000000001.1", "f__F;g__A"),
@@ -518,6 +564,12 @@ mod tests {
             );
         }
         let accessions = taxa.iter().map(|(a, _)| a.to_string()).collect::<Vec<_>>();
+        (accessions, data)
+    }
+
+    #[test]
+    fn margin_decides_genus_then_family() {
+        let (accessions, data) = genera();
         let aai = |reference, aai| AaiHit {
             reference,
             aai,
