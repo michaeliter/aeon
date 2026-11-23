@@ -65,11 +65,10 @@ fn bin_dir_arg() -> Arg {
         .help("Directory holding hmmsearch and hmmalign (default: search PATH)")
 }
 
-/// Parameters of the "nt", "aa" or "markers" index of a classify database.
+/// Parameters of the "nt" or "aa" index of a classify database.
 fn classify_index_params(args: &clap::ArgMatches, index: &str) -> PrefixParams {
     let (kmer_size, sketch_size, seq_type) = match index {
         "aa" => ("aa_kmer_size", "aa_sketch_size", "aa"),
-        "markers" => ("marker_kmer_size", "marker_sketch_size", "aa"),
         _ => ("kmer_size", "sketch_size", "dna"),
     };
     PrefixParams {
@@ -294,7 +293,7 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("classify-db")
                 .about("Build a reference database for aeon classify (GTDB, WoL2 or any genome collection with a taxonomy)")
-                .long_about("Build the three aeon indexes aeon classify searches, over a set of reference genomes (e.g. GTDB species representatives or WoL2): their genomes (nucleotide k-mers), their proteomes (amino-acid k-mers), and their concatenated bac120/ar53 marker genes (amino-acid k-mers). Inputs are the genomes (--genome-list), their taxonomy (--taxonomy, e.g. GTDB's bac120_taxonomy_r232.tsv.gz and ar53_taxonomy_r232.tsv.gz, or WoL2's lineages.txt) and optionally their proteomes (--protein-list; otherwise genes are called with FragGeneScanRs) and species radii (--radii; otherwise 95%). Marker genes are extracted with hmmsearch and hmmalign using the GTDB R232 marker HMMs bundled with aeon. Alternatively --gtdbtk-data supplies taxonomy, radii, marker HMMs, masks and the reference MSA from a GTDB-Tk reference data package. The database keeps its own copy of the taxonomy, radii and marker HMMs. Reference files must be named by genome ID (e.g. GCF_000005845.2_genomic.fna.gz or G000005825.fna.xz) and must stay at their listed paths, because classify computes exact ANI and AAI against them.")
+                .long_about("Build the two aeon indexes aeon classify searches, over a set of reference genomes (e.g. GTDB species representatives or WoL2): their genomes (nucleotide k-mers) and their proteomes (amino-acid k-mers); and their masked bac120/ar53 marker alignment, with the marker radius of each taxon from phylum to genus. Inputs are the genomes (--genome-list), their taxonomy (--taxonomy, e.g. GTDB's bac120_taxonomy_r232.tsv.gz and ar53_taxonomy_r232.tsv.gz, or WoL2's lineages.txt) and optionally their proteomes (--protein-list; otherwise genes are called with FragGeneScanRs) and species radii (--radii; otherwise 95%). Marker genes are extracted with hmmsearch and hmmalign using the GTDB R232 marker HMMs bundled with aeon. Alternatively --gtdbtk-data supplies taxonomy, radii, marker HMMs, masks and the reference MSA from a GTDB-Tk reference data package. The database keeps its own copy of the taxonomy, radii, marker alignment and marker HMMs. Reference files must be named by genome ID (e.g. GCF_000005845.2_genomic.fna.gz or G000005825.fna.xz) and must stay at their listed paths, because classify computes exact ANI and AAI against them.")
                 .arg(
                     Arg::new("db")
                         .long("db")
@@ -355,22 +354,6 @@ fn build_cli() -> Command {
                         .help("Nucleotide k-mer length"),
                 )
                 .arg(
-                    Arg::new("marker_kmer_size")
-                        .long("marker-kmer-size")
-                        .default_value("5")
-                        .value_name("K")
-                        .value_parser(clap::value_parser!(usize))
-                        .help("Amino-acid k-mer length for the marker-gene index"),
-                )
-                .arg(
-                    Arg::new("marker_sketch_size")
-                        .long("marker-sketch-size")
-                        .default_value("3000")
-                        .value_name("N")
-                        .value_parser(clap::value_parser!(usize))
-                        .help("Number of u16 values in each marker-gene MinHash sketch"),
-                )
-                .arg(
                     Arg::new("aa_kmer_size")
                         .long("aa-kmer-size")
                         .default_value("7")
@@ -424,7 +407,7 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("classify")
                 .about("Classify genomes against an aeon classify-db reference database, with GTDB-Tk-compatible output")
-                .long_about("Classify genomes in a cascade over the three indexes of an aeon classify-db. (1) Genome sketch search proposes the closest reference genomes. When only one has a sketch ANI of at least --min-sketch-ani and that estimate reaches its species radius, the genome gets that species; when several do, or the estimate falls short, TurboANI computes their exact ANI and AF and GTDB-Tk's ANI screen rule decides (closest reference with AF >= --min_af, within its species radius, 95% by default). (2) Remaining genomes have genes called with FragGeneScanRs (complete-genome model); proteome sketch search finds the --aai-candidates closest reference proteomes and estimates AAI from the sketch (with --diamond-aai, DIAMOND reciprocal best hits against the --candidates closest give AAI instead). The closest reference's genus (>= --genus-aai) or else family (>= --family-aai) is assigned when its AAI beats every reference of another genus (family) by at least --aai-margin points; when the candidates all share its taxon, it must lead the last candidate by the margin. (3) Genomes still unresolved have their bac120/ar53 marker genes extracted with hmmsearch and hmmalign as in GTDB-Tk; the masked concatenated markers are searched against the marker index, and the closest reference's lineage down to order is assigned. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, identify/, align/, classify/, and {prefix}.log.")
+                .long_about("Classify genomes in a cascade over an aeon classify-db. (1) Genome sketch search proposes the closest reference genomes. When only one has a sketch ANI of at least --min-sketch-ani and that estimate reaches its species radius, the genome gets that species; when several do, or the estimate falls short, TurboANI computes their exact ANI and AF and GTDB-Tk's ANI screen rule decides (closest reference with AF >= --min_af, within its species radius, 95% by default). (2) Remaining genomes have genes called with FragGeneScanRs (complete-genome model); proteome sketch search finds the --aai-candidates closest reference proteomes and estimates AAI from the sketch (with --diamond-aai, DIAMOND reciprocal best hits against the --candidates closest give AAI instead). The closest reference's genus (>= --genus-aai) or else family (>= --family-aai) is assigned when its AAI beats every reference of another genus (family) by at least --aai-margin points; when the candidates all share its taxon, it must lead the last candidate by the margin. (3) Genomes still unresolved have their bac120/ar53 marker genes extracted with hmmsearch and hmmalign as in GTDB-Tk; the masked concatenated markers are compared with every reference of the same marker set, and the lineage shared by the references tied with the closest is assigned from the phylum down to the genus, while the identity to the closest reaches each taxon's sibling radius. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, identify/, align/, classify/, and {prefix}.log.")
                 .arg(
                     Arg::new("db")
                         .long("db")
@@ -488,14 +471,6 @@ fn build_cli() -> Command {
                         .help("Sketch-estimated ANI a candidate needs to be considered for a species call; incomplete genomes lower the estimate"),
                 )
                 .arg(
-                    Arg::new("min_marker_identity")
-                        .long("min-marker-identity")
-                        .default_value("25")
-                        .value_name("PERCENT")
-                        .value_parser(clap::value_parser!(f64))
-                        .help("Sketch-estimated marker identity a marker-index hit needs; below it a genome stays unclassified past its domain"),
-                )
-                .arg(
                     Arg::new("genus_aai")
                         .long("genus-aai")
                         .default_value("65")
@@ -557,7 +532,7 @@ fn build_cli() -> Command {
                         .default_value("10")
                         .value_name("N")
                         .value_parser(clap::value_parser!(usize))
-                        .help("Sketch-search candidates per genome in the genome and marker indexes, and in the proteome index with --diamond-aai"),
+                        .help("Sketch-search candidates per genome in the genome index, and in the proteome index with --diamond-aai"),
                 )
                 .arg(
                     Arg::new("beam_width")
@@ -652,7 +627,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             IndexParams {
                 nt: classify_index_params(args, "nt"),
                 aa: classify_index_params(args, "aa"),
-                markers: classify_index_params(args, "markers"),
             },
         )?,
         "classify" => classify_genomes(&ClassifyOptions {
@@ -670,7 +644,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             candidates: *args.get_one("candidates").unwrap(),
             beam_width: *args.get_one("beam_width").unwrap(),
             min_sketch_ani: *args.get_one("min_sketch_ani").unwrap(),
-            min_marker_identity: *args.get_one("min_marker_identity").unwrap(),
             genus_aai: *args.get_one("genus_aai").unwrap(),
             family_aai: *args.get_one("family_aai").unwrap(),
             aai_margin: *args.get_one("aai_margin").unwrap(),

@@ -144,25 +144,24 @@ Search options:
 | `--output <FILE>` | stdout | Write tab-separated results to a file. |
 | `--no-preload` | off | Search the index straight from disk without first reading it into the page cache (see below). |
 
-**Index warm-up.** Search memory-maps the index and walks its graph in random order, so on a cold page cache every step waits on a random disk read. On GTDB-sized indexes on HPC storage a cold search ran about 240 times slower than a warm one, while reading the whole file in order took about 3 s. Search therefore reads the index front to back into the page cache in a background thread while the queries are sketched, then searches it from memory; `aeon classify` does the same for its three indexes, in the order it searches them. On Linux the read is skipped when the index does not fit in the memory available to the process (`MemAvailable`, capped by the job's cgroup limit, e.g. under Slurm; cached files count as free), and the search then reads pages on demand as before. Elsewhere it always runs. Results are the same either way. Use `--no-preload` to turn it off, e.g. when the index is already cached or memory is better spent on other work.
+**Index warm-up.** Search memory-maps the index and walks its graph in random order, so on a cold page cache every step waits on a random disk read. On GTDB-sized indexes on HPC storage a cold search ran about 240 times slower than a warm one, while reading the whole file in order took about 3 s. Search therefore reads the index front to back into the page cache in a background thread while the queries are sketched, then searches it from memory; `aeon classify` does the same for its two indexes, in the order it searches them. On Linux the read is skipped when the index does not fit in the memory available to the process (`MemAvailable`, capped by the job's cgroup limit, e.g. under Slurm; cached files count as free), and the search then reads pages on demand as before. Elsewhere it always runs. Results are the same either way. Use `--no-preload` to turn it off, e.g. when the index is already cached or memory is better spent on other work.
 
 ### Classify
 
-`aeon classify` assigns genomes the taxonomy of a reference database and writes GTDB-Tk 2.8 `classify_wf` outputs: `{prefix}.bac120.summary.tsv`, `{prefix}.ar53.summary.tsv`, and the `identify/`, `align/` and `classify/` directories with GTDB-Tk's file names and columns. aeon has no pplacer, RED or reference-tree step. Below species it classifies by AAI and by a search of marker genes.
+`aeon classify` assigns genomes the taxonomy of a reference database and writes GTDB-Tk 2.8 `classify_wf` outputs: `{prefix}.bac120.summary.tsv`, `{prefix}.ar53.summary.tsv`, and the `identify/`, `align/` and `classify/` directories with GTDB-Tk's file names and columns. aeon has no pplacer, RED or reference-tree step. Below species it classifies by AAI and by marker-gene identity.
 
 The reference database can be any collection of bacterial and archaeal genomes with a rank-prefixed taxonomy:
 - **GTDB:** built from the GTDB species representatives, aeon is a drop-in replacement for GTDB-Tk. Results should be close to GTDB-Tk's, but the method differs.
 - **Other collections:** for example WoL2, or a custom genome set.
 
-**Three indexes.** `aeon classify-db` builds three aeon indexes over the reference genomes, and every classify run uses all three:
+**Two indexes and a marker alignment.** `aeon classify-db` builds two aeon indexes over the reference genomes, and the masked bac120/ar53 marker alignment of the references with a marker radius for each taxon:
 
 | Index | Sequences | k-mers | Sketch size |
 |---|---|---|---|
 | `nt` | reference genomes | nucleotide, k=16 (`-k`) | 15,000 (`-s`) |
 | `aa` | reference proteomes | amino acid, k=7 (`--aa-kmer-size`) | 10,000 (`--aa-sketch-size`) |
-| `markers` | concatenated bac120/ar53 marker genes (aligned as in GTDB-Tk, gaps removed) | amino acid, k=5 (`--marker-kmer-size`) | 3,000 (`--marker-sketch-size`) |
 
-All three graphs are built with max degree 128 (`--max-degree`), construction beam 512 (`--build-beam-width`) and alpha 1.2 (`--alpha`).
+Both graphs are built with max degree 128 (`--max-degree`), construction beam 512 (`--build-beam-width`) and alpha 1.2 (`--alpha`).
 
 **Inputs:**
 
@@ -180,7 +179,8 @@ All three graphs are built with max degree 128 (`--max-degree`), construction be
 - **Reference marker genes:** extracted with hmmsearch and hmmalign on the reference proteomes, the same way as for queries.
 - **Marker sets:** the GTDB bac120/ar53 markers are universal bacterial and archaeal genes, so the marker step works for any reference collection. A reference counts as archaeal if its domain is `d__Archaea`.
 - **`--gtdbtk-data DIR`** (GTDB-Tk compatibility): optionally supplies the taxonomy, radii, marker HMMs, alignment masks and reference MSA from a GTDB-Tk package. Reference markers then come from the package's MSA, and queries and references are masked with GTDB's masks. `--taxonomy` and `--radii` override the package's files.
-- **Self-contained database:** the database keeps its own copy of the references' taxonomy, radii and marker HMMs in `reference_data/`, so `aeon classify` needs only `--db`.
+- **Marker radii:** computed at build from every pair of references in the same phylum with at least 500 comparable columns (see step 3). They are written to `reference_data/marker_radii.tsv`, with each taxon's sibling and nearest radius and the radius classify uses.
+- **Self-contained database:** the database keeps its own copy of the references' taxonomy, radii, marker alignment and marker HMMs in `reference_data/`, so `aeon classify` needs only `--db`.
 
 **Cascade.** Each genome stops at the first step that resolves it:
 
@@ -202,15 +202,16 @@ All three graphs are built with max degree 128 (`--max-degree`), construction be
      - **When all the sketch candidates share its genus (or family),** every other reference is at most as close as the last candidate, so the closest reference must lead that candidate by the margin. Without this, a large genus could fill every candidate and leave no competitor. With `--diamond-aai`, a taxon that fills the 10 candidates is assigned on its AAI alone.
      - A rank the closest reference has no name for (e.g. `g__`) is never assigned.
      - **Otherwise** the genome goes to step 3.
-3. **hmmer marker extraction, marker search.**
+3. **hmmer marker extraction, marker identity and radii.**
    - hmmsearch and hmmalign extract the bac120/ar53 markers exactly as GTDB-Tk's `identify` and `align` steps do, with the same copy-number rules, domain call, mask and `--min_perc_aa` filter.
-   - The masked concatenated markers are searched against the marker index.
-   - Only hits from the genome's own domain (bac120 or ar53) count, and only at or above `--min-marker-identity` (25% estimated identity).
-   - The genome gets the closest such reference's lineage down to order.
-   - A genome with no such hit is left unclassified below its domain.
+   - The masked concatenated markers are compared with every reference of the same marker set. Identity counts the columns where both have one of the 20 standard amino acids; gaps, `X` and other letters are missing. A reference needs at least 500 such columns to be comparable.
+   - **Best match and ties:** the best match is the comparable reference with the highest identity (the first in alignment order on an exact tie). A reference is tied with it if its identity is within 1.96 standard errors of the difference, √(p₁(1−p₁)/n₁ + pᵢ(1−pᵢ)/nᵢ), where p is identity and n the column count.
+   - **Depth:** starting from the lineage the tied references share (domain to genus), each rank from the phylum down is assigned while the best identity reaches that taxon's radius. The call stops at the first rank it misses.
+   - **Radii:** a reference's sibling identity in a taxon is its highest identity to a member of a different child taxon, for example another genus of its family. The taxon's sibling radius is the lowest sibling identity among its members. A taxon with one child taxon, or no comparable sibling pairs, uses its nearest radius instead: the same over any other member. A taxon with neither, such as a genus with one reference, uses the median sibling radius of its rank.
+   - A genome with no comparable reference is left unclassified below its domain.
 
 **Design decisions:**
-- **pplacer is replaced by AAI and the marker search.** This removes the reference tree and its large memory requirement.
+- **pplacer is replaced by AAI and the marker comparison.** This removes the reference tree and its large memory requirement.
 - **FragGeneScanRs calls query genes in place of Prodigal/pyrodigal.** It is faster, and accurate enough for AAI and marker extraction. It runs as a separate program because it is GPL-3.0 and aeon is MIT. It translates with table 11 only, so `translation_table` is always 11. References use GTDB's precomputed Prodigal proteomes (`--protein-list`) when available; FragGeneScanRs calls their genes only when no proteomes are given.
   - FragGeneScanRs stops calling genes on a contig at its first ambiguous base (N or any other non-ACGT base). aeon therefore gives it each stretch of at least 120 unambiguous bases as a separate sequence, then maps gene IDs and GFF coordinates back to the contigs. Before this, a quarter of the holdout references lost genes this way, and a 4.5 Mb *Arthrobacter* genome with an N run 20 kb into its main contig gave 268 proteins instead of 4,145. Gene calling takes the same time either way.
 - **Species calls use each species' ANI radius**, by default 95%. With GTDB's radii (`--radii sp_clusters_r232.tsv`, or `--gtdbtk-data`) they match GTDB-Tk's ANI screen.
@@ -220,24 +221,22 @@ All three graphs are built with max degree 128 (`--max-degree`), construction be
 - **AAI comes from the proteome sketch by default.** DIAMOND measures AAI more precisely, but that does not make the calls better, because GTDB does not draw genus and family boundaries by AAI. On the holdouts below, the sketch estimate made as few or fewer wrong calls than DIAMOND, in about a sixth of the time. Sketch estimates run about 2 points above DIAMOND AAI, and fall by about 5 points at 50% completeness, against under 1 for DIAMOND. The margin compares references with each other, so a shift that affects them all alike barely changes the calls. `--diamond-aai` remains for when the AAI values themselves matter.
 - **Genus 65% AAI and family 45% AAI** are the defaults, the genus and family boundaries proposed by Konstantinidis, Rosselló-Móra & Amann ([ISME J 2017](https://doi.org/10.1038/ismej.2017.113)). With the AAI margin below, they made 4 wrong calls in the 104 training and validation queries, and 5 in the 103 independent ones.
 - **AAI calls use a margin, not a vote.** A novel genus sits about equally far from several genera in its family, so its closest reference leads the next genus by only a point or two. A genus that is in the database stands out from its neighbours. Unlike a majority vote among the closest references, the margin doesn't penalise genera with few representatives; many GTDB genera have only one.
-- **Marker-search calls stop at order**, using the closest marker reference's lineage.
-  - The 25% floor only rejects chance k-mer matches. Random marker sequences share almost no 5-mers (J ≈ 0.001).
-  - It does not separate distant phyla from real but fast-evolving relatives. In the holdouts, other phyla reached up to 56% estimated identity, and Mycoplasmatales matched their own order at 38–53%.
-  - So a genome from a phylum missing from the database still gets the order of its closest phylum.
+- **Marker calls go as deep as each taxon's sibling radius allows.** A genome of a genus missing from the database is about as close to its family's other genera as they are to one another, so it reaches the family's sibling radius but not its sister genus's. A fixed identity cutoff per rank cuts across taxa that evolve at different rates.
+- **Marker identity is scored against every reference.** A sketch search of 500 candidates found the best match 96% of the time at full GTDB size. Scoring all references finds it and every tie, and costs well under a second per genome (bac120 is about 137,000 references × 5,036 columns).
 
 **Output differences from GTDB-Tk:**
 - `pplacer_taxonomy` and `red_value` are always `N/A`.
-- For marker-search calls, `closest_placement_reference`, `closest_placement_radius` and `closest_placement_taxonomy` describe the closest marker reference.
+- For marker calls, `closest_placement_reference`, `closest_placement_radius` and `closest_placement_taxonomy` describe the best marker match.
 - `classification_method` is one of:
   - `ani_screen`;
   - `taxonomic classification defined by AAI`;
   - `taxonomic classification defined by marker gene search`.
 - Extra files:
   - `classify/aai/{prefix}.aai_summary.tsv`: every AAI hit. By default these are the sketch candidates' estimates, with `N/A` in the DIAMOND columns. With `--diamond-aai` they carry the SD of the reciprocal-best-hit identities, their count, and the smaller proteome's protein count;
-  - `classify/markers/{prefix}.marker_summary.tsv`: every marker-index hit, with an estimated marker identity.
+  - `classify/markers/{prefix}.marker_summary.tsv`: each genome's ten best marker matches and every reference tied with the best, with identity, column overlap and whether it is tied.
 - `align/` holds the user MSA only, not the full reference MSA.
 - `classify/ani_screen/{prefix}.ani_screen_unassigned_hits.tsv.gz` lists the TurboANI hits of genomes the ANI screen did not assign, so it covers only genomes whose sketch search found candidates.
-- `{prefix}.json` records aeon's steps under GTDB-Tk's four step names, so GTDB-Tk can read it. Gene calling and the marker HMM search count as `identify`; AAI and the marker-index search count as `classify`. Each step's duration is the time spent in it, and its `starts_at` and `ends_at` are its first start and last end.
+- `{prefix}.json` records aeon's steps under GTDB-Tk's four step names, so GTDB-Tk can read it. Gene calling and the marker HMM search count as `identify`; AAI and the marker comparison count as `classify`. Each step's duration is the time spent in it, and its `starts_at` and `ends_at` are its first start and last end.
 
 ```bash
 # External tools: HMMER, DIAMOND for --diamond-aai (environment.yml), and FragGeneScanRs.
@@ -281,7 +280,7 @@ A genus or family holdout has no reference of its true taxon, so the right answe
 | Proteome sketch (default) | Independent (103) | 50% | 4 | 88 | 11 |
 | `--diamond-aai` | Independent (103) | 50% | 9 | 84 | 10 |
 
-All rows come from full classify runs. The partial-genome rows keep a random 70% or 50% of each query in contig-sized pieces (median 15 kb). On the complete independent set, applying the margin over the sketch estimates of every reference, instead of the 50 candidates with the bound on the last one, gave the same counts. Two of the independent set's wrong calls are species calls that GTDB-Tk's ANI screen would make too: the withheld species sits 95.47% and 95.00% ANI from a sister species whose radius is 95%.
+All rows come from full classify runs with the earlier marker step, which gave every marker-tier genome its closest reference's order; the marker results below cover the current step. The partial-genome rows keep a random 70% or 50% of each query in contig-sized pieces (median 15 kb). On the complete independent set, applying the margin over the sketch estimates of every reference, instead of the 50 candidates with the bound on the last one, gave the same counts. Two of the independent set's wrong calls are species calls that GTDB-Tk's ANI screen would make too: the withheld species sits 95.47% and 95.00% ANI from a sister species whose radius is 95%.
 
 The margin table below uses DIAMOND AAI (`--diamond-aai`) over the training and validation sets (104 queries):
 
@@ -296,7 +295,16 @@ The margin table below uses DIAMOND AAI (`--diamond-aai`) over the training and 
 
 The 5-point row comes from full classify runs. The other rows replay the rule over the same AAI hits. The margin was chosen on these same queries while FragGeneScanRs was still losing genes at ambiguous bases (see the design decisions above). With complete proteomes, margins of 3, 5 and 7 points make the same number of wrong calls.
 
-- **Marker search:** in the default runs, all 39 order-level calls on the training and validation sets and all 31 on the independent set were correct.
+- **Marker step:** these holdouts withhold species, genera and families but never an order, so the closest reference's order is always right and they cannot show what the sibling radii are for: stopping above the order, or going below it, only as far as the references support. Marker-tier genomes (wrong / right / too shallow), with the default runs' nt and aa indexes:
+
+  | Marker step | Training + validation (39) | Independent (31) |
+  |---|---|---|
+  | Closest reference's order (earlier step) | 0 / 34 / 5 | 0 / 24 / 7 |
+  | Sibling radii (current step) | 4 / 17 / 18 | 2 / 18 / 11 |
+
+  - Most of the extra shallow calls stop at the domain or phylum. These databases hold one order per class, so phylum and class radii fall back to the nearest identity within that order (e.g. 70.5% for Bacillota). With complete phyla, as in GTDB, they come from identity between classes and phyla.
+  - The wrong calls put a withheld family inside a neighbouring family whose radius its members reach, e.g. Orbaceae in Enterobacteriaceae at 92.2% identity against a radius of 85.2%.
+  - The sibling-radius step was adopted on a full-GTDB benchmark (R226 references, R232 queries), where it improved on the order-level call.
 - **Why a fixed AAI cutoff is not enough.** GTDB draws genus and family boundaries by relative evolutionary divergence, not AAI, so a fixed AAI cutoff cuts across them:
 
   | Comparison (per query) | Min | Median | Max |
@@ -323,7 +331,7 @@ The 5-point row comes from full classify runs. The other rows replay the rule ov
 | Validation | 49 | 221 | 12 s / 83 s | 76 s / 537 s | 1.32 GB |
 | Independent | 103 | 891 | 23 s / 167 s | 156 s / 1,159 s | 1.15 GB |
 
-Building the 272-reference database from Prodigal proteomes (`--protein-list`) took 123 s; the 891-reference one took 390 s, 387 s of it extracting marker genes, with a peak RSS of 0.73 GB. Calling the references' genes with FragGeneScanRs instead (no `--protein-list`) took 134 s and 427 s, with a peak RSS of 1.6 GB. Index scaling at full GTDB size has not been measured yet. Indexes are warmed before searching (see [Search](#search)); `--no-preload` turns this off.
+Building the 272-reference database from Prodigal proteomes (`--protein-list`) took 121 s; the 891-reference one took 354 s, 334 s of it extracting marker genes, with a peak RSS of 0.78 GB. Computing the marker radii took under a second for either. At GTDB R232 size the radii compare about 2.6 billion reference pairs. Calling the references' genes with FragGeneScanRs instead (no `--protein-list`) took 134 s and 427 s, with a peak RSS of 1.6 GB (measured with the earlier marker index). Index scaling at full GTDB size has not been measured yet. Indexes are warmed before searching (see [Search](#search)); `--no-preload` turns this off.
 
 ## Update Semantics
 

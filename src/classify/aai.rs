@@ -22,7 +22,7 @@ use rayon::prelude::*;
 use crate::classify::ani::sketch_ani;
 use crate::classify::external::run;
 use crate::classify::genes::write_fasta_record;
-use crate::classify::refdata::GtdbtkData;
+use crate::classify::refdata::{GtdbtkData, is_named};
 
 /// DIAMOND threads per query job; small searches scale poorly past a few.
 const THREADS_PER_JOB: usize = 2;
@@ -444,7 +444,7 @@ pub(crate) fn decide(
         }
         let taxon = &taxonomy[..ranks];
         // A reference without a name at this rank cannot give one.
-        if taxon[ranks - 1].len() <= 3 {
+        if !is_named(&taxon[ranks - 1]) {
             return None;
         }
         let lead = match rest.iter().find(|(_, other)| other[..ranks] != *taxon) {

@@ -10,6 +10,14 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 pub(crate) const RANK_PREFIXES: [&str; 7] = ["d__", "p__", "c__", "o__", "f__", "g__", "s__"];
+pub(crate) const RANK_NAMES: [&str; 7] = [
+    "domain", "phylum", "class", "order", "family", "genus", "species",
+];
+
+/// A taxon with a name, not just its rank prefix (`g__`).
+pub(crate) fn is_named(taxon: &str) -> bool {
+    taxon.len() > 3
+}
 
 /// Genome ID used to match genomes with their taxonomy. NCBI assembly
 /// accessions take GTDB-Tk's `canonical_gid` form, so GenBank and RefSeq

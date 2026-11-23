@@ -1,7 +1,6 @@
 //! Marker genes: find the GTDB bac120/ar53 markers with HMMER, classify their
 //! copy number, pick each genome's domain, and build the masked concatenated
 //! marker alignment, following GTDB-Tk 2.8's `identify` and `align` steps.
-//! The alignment's residues are what the marker index sketches.
 
 use flate2::Compression;
 use flate2::read::GzDecoder;
@@ -1115,12 +1114,6 @@ pub(crate) fn apply_mask(
     ))
 }
 
-/// The marker search's sequence for a masked alignment: its residues
-/// without gap columns.
-pub(crate) fn marker_sequence(masked: &str) -> String {
-    masked.chars().filter(char::is_ascii_alphabetic).collect()
-}
-
 /// HMMER and the marker-data directory needed to extract markers.
 pub(crate) struct MarkerTools<'a> {
     pub(crate) hmmsearch: &'a Path,
@@ -1238,19 +1231,6 @@ pub(crate) fn write_filtered(path: &Path, pruned: &BTreeMap<String, f64>) -> std
     output.flush()
 }
 
-/// Write a reference or query's marker-search sequence (the masked
-/// alignment's residues) to a one-record FASTA. Returns false, writing
-/// nothing, when the alignment has no residues.
-pub(crate) fn write_marker_fasta(path: &Path, id: &str, masked: &str) -> std::io::Result<bool> {
-    let sequence = marker_sequence(masked);
-    if sequence.is_empty() {
-        return Ok(false);
-    }
-    let mut output = BufWriter::new(File::create(path)?);
-    write_fasta_record(&mut output, id.as_bytes(), sequence.as_bytes())?;
-    output.flush()?;
-    Ok(true)
-}
 #[cfg(test)]
 mod tests {
     use super::*;

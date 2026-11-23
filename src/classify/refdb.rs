@@ -1,8 +1,9 @@
-//! The `aeon classify-db` reference database: three aeon indexes over the
-//! reference genomes (e.g. GTDB species representatives or WoL2; genome nucleotides, proteomes, and concatenated
-//! marker genes), plus a `reference_data/` directory with the references'
-//! taxonomy and species radii and the marker HMMs (and masks, when built from
-//! a GTDB-Tk package). Classify needs nothing else.
+//! The `aeon classify-db` reference database: two aeon indexes over the
+//! reference genomes (e.g. GTDB species representatives or WoL2; genome
+//! nucleotides and proteomes), plus a `reference_data/` directory with the
+//! references' taxonomy, species radii, masked marker alignment and taxon
+//! sibling radii, and the marker HMMs (and masks, when built from a GTDB-Tk
+//! package). Classify needs nothing else.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,9 +17,13 @@ use needletail::parse_fastx_file;
 
 use crate::classify::external::find_tool;
 use crate::classify::genes::GeneCaller;
+use crate::classify::marker_rank::{
+    encode_row, read_marker_radii, resolve_radii, taxon_radii, write_marker_alignment,
+    write_marker_radii,
+};
 use crate::classify::markers::{
     MARKER_SETS, MarkerTools, PfamInfo, apply_mask, extract_masked_markers, read_mask,
-    reference_msa_path, write_marker_data, write_marker_fasta,
+    reference_msa_path, write_marker_data,
 };
 use crate::classify::refdata::{
     DEFAULT_RADIUS, GtdbtkData, Radius, accession_from_path, canonical_gid,
@@ -33,14 +38,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const MANIFEST_FILE: &str = "manifest.json";
 const NT_PREFIX: &str = "nt";
 const AA_PREFIX: &str = "aa";
-const MARKER_PREFIX: &str = "markers";
 const PROTEIN_DIR: &str = "proteins";
-const MARKER_DIR: &str = "marker_genes";
+const MARKER_TMP_DIR: &str = "marker_genes_tmp";
 const REFERENCE_DIR: &str = "reference_data";
 const TAXONOMY_FILE: &str = "taxonomy.tsv";
 const RADII_FILE: &str = "radii.tsv";
 
-/// Where reference proteomes for the AAI and marker indexes come from.
+/// Where reference proteomes for the AAI index and marker alignment come from.
 pub(crate) enum ProteinSource {
     /// Precomputed proteomes (e.g. GTDB `protein_faa_reps`), named by genome ID.
     List(String),
@@ -68,7 +72,7 @@ pub(crate) struct Manifest {
     /// The GTDB-Tk package the database was built from, for the record.
     pub(crate) gtdbtk_data: Option<String>,
     pub(crate) references: usize,
-    /// References with markers in the marker index.
+    /// References with rows in the marker alignment.
     pub(crate) marker_references: usize,
 }
 
@@ -109,8 +113,9 @@ pub(crate) struct ClassifyDb {
     pub(crate) nt: Index,
     /// Reference proteomes, named by their genomes' accessions.
     pub(crate) aa: Index,
-    /// Concatenated marker genes of the references that have them.
-    pub(crate) markers: Index,
+    /// The radius of each reference taxon from phylum to genus for the
+    /// marker rank call.
+    pub(crate) marker_radii: HashMap<String, f64>,
 }
 
 impl ClassifyDb {
@@ -148,6 +153,7 @@ impl ClassifyDb {
         let reference_dir = dir.join(REFERENCE_DIR);
         let file = |name: &str| reference_dir.join(name).to_string_lossy().into_owned();
         Ok(Self {
+            marker_radii: read_marker_radii(&reference_dir)?,
             data: GtdbtkData::from_files(
                 &manifest.gtdb_release,
                 &[file(TAXONOMY_FILE)],
@@ -155,7 +161,6 @@ impl ClassifyDb {
             )?,
             nt,
             aa,
-            markers: Index::open(&dir, MARKER_PREFIX)?,
             reference_dir,
             manifest,
         })
@@ -167,11 +172,10 @@ impl ClassifyDb {
     }
 }
 
-/// Index parameters of the three indexes.
+/// Index parameters of the two indexes.
 pub(crate) struct IndexParams {
     pub(crate) nt: PrefixParams,
     pub(crate) aa: PrefixParams,
-    pub(crate) markers: PrefixParams,
 }
 
 pub(crate) fn build_classify_db(
@@ -240,7 +244,7 @@ pub(crate) fn build_classify_db(
         }
     );
     // The nucleotide index needs only the genomes, so it builds while the
-    // proteomes, protein index and marker index are prepared.
+    // proteomes, protein index and marker alignment are prepared.
     let (nt, rest) = rayon::join(
         || build_index(&db.join(NT_PREFIX), &genomes, params.nt),
         || -> Result<_, String> {
@@ -257,7 +261,7 @@ pub(crate) fn build_classify_db(
             let (aa, markers) = rayon::join(
                 || build_index(&db.join(AA_PREFIX), &proteomes, params.aa),
                 || {
-                    let markers = write_reference_markers(
+                    write_reference_markers(
                         &reference_dir,
                         package,
                         &data,
@@ -266,8 +270,7 @@ pub(crate) fn build_classify_db(
                         bin_dir,
                         db,
                     )
-                    .map_err(|error| error.to_string())?;
-                    build_index(&db.join(MARKER_PREFIX), &markers, params.markers)
+                    .map_err(|error| error.to_string())
                 },
             );
             aa?;
@@ -275,12 +278,10 @@ pub(crate) fn build_classify_db(
         },
     );
     nt?;
-    rest?;
-    // Index builds drop exact-content duplicates, so count what was indexed.
-    let (references, marker_references) = (
-        Index::open(db, NT_PREFIX)?.len(),
-        Index::open(db, MARKER_PREFIX)?.len(),
-    );
+    let marker_references = rest?;
+    // The nt index build drops exact-content duplicates, so count what was
+    // indexed. The marker alignment keeps every reference with markers.
+    let references = Index::open(db, NT_PREFIX)?.len();
     let manifest = Manifest {
         aeon_version: env!("CARGO_PKG_VERSION").into(),
         gtdb_release: data.version.clone(),
@@ -302,10 +303,11 @@ pub(crate) fn build_classify_db(
     Ok(())
 }
 
-/// Write each reference's masked marker residues to `marker_genes/{accession}.faa`
-/// and return the files in reference order. With a GTDB-Tk package, rows
-/// come from its reference MSA; other references get theirs from hmmsearch
-/// and hmmalign on their proteomes, using the marker data in `root`.
+/// Write the references' masked marker alignment rows to `root`, one file
+/// per marker set, and the radii of their taxa from phylum to genus, and
+/// return how many references have rows. With a GTDB-Tk package, rows come
+/// from its reference MSA; other references get theirs from hmmsearch and
+/// hmmalign on their proteomes, using the marker data in `root`.
 fn write_reference_markers(
     root: &Path,
     package: Option<(&Path, &str)>,
@@ -314,15 +316,10 @@ fn write_reference_markers(
     proteomes: &[String],
     bin_dir: Option<&str>,
     db: &Path,
-) -> Result<Vec<String>, Box<dyn Error>> {
+) -> Result<usize, Box<dyn Error>> {
     let started = Instant::now();
-    let marker_dir = db.join(MARKER_DIR);
-    fs::create_dir_all(&marker_dir)?;
-    let file_of = |accession: &str| marker_dir.join(format!("{accession}.faa"));
-    let write =
-        |accession: &str, masked: &str| write_marker_fasta(&file_of(accession), accession, masked);
-    let mut with_markers = HashSet::new();
-    let mut from_package = 0;
+    let (mut with_markers, mut from_package) = (0, 0);
+    let mut radii = BTreeMap::new();
     for set in MARKER_SETS {
         let mut pending = accessions
             .iter()
@@ -334,8 +331,10 @@ fn write_reference_markers(
             .map(|(accession, proteome)| (canonical_gid(accession), (accession, proteome)))
             .collect::<HashMap<_, _>>();
         if pending.is_empty() {
+            write_marker_alignment(root, set, &[])?;
             continue;
         }
+        let mut rows = Vec::new();
         let mask = read_mask(root, set)?;
         // The R232 bac120 MSA is several GB, so rows are streamed.
         let msa = package.map(|(package, release)| reference_msa_path(package, release, set));
@@ -354,68 +353,83 @@ fn write_reference_markers(
                 };
                 let (masked, _, _) =
                     apply_mask(&String::from_utf8_lossy(&record.seq()), mask.as_deref())?;
-                if write(accession, &masked)? {
-                    with_markers.insert(accession.clone());
-                    from_package += 1;
-                }
+                push_marker_row(&mut rows, accession, &masked);
                 if pending.is_empty() {
                     break;
                 }
             }
+            from_package += rows.len();
         }
-        if pending.is_empty() {
-            continue;
-        }
-        eprintln!(
-            "Extracting {set} markers with HMMER for {} reference(s){}",
-            pending.len(),
-            msa.map_or(String::new(), |msa| format!(
-                " missing from {}",
-                msa.display()
-            ))
-        );
-        let pfam_info = PfamInfo::load(root)?;
-        let (hmmsearch, hmmalign) = (
-            find_tool(bin_dir, "hmmsearch")?,
-            find_tool(bin_dir, "hmmalign")?,
-        );
-        let tools = MarkerTools {
-            hmmsearch: &hmmsearch,
-            hmmalign: &hmmalign,
-            root,
-            pfam_info: &pfam_info,
-        };
-        let inputs = pending
-            .values()
-            .map(|(accession, proteome)| ((*accession).clone(), PathBuf::from(proteome)))
-            .collect::<Vec<_>>();
-        let work_dir = db.join(format!("{MARKER_DIR}_tmp"));
-        let masked: BTreeMap<String, String> = extract_masked_markers(
-            &tools,
-            mask.as_deref(),
-            set,
-            &inputs,
-            &work_dir,
-            rayon::current_num_threads(),
-        )?;
-        fs::remove_dir_all(&work_dir)?;
-        for (accession, masked) in masked {
-            if write(&accession, &masked)? {
-                with_markers.insert(accession);
+        if !pending.is_empty() {
+            eprintln!(
+                "Extracting {set} markers with HMMER for {} reference(s){}",
+                pending.len(),
+                msa.map_or(String::new(), |msa| format!(
+                    " missing from {}",
+                    msa.display()
+                ))
+            );
+            let pfam_info = PfamInfo::load(root)?;
+            let (hmmsearch, hmmalign) = (
+                find_tool(bin_dir, "hmmsearch")?,
+                find_tool(bin_dir, "hmmalign")?,
+            );
+            let tools = MarkerTools {
+                hmmsearch: &hmmsearch,
+                hmmalign: &hmmalign,
+                root,
+                pfam_info: &pfam_info,
+            };
+            let inputs = pending
+                .values()
+                .map(|(accession, proteome)| ((*accession).clone(), PathBuf::from(proteome)))
+                .collect::<Vec<_>>();
+            let work_dir = db.join(MARKER_TMP_DIR);
+            let masked: BTreeMap<String, String> = extract_masked_markers(
+                &tools,
+                mask.as_deref(),
+                set,
+                &inputs,
+                &work_dir,
+                rayon::current_num_threads(),
+            )?;
+            fs::remove_dir_all(&work_dir)?;
+            for (accession, masked) in masked {
+                push_marker_row(&mut rows, &accession, &masked);
             }
         }
+        write_marker_alignment(root, set, &rows)?;
+        with_markers += rows.len();
+        let radii_started = Instant::now();
+        let references = rows
+            .iter()
+            .filter_map(|(accession, row)| Some((data.taxonomy_of(accession)?, row.as_slice())))
+            .collect::<Vec<_>>();
+        let set_radii = taxon_radii(&references);
+        eprintln!(
+            "Computed {set} marker radii of {} taxa from {} references in {:.3}s",
+            set_radii.len(),
+            references.len(),
+            radii_started.elapsed().as_secs_f64()
+        );
+        radii.extend(set_radii);
     }
+    // Rank medians pool both marker sets.
+    write_marker_radii(root, &radii, &resolve_radii(&radii))?;
     eprintln!(
-        "Wrote marker genes for {}/{} references ({from_package} from the package MSA) in {:.3}s",
-        with_markers.len(),
+        "Wrote marker alignment rows for {with_markers}/{} references ({from_package} from the package MSA) in {:.3}s",
         accessions.len(),
         started.elapsed().as_secs_f64()
     );
-    Ok(accessions
-        .iter()
-        .filter(|accession| with_markers.contains(*accession))
-        .map(|accession| file_of(accession).to_string_lossy().into_owned())
-        .collect())
+    Ok(with_markers)
+}
+
+/// Add a reference's masked alignment row, unless it has no residues.
+fn push_marker_row(rows: &mut Vec<(String, Vec<u8>)>, accession: &str, masked: &str) {
+    let row = encode_row(masked.as_bytes());
+    if row.iter().any(|&residue| residue != 0) {
+        rows.push((accession.to_owned(), row));
+    }
 }
 
 /// Build the aeon index at `prefix` over `paths`. `build_database` reads its

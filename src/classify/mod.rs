@@ -6,6 +6,7 @@ pub(crate) mod ani;
 pub(crate) mod external;
 pub(crate) mod genes;
 pub(crate) mod log;
+pub(crate) mod marker_rank;
 pub(crate) mod markers;
 pub(crate) mod refdata;
 pub(crate) mod refdb;
@@ -28,12 +29,15 @@ use crate::classify::ani::{
 use crate::classify::external::{find_program, find_tool};
 use crate::classify::genes::{GeneCaller, TRANSLATION_TABLE};
 use crate::classify::log::ClassifyLog;
+use crate::classify::marker_rank::{
+    MarkerAlignment, MarkerCall, call_rank, encode_row, listed_matches, match_references,
+};
 use crate::classify::markers::{
     CopyNumber, MARKER_SETS, MarkerTools, PfamInfo, align_markers, apply_mask, filtered_reason,
-    genome_domain, identify_markers, marker_hmms, marker_sequence, multihit_warning, read_mask,
+    genome_domain, identify_markers, marker_hmms, multihit_warning, read_mask,
     write_filtered, write_marker_info, write_markers_summary, write_msa_gz,
 };
-use crate::classify::refdata::{marker_set_for_taxonomy, standardise_taxonomy};
+use crate::classify::refdata::{RANK_NAMES, marker_set_for_taxonomy, standardise_taxonomy};
 use crate::classify::refdb::{ClassifyDb, Index};
 use crate::classify::run_record::{ALIGN, ANI_SCREEN, CLASSIFY, IDENTIFY, RunInfo, RunRecord};
 use crate::classify::summary::{
@@ -61,7 +65,6 @@ pub(crate) struct ClassifyOptions {
     pub(crate) candidates: usize,
     pub(crate) beam_width: usize,
     pub(crate) min_sketch_ani: f64,
-    pub(crate) min_marker_identity: f64,
     pub(crate) genus_aai: f64,
     pub(crate) family_aai: f64,
     pub(crate) aai_margin: f64,
@@ -177,10 +180,10 @@ struct AaiResult {
 /// Where the marker pipeline left a genome.
 #[derive(Debug)]
 enum MarkerOutcome {
-    /// In the masked user MSA and searched against the marker index.
+    /// In the masked user MSA and compared with the reference markers.
     Aligned {
         msa_percent: f64,
-        closest: Option<MarkerHit>,
+        call: Option<MarkerHit>,
     },
     /// No single-copy marker of either set.
     NoMarkers,
@@ -195,12 +198,12 @@ struct MarkerResult {
     warnings: Vec<String>,
 }
 
-/// The closest reference in the marker index.
+/// The marker rank call.
 #[derive(Debug, Clone, PartialEq)]
 struct MarkerHit {
+    /// The best match's reference.
     accession: String,
-    /// Sketch-estimated identity of the concatenated markers, 0-100.
-    identity: f64,
+    call: MarkerCall,
 }
 
 impl Stage {
@@ -235,9 +238,9 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
         db.nt.paths.len()
     ));
     log.info(format!("Identified {} genomes to classify", queries.len()));
-    // Warm all three indexes in search order while the queries are processed.
+    // Warm both indexes in search order while the queries are processed.
     let warmup = Warmup::start(
-        &[&db.nt.prefix, &db.aa.prefix, &db.markers.prefix],
+        &[&db.nt.prefix, &db.aa.prefix],
         options.preload,
     )?;
     if !options.preload {
@@ -267,7 +270,6 @@ pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn 
     run_marker_tier(
         &mut results,
         &db,
-        &warmup,
         options,
         &out_dir,
         &log,
@@ -685,12 +687,11 @@ fn run_aai_tier(
 
 /// GTDB-Tk's `identify` and `align` steps for genomes neither ANI nor AAI
 /// resolved (marker search, copy number, domain call, and the masked
-/// concatenated alignment), then a search of the marker index for the
-/// closest reference.
+/// concatenated alignment), then the marker rank call against the reference
+/// marker alignment.
 fn run_marker_tier(
     results: &mut [QueryResult],
     db: &ClassifyDb,
-    warmup: &Warmup,
     options: &ClassifyOptions,
     out_dir: &Path,
     log: &ClassifyLog,
@@ -709,6 +710,17 @@ fn run_marker_tier(
         return Ok(());
     }
     let root = db.root().to_path_buf();
+    // The reference marker alignment is read while HMMER runs.
+    let alignments = {
+        let root = root.clone();
+        std::thread::spawn(move || {
+            MARKER_SETS
+                .into_iter()
+                .map(|set| Ok((set, MarkerAlignment::read(&root, set)?)))
+                .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()
+                .map_err(|error| error.to_string())
+        })
+    };
     let (hmmsearch, hmmalign) = (
         find_tool(options.bin_dir.as_deref(), "hmmsearch")?,
         find_tool(options.bin_dir.as_deref(), "hmmalign")?,
@@ -872,7 +884,10 @@ fn run_marker_tier(
         }
     }
     record.mark(ALIGN);
-    let closest = search_marker_index(&aligned, db, warmup, options, out_dir, log)?;
+    let alignments = alignments
+        .join()
+        .map_err(|_| "reading the reference marker alignment failed")??;
+    let calls = call_marker_ranks(&aligned, &alignments, db, out_dir, &options.prefix, log)?;
     if !aligned.is_empty() {
         record.output(
             CLASSIFY,
@@ -885,7 +900,7 @@ fn run_marker_tier(
             id.clone(),
             MarkerOutcome::Aligned {
                 msa_percent,
-                closest: closest.get(&id).cloned(),
+                call: calls.get(&id).cloned(),
             },
         );
     }
@@ -916,76 +931,84 @@ fn run_marker_tier(
     Ok(())
 }
 
-/// Search the marker index with each aligned genome's marker residues, and
-/// write the hits of the genome's own domain at or above
-/// `--min-marker-identity` to `classify/markers/{prefix}.marker_summary.tsv`.
-/// Returns the closest such reference per genome.
-fn search_marker_index(
+/// Compare each aligned genome's masked markers with every reference of its
+/// marker set and call its rank from the references tied with the best match
+/// and the taxa's radii. The tied references and the ten closest of each
+/// genome go to `classify/markers/{prefix}.marker_summary.tsv`.
+fn call_marker_ranks(
     aligned: &BTreeMap<String, (String, f64, &'static str)>,
+    alignments: &BTreeMap<&str, MarkerAlignment>,
     db: &ClassifyDb,
-    warmup: &Warmup,
-    options: &ClassifyOptions,
     out_dir: &Path,
+    prefix: &str,
     log: &ClassifyLog,
 ) -> Result<BTreeMap<String, MarkerHit>, Box<dyn Error>> {
     if aligned.is_empty() {
         return Ok(BTreeMap::new());
     }
-    log.info(format!(
-        "Searching the marker index for {} genome(s).",
-        thousands(aligned.len())
-    ));
-    let summary_path = marker_summary_path(out_dir, &options.prefix);
-    let sequence_dir = summary_path.with_file_name("intermediate_results");
-    fs::create_dir_all(&sequence_dir)?;
-    let mut paths = Vec::with_capacity(aligned.len());
-    for (id, (masked, _, _)) in aligned {
-        let path = sequence_dir.join(format!("{id}.faa"));
-        fs::write(&path, format!(">{id}\n{}\n", marker_sequence(masked)))?;
-        paths.push(path.to_string_lossy().into_owned());
-    }
-    let vectors = sketch_from_params(&paths, &db.markers.params);
-    let neighbors = search_index(
-        &db.markers,
-        warmup,
-        &vectors,
-        options.candidates,
-        options,
-        log,
-    )?;
+    let summary_path = marker_summary_path(out_dir, prefix);
+    fs::create_dir_all(summary_path.parent().expect("classify/markers"))?;
     let mut output = BufWriter::new(File::create(&summary_path)?);
     writeln!(
         output,
-        "user_genome\treference_genome\testimated_marker_identity\treference_taxonomy"
+        "user_genome\treference_genome\tmarker_identity\toverlap\ttied\treference_taxonomy"
     )?;
-    let mut closest = BTreeMap::new();
-    for ((id, (_, _, marker_set)), hits) in aligned.iter().zip(neighbors) {
-        for (reference, distance) in hits {
-            let accession = &db.markers.accessions[reference as usize];
-            let identity = sketch_ani(distance, db.markers.params.kmer_size);
-            // Unrelated marker sets share k-mers only by chance, and the
-            // other domain's markers are different genes.
-            let Some(taxonomy) = db.data.taxonomy_of(accession).filter(|taxonomy| {
-                marker_set_for_taxonomy(taxonomy) == *marker_set
-                    && identity >= options.min_marker_identity
-            }) else {
+    let mut calls = BTreeMap::new();
+    for set in MARKER_SETS {
+        let genomes = aligned
+            .iter()
+            .filter(|(_, (_, _, marker_set))| *marker_set == set)
+            .collect::<Vec<_>>();
+        if genomes.is_empty() {
+            continue;
+        }
+        let references = &alignments[set];
+        log.info(format!(
+            "Comparing {} genome(s) with the marker alignment of {} {} references.",
+            thousands(genomes.len()),
+            thousands(references.len()),
+            domain_adjective(set)
+        ));
+        let taxonomies = references
+            .accessions
+            .iter()
+            .map(|accession| {
+                db.data
+                    .taxonomy_of(accession)
+                    .ok_or_else(|| format!("marker reference {accession} has no taxonomy"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (id, (masked, _, _)) in genomes {
+            let matches = match_references(&encode_row(masked.as_bytes()), references);
+            let Some(call) = call_rank(&matches, |row| taxonomies[row], &db.marker_radii) else {
                 continue;
             };
-            writeln!(
-                output,
-                "{id}\t{accession}\t{}\t{}",
-                py_round(identity, 2),
-                taxonomy.join(";")
-            )?;
-            closest.entry(id.clone()).or_insert_with(|| MarkerHit {
-                accession: accession.clone(),
-                identity,
-            });
+            for (hit, tied) in listed_matches(&matches, &call, MARKER_SUMMARY_HITS) {
+                writeln!(
+                    output,
+                    "{id}\t{}\t{}\t{}\t{}\t{}",
+                    references.accessions[hit.row],
+                    py_round(hit.identity, 2),
+                    hit.overlap,
+                    tied,
+                    taxonomies[hit.row].join(";")
+                )?;
+            }
+            calls.insert(
+                id.clone(),
+                MarkerHit {
+                    accession: references.accessions[call.best.row].clone(),
+                    call,
+                },
+            );
         }
     }
     output.flush()?;
-    Ok(closest)
+    Ok(calls)
 }
+
+/// Marker matches listed per genome besides the tied ones.
+const MARKER_SUMMARY_HITS: usize = 10;
 
 fn marker_summary_path(out_dir: &Path, prefix: &str) -> PathBuf {
     out_dir
@@ -1258,8 +1281,7 @@ fn aai_summary_row(
 }
 
 /// Fill in the marker-tier fields: GTDB-Tk's rows for genomes without
-/// markers or filtered from the MSA, else the closest marker reference's
-/// lineage down to order.
+/// markers or filtered from the MSA, else the marker rank call.
 fn marker_summary_row(
     mut row: SummaryRow,
     markers: &MarkerResult,
@@ -1276,30 +1298,29 @@ fn marker_summary_row(
             row.warnings.push(reason.clone());
             (markers.marker_set, row)
         }
-        MarkerOutcome::Aligned {
-            msa_percent,
-            closest,
-        } => {
+        MarkerOutcome::Aligned { msa_percent, call } => {
             row.translation_table = Some(TRANSLATION_TABLE);
             row.msa_percent = Some(*msa_percent);
             row.warnings.extend(markers.warnings.iter().cloned());
-            let Some((hit, taxonomy)) = closest.as_ref().and_then(|hit| {
-                db.data
-                    .taxonomy_of(&hit.accession)
-                    .map(|taxonomy| (hit, taxonomy))
-            }) else {
+            let Some(MarkerHit { accession, call }) = call else {
                 row.classification = Some(unclassified(markers.marker_set, true));
                 return (markers.marker_set, row);
             };
-            row.classification = Some(standardise_taxonomy(&taxonomy[..4].join(";")));
-            row.closest_placement_reference = Some(hit.accession.clone());
-            row.closest_placement_radius = db.data.radius_of(&hit.accession);
-            row.closest_placement_taxonomy = Some(taxonomy.join(";"));
+            row.classification = Some(standardise_taxonomy(&call.lineage.join(";")));
+            row.closest_placement_reference = Some(accession.clone());
+            row.closest_placement_radius = db.data.radius_of(accession);
+            row.closest_placement_taxonomy = db
+                .data
+                .taxonomy_of(accession)
+                .map(|taxonomy| taxonomy.join(";"));
             row.classification_method =
                 Some("taxonomic classification defined by marker gene search".into());
             row.note = Some(format!(
-                "order of the closest marker gene match (estimated marker identity {}%)",
-                py_round(hit.identity, 2)
+                "marker identity {}% over {} columns to the closest reference, {} reference(s) tied; called to the {} by taxon radii",
+                py_round(call.best.identity, 2),
+                thousands(call.best.overlap as usize),
+                call.tied.len(),
+                RANK_NAMES[call.lineage.len() - 1]
             ));
             (markers.marker_set, row)
         }

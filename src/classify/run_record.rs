@@ -4,7 +4,7 @@
 //! GTDB-Tk reads this file back to resume a run and rejects step names and
 //! fields it does not know, so aeon's tiers are filed under GTDB-Tk's four
 //! `classify_wf` steps: gene calling and marker search under `identify`,
-//! the AAI tier and the marker-index search under `classify`.
+//! the AAI tier and the marker rank call under `classify`.
 
 use chrono::{DateTime, Local};
 use serde::Serialize;
