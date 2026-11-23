@@ -1,11 +1,15 @@
-# GTDB marker HMMs
+# GTDB marker HMMs and alignment masks
 
 These files hold the hidden Markov models of the 120 bacterial (bac120) and 53
 archaeal (ar53) GTDB marker genes: 152 TIGRFAM and 16 Pfam models. They are
 copied unmodified from the GTDB-Tk R232 reference data package
 (`markers/tigrfam/tigrfam.hmm`, `markers/pfam/Pfam-A.hmm` and
 `markers/pfam/Pfam-A.hmm.dat`), with the two libraries gzip-compressed.
-`aeon classify-db` uses them when no GTDB-Tk package is given.
+`bac120.mask` and `ar53.mask` are GTDB R232's alignment masks
+(`masks/gtdb_r232_{bac120,ar53}.mask` in the package; the ar53 mask is also
+GTDB's `ar53_msa_mask_r232.txt`). They keep 5,010 and 4,369 columns of the
+concatenated marker alignments. `aeon classify-db` uses these files when no
+GTDB-Tk package is given.
 
 They are third-party data, distributed under their own licences, not aeon's
 MIT licence.
@@ -46,9 +50,12 @@ released under the Creative Commons Zero (CC0) public domain dedication
   Tosatto SCE, Paladin L, Raj S, Richardson LJ, Finn RD, Bateman A. Pfam: The
   protein families database in 2021. Nucleic Acids Res. 2021;49(D1):D412-9.
 
-## Marker selection
+## Marker selection and masks
 
-The bac120 and ar53 marker sets are those of the Genome Taxonomy Database:
+The bac120 and ar53 marker sets and the alignment masks are those of the
+Genome Taxonomy Database, whose data are licensed under the Creative Commons
+Attribution-ShareAlike 4.0 International licence
+(https://creativecommons.org/licenses/by-sa/4.0/):
 
 - Parks DH, Chuvochina M, Rinke C, Mussig AJ, Chaumeil PA, Hugenholtz P. GTDB:
   an ongoing census of bacterial and archaeal diversity through a

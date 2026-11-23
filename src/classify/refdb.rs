@@ -231,17 +231,12 @@ pub(crate) fn build_classify_db(
     fs::create_dir_all(&reference_dir)?;
     write_reference_data(&reference_dir, &data, &accessions)?;
     let package = package.as_deref().zip(package_release.as_deref());
-    let masked = write_marker_data(&reference_dir, package)?;
+    write_marker_data(&reference_dir, package)?;
     eprintln!(
-        "Wrote marker HMMs from {}{}",
+        "Wrote marker HMMs and alignment masks from {}",
         package.map_or("aeon's bundled GTDB R232 copy".into(), |(root, _)| root
             .display()
-            .to_string()),
-        if masked {
-            ", with GTDB masks"
-        } else {
-            ", without alignment masks"
-        }
+            .to_string())
     );
     // The nucleotide index needs only the genomes, so it builds while the
     // proteomes, protein index and marker alignment are prepared.

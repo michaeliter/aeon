@@ -238,20 +238,25 @@ fn individual_hmm_path(root: &Path, id: &str) -> PathBuf {
     }
 }
 
-/// GTDB-Tk R232's marker HMM libraries, bundled for databases built
-/// without a GTDB-Tk package (see `data/gtdb_markers/NOTICE.md`).
+/// GTDB-Tk R232's marker HMM libraries and GTDB R232's alignment masks,
+/// bundled for databases built without a GTDB-Tk package (see
+/// `data/gtdb_markers/NOTICE.md`).
 const BUNDLED_TIGRFAM: &[u8] = include_bytes!("../../data/gtdb_markers/tigrfam.hmm.gz");
 const BUNDLED_PFAM: &[u8] = include_bytes!("../../data/gtdb_markers/Pfam-A.hmm.gz");
 const BUNDLED_PFAM_DAT: &[u8] = include_bytes!("../../data/gtdb_markers/Pfam-A.hmm.dat");
+const BUNDLED_MASKS: [(&str, &[u8]); 2] = [
+    ("ar53", include_bytes!("../../data/gtdb_markers/ar53.mask")),
+    ("bac120", include_bytes!("../../data/gtdb_markers/bac120.mask")),
+];
 
 /// Lay out the marker HMMs under `dest` as a GTDB-Tk package does
-/// (`markers/{tigrfam,pfam}/...`, including `individual_hmms/`), from
-/// `package` or else from the bundled copy, and copy the package's masks
-/// to `masks/{marker_set}.mask`. Returns whether masks were copied.
+/// (`markers/{tigrfam,pfam}/...`, including `individual_hmms/`), and the
+/// alignment masks as `masks/{marker_set}.mask`, from `package` or else from
+/// the bundled copy.
 pub(crate) fn write_marker_data(
     dest: &Path,
     package: Option<(&Path, &str)>,
-) -> Result<bool, Box<dyn Error>> {
+) -> Result<(), Box<dyn Error>> {
     let gunzip = |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
         let mut text = Vec::new();
         GzDecoder::new(bytes).read_to_end(&mut text)?;
@@ -294,16 +299,22 @@ pub(crate) fn write_marker_data(
             }
         }
     }
-    let Some((root, release)) = package else {
-        return Ok(false);
-    };
     fs::create_dir_all(dest.join("masks"))?;
-    for set in MARKER_SETS {
-        let source = package_mask_path(root, release, set);
-        fs::copy(&source, mask_path(dest, set))
-            .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
+    match package {
+        Some((root, release)) => {
+            for set in MARKER_SETS {
+                let source = package_mask_path(root, release, set);
+                fs::copy(&source, mask_path(dest, set))
+                    .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
+            }
+        }
+        None => {
+            for (set, mask) in BUNDLED_MASKS {
+                fs::write(mask_path(dest, set), mask)?;
+            }
+        }
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Split a concatenated HMMER3 library into `(ACC, model text)` pairs.
@@ -1245,14 +1256,21 @@ mod tests {
     }
 
     #[test]
-    fn bundled_hmms_cover_every_marker() {
+    fn bundled_marker_data_covers_every_marker() {
         let dir = std::env::temp_dir().join(format!("aeon-markers-{}", std::process::id()));
         // Fails if any bac120 or ar53 marker is missing.
-        assert!(!write_marker_data(&dir, None).unwrap());
-        let hmms = marker_hmms(&dir, "bac120").unwrap();
-        assert_eq!(hmms.len(), 120);
+        write_marker_data(&dir, None).unwrap();
+        assert_eq!(marker_hmms(&dir, "bac120").unwrap().len(), 120);
         assert_eq!(marker_hmms(&dir, "ar53").unwrap().len(), 53);
         assert!(PfamInfo::load(&dir).is_ok());
+        // Each mask spans the set's concatenated HMMs and keeps the columns
+        // of GTDB R232's published MSAs.
+        for (set, kept) in [("bac120", 5010), ("ar53", 4369)] {
+            let columns = marker_hmms(&dir, set).unwrap().iter().map(|hmm| hmm.length).sum::<usize>();
+            let mask = read_mask(&dir, set).unwrap().unwrap();
+            assert_eq!(mask.len(), columns);
+            assert_eq!(mask.iter().filter(|keep| **keep).count(), kept);
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 

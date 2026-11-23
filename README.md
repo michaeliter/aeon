@@ -171,14 +171,14 @@ Both graphs are built with max degree 128 (`--max-degree`), construction beam 51
 | Reference taxonomy, `genome<TAB>d__…;p__…;…;s__…` with rank prefixes and lower ranks optional (e.g. GTDB's `bac120_taxonomy_r232.tsv.gz` and `ar53_taxonomy_r232.tsv.gz`, or WoL2's `lineages.txt`) | `--taxonomy` (repeatable or comma-separated) | required without `--gtdbtk-data` |
 | Reference proteomes, one FASTA per genome named by genome ID (e.g. GTDB `protein_faa_reps`) | `--protein-list` | genes called with FragGeneScanRs |
 | Species ANI radii, `species<TAB>genome<TAB>radius` (GTDB-Tk `gtdb_radii.tsv`), or GTDB's `sp_clusters_r232.tsv` | `--radii` | 95% for every species |
-| Marker HMMs (bac120 and ar53) | — | GTDB R232's TIGRFAM and Pfam models, bundled with aeon (`data/gtdb_markers/`, see its NOTICE for their licences) |
+| Marker HMMs and alignment masks (bac120 and ar53) | — | GTDB R232's TIGRFAM and Pfam models and masks, bundled with aeon (`data/gtdb_markers/`, see its NOTICE for their licences) |
 
 - **Genome IDs:** taken from file names and matched to the taxonomy. NCBI assembly accessions match across GenBank/RefSeq prefixes and versions, as in GTDB-Tk (`RS_GCF_000005845.2` and `GCA_000005845.1` are the same genome). Any other ID must match exactly.
 - **Compression:** genomes and proteomes may be plain, gzip, bzip2, xz or zstd FASTA.
 - **Collections shipped as one file:** for collections distributed as a single FASTA (WoL2's `all.fna.xz`), split it into one file per genome first.
-- **Reference marker genes:** extracted with hmmsearch and hmmalign on the reference proteomes, the same way as for queries.
+- **Reference marker genes:** extracted with hmmsearch and hmmalign on the reference proteomes, the same way as for queries, and masked with GTDB's R232 masks (5,010 bac120 and 4,369 ar53 columns). For GTDB references this reproduces the rows of GTDB's published R232 MSA.
 - **Marker sets:** the GTDB bac120/ar53 markers are universal bacterial and archaeal genes, so the marker step works for any reference collection. A reference counts as archaeal if its domain is `d__Archaea`.
-- **`--gtdbtk-data DIR`** (GTDB-Tk compatibility): optionally supplies the taxonomy, radii, marker HMMs, alignment masks and reference MSA from a GTDB-Tk package. Reference markers then come from the package's MSA, and queries and references are masked with GTDB's masks. `--taxonomy` and `--radii` override the package's files.
+- **`--gtdbtk-data DIR`** (GTDB-Tk compatibility): optionally supplies the taxonomy, radii, marker HMMs, alignment masks and reference MSA from a GTDB-Tk package. Reference markers then come from the package's MSA, which skips running HMMER on GTDB references, and the package's masks replace the bundled ones. `--taxonomy` and `--radii` override the package's files.
 - **Marker radii:** computed at build from every pair of references in the same phylum with at least 500 comparable columns (see step 3). They are written to `reference_data/marker_radii.tsv`, with each taxon's sibling and nearest radius and the radius classify uses.
 - **Self-contained database:** the database keeps its own copy of the references' taxonomy, radii, marker alignment and marker HMMs in `reference_data/`, so `aeon classify` needs only `--db`.
 
@@ -222,7 +222,7 @@ Both graphs are built with max degree 128 (`--max-degree`), construction beam 51
 - **Genus 65% AAI and family 45% AAI** are the defaults, the genus and family boundaries proposed by Konstantinidis, Rosselló-Móra & Amann ([ISME J 2017](https://doi.org/10.1038/ismej.2017.113)). With the AAI margin below, they made 4 wrong calls in the 104 training and validation queries, and 5 in the 103 independent ones.
 - **AAI calls use a margin, not a vote.** A novel genus sits about equally far from several genera in its family, so its closest reference leads the next genus by only a point or two. A genus that is in the database stands out from its neighbours. Unlike a majority vote among the closest references, the margin doesn't penalise genera with few representatives; many GTDB genera have only one.
 - **Marker calls go as deep as each taxon's sibling radius allows.** A genome of a genus missing from the database is about as close to its family's other genera as they are to one another, so it reaches the family's sibling radius but not its sister genus's. A fixed identity cutoff per rank cuts across taxa that evolve at different rates.
-- **Marker identity is scored against every reference.** A sketch search of 500 candidates found the best match 96% of the time at full GTDB size. Scoring all references finds it and every tie, and costs well under a second per genome (bac120 is about 137,000 references × 5,036 columns).
+- **Marker identity is scored against every reference.** A sketch search of 500 candidates found the best match 96% of the time at full GTDB size. Scoring all references finds it and every tie, and takes about 11 ms per genome at GTDB R232 size (189,801 bac120 rows of 5,010 columns).
 
 **Output differences from GTDB-Tk:**
 - `pplacer_taxonomy` and `red_value` are always `N/A`.
@@ -300,9 +300,9 @@ The 5-point row comes from full classify runs. The other rows replay the rule ov
   | Marker step | Training + validation (39) | Independent (31) |
   |---|---|---|
   | Closest reference's order (earlier step) | 0 / 34 / 5 | 0 / 24 / 7 |
-  | Sibling radii (current step) | 4 / 17 / 18 | 2 / 18 / 11 |
+  | Sibling radii (current step) | 4 / 10 / 25 | 2 / 18 / 11 |
 
-  - Most of the extra shallow calls stop at the domain or phylum. These databases hold one order per class, so phylum and class radii fall back to the nearest identity within that order (e.g. 70.5% for Bacillota). With complete phyla, as in GTDB, they come from identity between classes and phyla.
+  - Most of the extra shallow calls stop at the domain or phylum. These databases hold one order per class, so phylum and class radii fall back to the nearest identity within that order (e.g. 89.1% for Bacillota). With complete phyla, as in GTDB, they come from identity between classes and phyla.
   - The wrong calls put a withheld family inside a neighbouring family whose radius its members reach, e.g. Orbaceae in Enterobacteriaceae at 92.2% identity against a radius of 85.2%.
   - The sibling-radius step was adopted on a full-GTDB benchmark (R226 references, R232 queries), where it improved on the order-level call.
 - **Why a fixed AAI cutoff is not enough.** GTDB draws genus and family boundaries by relative evolutionary divergence, not AAI, so a fixed AAI cutoff cuts across them:
@@ -331,7 +331,7 @@ The 5-point row comes from full classify runs. The other rows replay the rule ov
 | Validation | 49 | 221 | 12 s / 83 s | 76 s / 537 s | 1.32 GB |
 | Independent | 103 | 891 | 23 s / 167 s | 156 s / 1,159 s | 1.15 GB |
 
-Building the 272-reference database from Prodigal proteomes (`--protein-list`) took 121 s; the 891-reference one took 354 s, 334 s of it extracting marker genes, with a peak RSS of 0.78 GB. Computing the marker radii took under a second for either. At GTDB R232 size the radii compare about 2.6 billion reference pairs. Calling the references' genes with FragGeneScanRs instead (no `--protein-list`) took 134 s and 427 s, with a peak RSS of 1.6 GB (measured with the earlier marker index). Index scaling at full GTDB size has not been measured yet. Indexes are warmed before searching (see [Search](#search)); `--no-preload` turns this off.
+Building the 272-reference database from Prodigal proteomes (`--protein-list`) took 113 s; the 891-reference one took 352 s, 326 s of it extracting marker genes, with a peak RSS of 0.80 GB. Without a GTDB-Tk package, every reference's markers are extracted with HMMER; with one, GTDB references take their rows from the package's MSA. The marker radii took under a second for either database. At GTDB R232 size (189,801 bac120 rows of 5,010 columns, 2.23 billion pairs within phyla) they took 201 s on 12 cores, with about 1 GB of rows in memory, and comparing a marker-tier genome with every reference took about 11 ms. Calling the references' genes with FragGeneScanRs instead (no `--protein-list`) took 134 s and 427 s, with a peak RSS of 1.6 GB (measured with the earlier marker index). Index scaling at full GTDB size has not been measured yet. Indexes are warmed before searching (see [Search](#search)); `--no-preload` turns this off.
 
 ## Update Semantics
 
