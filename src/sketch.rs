@@ -1,9 +1,11 @@
-use needletail::{Sequence, parse_fastx_file};
+use needletail::errors::{ParseError, ParseErrorKind};
+use needletail::{FastxReader, Sequence, parse_fastx_file};
 use num_traits::{NumCast, PrimInt, ToPrimitive};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 // DNA / base k-mer machinery
@@ -61,49 +63,82 @@ fn ascii_to_seq_aa(bases: &[u8]) -> Result<SequenceAA, ()> {
     Ok(SequenceAA::new_filtered(&upper, &alphabet))
 }
 
-fn read_dna_sequences(path: &str) -> Vec<SequenceStruct> {
-    let mut sequences = Vec::new();
-    let mut reader =
-        parse_fastx_file(path).unwrap_or_else(|error| panic!("Invalid FASTA/Q {path}: {error}"));
-    while let Some(record) = reader.next() {
-        let record =
-            record.unwrap_or_else(|error| panic!("Error reading record in {path}: {error}"));
-        let normalized = record.normalize(false).into_owned();
-        sequences.push(ascii_to_seq(&normalized).expect("DNA compression must succeed"));
+/// Attempts at reading a sequence file before giving up: shared filesystems
+/// such as NFS can fail reads transiently.
+const READ_ATTEMPTS: u32 = 5;
+/// Wait before the first retry; it doubles before each further retry.
+const FIRST_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Open `path` and collect its records with `read`, retrying the whole file
+/// after an I/O error with exponential backoff. Format errors panic at once.
+fn read_with_retries<T>(
+    path: &str,
+    first_delay: Duration,
+    read: impl Fn(&mut dyn FastxReader) -> Result<Vec<T>, ParseError>,
+) -> Vec<T> {
+    let mut delay = first_delay;
+    let mut attempt = 1;
+    loop {
+        let (result, opened) = match parse_fastx_file(path) {
+            Ok(mut reader) => (read(reader.as_mut()), true),
+            Err(error) => (Err(error), false),
+        };
+        match result {
+            Ok(records) => return records,
+            Err(error) if error.kind == ParseErrorKind::Io && attempt < READ_ATTEMPTS => {
+                eprintln!(
+                    "WARNING: I/O error reading {path} (attempt {attempt}/{READ_ATTEMPTS}), retrying in {delay:?}: {error}"
+                );
+                thread::sleep(delay);
+                delay *= 2;
+                attempt += 1;
+            }
+            Err(error) if opened => panic!("Error reading record in {path}: {error}"),
+            Err(error) => panic!("Invalid FASTA/Q {path}: {error}"),
+        }
     }
-    sequences
+}
+
+fn read_dna_sequences(path: &str) -> Vec<SequenceStruct> {
+    read_with_retries(path, FIRST_RETRY_DELAY, |reader| {
+        let mut sequences = Vec::new();
+        while let Some(record) = reader.next() {
+            let normalized = record?.normalize(false).into_owned();
+            sequences.push(ascii_to_seq(&normalized).expect("DNA compression must succeed"));
+        }
+        Ok(sequences)
+    })
 }
 
 fn read_aa_sequences(path: &str) -> Vec<SequenceAA> {
-    let mut sequences = Vec::new();
-    let mut reader =
-        parse_fastx_file(path).unwrap_or_else(|error| panic!("Invalid FASTA/Q {path}: {error}"));
-    let mut record_num = 0_u64;
-    while let Some(record) = reader.next() {
-        let record =
-            record.unwrap_or_else(|error| panic!("Error reading record in {path}: {error}"));
-        let bases = record.seq();
-        let sequence_id = String::from_utf8_lossy(record.id());
-        if bases.is_empty() {
-            eprintln!(
-                "ERROR: sequence of null length, file: {path:?}, record num: {record_num}, sequence id: {sequence_id}"
-            );
+    read_with_retries(path, FIRST_RETRY_DELAY, |reader| {
+        let mut sequences = Vec::new();
+        let mut record_num = 0_u64;
+        while let Some(record) = reader.next() {
+            let record = record?;
+            let bases = record.seq();
+            let sequence_id = String::from_utf8_lossy(record.id());
+            if bases.is_empty() {
+                eprintln!(
+                    "ERROR: sequence of null length, file: {path:?}, record num: {record_num}, sequence id: {sequence_id}"
+                );
+                record_num += 1;
+                continue;
+            }
+            let sequence =
+                ascii_to_seq_aa(&bases).unwrap_or_else(|_| panic!("AA parse error in {path}"));
+            if sequence.is_empty() {
+                eprintln!(
+                    "ERROR: null encoded sequence, file: {path:?}, record num: {record_num}, sequence id: {sequence_id}"
+                );
+                record_num += 1;
+                continue;
+            }
+            sequences.push(sequence);
             record_num += 1;
-            continue;
         }
-        let sequence =
-            ascii_to_seq_aa(&bases).unwrap_or_else(|_| panic!("AA parse error in {path}"));
-        if sequence.is_empty() {
-            eprintln!(
-                "ERROR: null encoded sequence, file: {path:?}, record num: {record_num}, sequence id: {sequence_id}"
-            );
-            record_num += 1;
-            continue;
-        }
-        sequences.push(sequence);
-        record_num += 1;
-    }
-    sequences
+        Ok(sequences)
+    })
 }
 
 fn hash_dna_genome(sequences: &[SequenceStruct]) -> GenomeContentHash {
@@ -628,7 +663,54 @@ pub(crate) fn genome_content_hashes_from_params(
 
 #[cfg(test)]
 mod tests {
-    use super::{ascii_to_seq, ascii_to_seq_aa, hash_dna_genome};
+    use super::{ascii_to_seq, ascii_to_seq_aa, hash_dna_genome, read_with_retries};
+    use needletail::errors::{ParseError, ParseErrorKind};
+    use std::cell::Cell;
+    use std::time::Duration;
+    use std::{fs, io};
+
+    /// A one-record FASTA file in the temporary directory.
+    fn fasta_file(name: &str) -> String {
+        let path = std::env::temp_dir().join(format!("aeon-{}-{name}.fa", std::process::id()));
+        fs::write(&path, ">r1\nACGT\n").unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn reads_are_retried_after_io_errors() {
+        let path = fasta_file("retry");
+        let attempts = Cell::new(0);
+        let records = read_with_retries(&path, Duration::ZERO, |reader| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                return Err(ParseError::from(io::Error::other("transient")));
+            }
+            let mut ids = Vec::new();
+            while let Some(record) = reader.next() {
+                ids.push(record?.id().to_vec());
+            }
+            Ok(ids)
+        });
+        assert_eq!((records, attempts.get()), (vec![b"r1".to_vec()], 3));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn format_errors_are_not_retried() {
+        let path = fasta_file("format");
+        let attempts = Cell::new(0);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read_with_retries::<()>(&path, Duration::ZERO, |_| {
+                attempts.set(attempts.get() + 1);
+                let mut error = ParseError::from(io::Error::other("bad record"));
+                error.kind = ParseErrorKind::InvalidStart;
+                Err(error)
+            })
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(attempts.get(), 1);
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn aa_conversion_exposes_empty_and_fully_filtered_records() {
