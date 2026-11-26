@@ -466,7 +466,7 @@ fn build_cli() -> Command {
                     Arg::new("turboani")
                         .long("turboani")
                         .action(ArgAction::SetTrue)
-                        .help("Compute exact ANI and AF with TurboANI when the sketch alone cannot name one species, instead of deciding on the sketch estimates: checks AF, at more CPU time. Needs aeon built with --features turboani"),
+                        .help("Compute exact ANI and AF with TurboANI when the sketch alone cannot name one species, instead of deciding on the sketch estimates: checks AF (e.g. against chimeric MAGs), at more CPU time. Reads the reference genomes at the paths the db was built from. Needs aeon built with --features turboani"),
                 )
                 .arg(
                     Arg::new("min_sketch_ani")
