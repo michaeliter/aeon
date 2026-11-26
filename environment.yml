@@ -8,7 +8,8 @@ channels:
   - conda-forge
   - bioconda
 dependencies:
-  - diamond>=2.1
   - hmmer>=3.4
+  # Only needed with aeon classify --diamond-aai.
+  - diamond>=2.1
   # Only needed to compare aeon classify with GTDB-Tk.
   - gtdbtk=2.8.0

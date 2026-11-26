@@ -407,7 +407,7 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("classify")
                 .about("Classify genomes against an aeon classify-db reference database, with GTDB-Tk-compatible output")
-                .long_about("Classify genomes in a cascade over an aeon classify-db. (1) Genome sketch search proposes the closest reference genomes. When only one has a sketch ANI of at least --min-sketch-ani and that estimate reaches its species radius, the genome gets that species; when several do, or the estimate falls short, TurboANI computes their exact ANI and AF and GTDB-Tk's ANI screen rule decides (closest reference with AF >= --min_af, within its species radius, 95% by default). (2) Remaining genomes have genes called with FragGeneScanRs (complete-genome model); proteome sketch search finds the --aai-candidates closest reference proteomes and estimates AAI from the sketch (with --diamond-aai, DIAMOND reciprocal best hits against the --candidates closest give AAI instead). The closest reference's genus (>= --genus-aai) or else family (>= --family-aai) is assigned when its AAI beats every reference of another genus (family) by at least --aai-margin points; when the candidates all share its taxon, it must lead the last candidate by the margin. (3) Genomes still unresolved have their bac120/ar53 marker genes extracted with hmmsearch and hmmalign as in GTDB-Tk; the masked concatenated markers are compared with every reference of the same marker set, and the lineage shared by the references tied with the closest is assigned from the phylum down to the genus, while the identity to the closest reaches each taxon's sibling radius. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, identify/, align/, classify/, and {prefix}.log.")
+                .long_about("Classify genomes in a cascade over an aeon classify-db. (1) Genome sketch search proposes the --candidates closest reference genomes, and GTDB-Tk's ANI screen rule decides on their sketch-estimated ANI: the closest gives its species if it is within that species' radius (95% by default). With --turboani, when more than one candidate has a sketch ANI of at least --min-sketch-ani, or the only one does not clear its radius by a point, TurboANI computes their exact ANI and AF first, and the closest reference with AF >= --min_af must be within its radius. (2) Remaining genomes have genes called with FragGeneScanRs (complete-genome model); proteome sketch search finds the --aai-candidates closest reference proteomes and estimates AAI from the sketch (with --diamond-aai, DIAMOND reciprocal best hits against the --candidates closest give AAI instead). The closest reference's genus (>= --genus-aai) or else family (>= --family-aai) is assigned when its AAI beats every reference of another genus (family) by at least --aai-margin points; when the candidates all share its taxon, it must lead the last candidate by the margin. (3) Genomes still unresolved have their bac120/ar53 marker genes extracted with hmmsearch and hmmalign as in GTDB-Tk; the masked concatenated markers are compared with every reference of the same marker set, and the lineage shared by the references tied with the closest is assigned from the phylum down to the genus, while the identity to the closest reaches each taxon's sibling radius. Results are written in the GTDB-Tk classify_wf layout: {out_dir}/{prefix}.{bac120,ar53}.summary.tsv, identify/, align/, classify/, and {prefix}.log.")
                 .arg(
                     Arg::new("db")
                         .long("db")
@@ -460,7 +460,13 @@ fn build_cli() -> Command {
                         .default_value("0.5")
                         .value_name("FLOAT")
                         .value_parser(clap::value_parser!(f64))
-                        .help("Minimum alignment fraction for a species assignment"),
+                        .help("Minimum alignment fraction for a species assignment (checked with --turboani; sketch estimates carry no AF)"),
+                )
+                .arg(
+                    Arg::new("turboani")
+                        .long("turboani")
+                        .action(ArgAction::SetTrue)
+                        .help("Compute exact ANI and AF with TurboANI when the sketch alone cannot name one species, instead of deciding on the sketch estimates: checks AF, at more CPU time. Needs aeon built with --features turboani"),
                 )
                 .arg(
                     Arg::new("min_sketch_ani")
@@ -468,7 +474,7 @@ fn build_cli() -> Command {
                         .default_value("90")
                         .value_name("PERCENT")
                         .value_parser(clap::value_parser!(f64))
-                        .help("Sketch-estimated ANI a candidate needs to be considered for a species call; incomplete genomes lower the estimate"),
+                        .help("With --turboani, sketch-estimated ANI a candidate needs to be checked by TurboANI; incomplete genomes lower the estimate"),
                 )
                 .arg(
                     Arg::new("genus_aai")
@@ -643,6 +649,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             min_af: *args.get_one("min_af").unwrap(),
             candidates: *args.get_one("candidates").unwrap(),
             beam_width: *args.get_one("beam_width").unwrap(),
+            turboani: args.get_flag("turboani"),
             min_sketch_ani: *args.get_one("min_sketch_ani").unwrap(),
             genus_aai: *args.get_one("genus_aai").unwrap(),
             family_aai: *args.get_one("family_aai").unwrap(),

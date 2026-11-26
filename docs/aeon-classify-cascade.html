@@ -59,7 +59,7 @@
     <div class="diagram-container">
       <svg viewBox="0 0 1280 752" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="aeon-classify-cascade-title aeon-classify-cascade-desc">
         <title id="aeon-classify-cascade-title">How aeon classify assigns a taxonomy</title>
-        <desc id="aeon-classify-cascade-desc">Flowchart of the aeon classify cascade: a genome sketch search and TurboANI assign species, DIAMOND AAI against the ten closest proteomes assigns genus or family, and a marker gene search assigns order; each decision either makes the call or passes the genome to the next step.</desc>
+        <desc id="aeon-classify-cascade-desc">Flowchart of the aeon classify cascade: a genome sketch search assigns species by each species' ANI radius, AAI estimated from the proteome sketches of the 50 closest proteomes assigns genus or family by a 5-point margin, and identity over the masked bac120/ar53 marker alignment assigns phylum to genus by sibling radii; each decision either makes the call or passes the genome to the next step.</desc>
         <defs>
           <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4b5b6b"/></marker>
         </defs>
@@ -72,18 +72,15 @@
         <rect x="32" y="224" width="1216" height="204" rx="8" fill="#f2f8f7" stroke="#d3e8e3" stroke-width="1"/>
         <text x="48" y="244" fill="#2f7a70" font-size="11" font-weight="700" font-family="'Archivo', sans-serif" >Step 2<tspan fill="#4b5b6b" font-weight="500" dx="8">aa index</tspan></text>
         <rect x="32" y="452" width="1216" height="224" rx="8" fill="#f2f8f7" stroke="#d3e8e3" stroke-width="1"/>
-        <text x="48" y="472" fill="#2f7a70" font-size="11" font-weight="700" font-family="'Archivo', sans-serif" >Step 3<tspan fill="#4b5b6b" font-weight="500" dx="8">markers index</tspan></text>
+        <text x="48" y="472" fill="#2f7a70" font-size="11" font-weight="700" font-family="'Archivo', sans-serif" >Step 3<tspan fill="#4b5b6b" font-weight="500" dx="8">marker alignment</tspan></text>
 
         <!-- Arrows (drawn first, behind nodes) -->
         <!-- Step 1 -->
         <line x1="172" y1="128" x2="216" y2="128" stroke="#4b5b6b" stroke-width="1.2" marker-end="url(#arrow)"/>
         <line x1="356" y1="128" x2="400" y2="128" stroke="#4b5b6b" stroke-width="1.2" marker-end="url(#arrow)"/>
-        <line x1="608" y1="128" x2="652" y2="128" stroke="#4b5b6b" stroke-width="1.2" marker-end="url(#arrow)"/>
-        <line x1="792" y1="128" x2="836" y2="128" stroke="#4b5b6b" stroke-width="1.2" marker-end="url(#arrow)"/>
-        <line x1="1044" y1="128" x2="1096" y2="128" stroke="#4b5b6b" stroke-width="1.2" marker-end="url(#arrow)"/>
-        <path d="M 504 76 L 504 64 Q 504 56 512 56 L 1152 56 Q 1160 56 1160 64 L 1160 104" fill="none" stroke="#4b5b6b" stroke-width="1.2" marker-end="url(#arrow)"/>
+        <line x1="608" y1="128" x2="1096" y2="128" stroke="#4b5b6b" stroke-width="1.2" marker-end="url(#arrow)"/>
         <!-- Step 1 → Step 2 -->
-        <path d="M 940 180 L 940 204 Q 940 212 932 212 L 188 212 Q 180 212 180 220 L 180 330" fill="none" stroke="#4b5b6b" stroke-width="1.2" marker-end="url(#arrow)"/>
+        <path d="M 504 180 L 504 204 Q 504 212 496 212 L 188 212 Q 180 212 180 220 L 180 330" fill="none" stroke="#4b5b6b" stroke-width="1.2" marker-end="url(#arrow)"/>
         <!-- Step 2 -->
         <line x1="192" y1="356" x2="232" y2="356" stroke="#4b5b6b" stroke-width="1.2" marker-end="url(#arrow)"/>
         <line x1="372" y1="356" x2="412" y2="356" stroke="#4b5b6b" stroke-width="1.2" marker-end="url(#arrow)"/>
@@ -103,14 +100,10 @@
         <line x1="792" y1="632" x2="1096" y2="632" stroke="#4b5b6b" stroke-width="1.2" marker-end="url(#arrow)"/>
 
         <!-- Arrow labels -->
-        <rect x="816" y="38" width="28" height="12" rx="2" fill="#f2f8f7"/>
-        <text x="830" y="47" fill="#4b5b6b" font-size="8.5" font-weight="500" font-family="'IBM Plex Mono', monospace" text-anchor="middle">YES</text>
-        <rect x="618" y="110" width="24" height="12" rx="2" fill="#f2f8f7"/>
-        <text x="630" y="119" fill="#4b5b6b" font-size="8.5" font-weight="500" font-family="'IBM Plex Mono', monospace" text-anchor="middle">NO</text>
         <rect x="1056" y="110" width="28" height="12" rx="2" fill="#f2f8f7"/>
         <text x="1070" y="119" fill="#4b5b6b" font-size="8.5" font-weight="500" font-family="'IBM Plex Mono', monospace" text-anchor="middle">YES</text>
-        <rect x="948" y="186" width="24" height="12" rx="2" fill="#f2f8f7"/>
-        <text x="960" y="195" fill="#4b5b6b" font-size="8.5" font-weight="500" font-family="'IBM Plex Mono', monospace" text-anchor="middle">NO</text>
+        <rect x="512" y="186" width="24" height="12" rx="2" fill="#f2f8f7"/>
+        <text x="524" y="195" fill="#4b5b6b" font-size="8.5" font-weight="500" font-family="'IBM Plex Mono', monospace" text-anchor="middle">NO</text>
 
         <rect x="986" y="262" width="28" height="12" rx="2" fill="#f2f8f7"/>
         <text x="1000" y="271" fill="#4b5b6b" font-size="8.5" font-weight="500" font-family="'IBM Plex Mono', monospace" text-anchor="middle">YES</text>
@@ -138,18 +131,11 @@
         <rect x="216" y="102" width="140" height="52" rx="6" fill="#dcefeb" stroke="#5ea69c" stroke-width="1.4"/>
         <text x="286" y="126" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">nt sketch search</text>
         <text x="286" y="140" fill="#4b5b6b" font-size="9" font-family="'IBM Plex Mono', monospace" text-anchor="middle">k=16, s=15k, top 10</text>
+        <text x="286" y="174" fill="#4b5b6b" font-size="9" font-style="italic" font-family="'IBM Plex Mono', monospace" text-anchor="middle">--turboani: exact ANI + AF</text>
 
         <polygon points="504,76 608,128 504,180 400,128" fill="#e3eef8" stroke="#6b97c6" stroke-width="1.4"/>
-        <text x="504" y="126" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">Only one hit ≥ 90%</text>
-        <text x="504" y="140" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">and ≥ radius + 1?</text>
-
-        <rect x="652" y="102" width="140" height="52" rx="6" fill="#dcefeb" stroke="#5ea69c" stroke-width="1.4"/>
-        <text x="722" y="126" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">TurboANI</text>
-        <text x="722" y="140" fill="#4b5b6b" font-size="9" font-family="'IBM Plex Mono', monospace" text-anchor="middle">ANI + AF, hits ≥ 90%</text>
-
-        <polygon points="940,76 1044,128 940,180 836,128" fill="#e3eef8" stroke="#6b97c6" stroke-width="1.4"/>
-        <text x="940" y="126" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">Best AF ≥ 0.5 hit</text>
-        <text x="940" y="140" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">within its radius?</text>
+        <text x="504" y="126" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">Closest hit within</text>
+        <text x="504" y="140" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">its species radius?</text>
 
         <rect x="1096" y="104" width="128" height="48" rx="24" fill="#283a4c" stroke="none"/>
         <text x="1160" y="126" fill="#ffffff" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">Species</text>
@@ -162,11 +148,11 @@
 
         <rect x="232" y="330" width="140" height="52" rx="6" fill="#dcefeb" stroke="#5ea69c" stroke-width="1.4"/>
         <text x="302" y="354" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">aa sketch search</text>
-        <text x="302" y="368" fill="#4b5b6b" font-size="9" font-family="'IBM Plex Mono', monospace" text-anchor="middle">k=7, s=10k, top 10</text>
+        <text x="302" y="368" fill="#4b5b6b" font-size="9" font-family="'IBM Plex Mono', monospace" text-anchor="middle">k=7, s=10k, top 50</text>
 
         <rect x="412" y="330" width="140" height="52" rx="6" fill="#dcefeb" stroke="#5ea69c" stroke-width="1.4"/>
-        <text x="482" y="354" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">DIAMOND AAI</text>
-        <text x="482" y="368" fill="#4b5b6b" font-size="9" font-family="'IBM Plex Mono', monospace" text-anchor="middle">10 refs, ≥ 50 RBH</text>
+        <text x="482" y="354" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">AAI estimate</text>
+        <text x="482" y="368" fill="#4b5b6b" font-size="9" font-family="'IBM Plex Mono', monospace" text-anchor="middle">from sketch Jaccard</text>
 
         <polygon points="696,304 800,356 696,408 592,356" fill="#e3eef8" stroke="#6b97c6" stroke-width="1.4"/>
         <text x="696" y="354" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">≥ 65% AAI and 5 pts</text>
@@ -194,18 +180,18 @@
         <text x="344" y="552" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">of MSA columns?</text>
 
         <rect x="496" y="514" width="140" height="52" rx="6" fill="#dcefeb" stroke="#5ea69c" stroke-width="1.4"/>
-        <text x="566" y="538" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">Marker search</text>
-        <text x="566" y="552" fill="#4b5b6b" font-size="9" font-family="'IBM Plex Mono', monospace" text-anchor="middle">k=5, s=3k, top 10</text>
+        <text x="566" y="538" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">Marker identity</text>
+        <text x="566" y="552" fill="#4b5b6b" font-size="9" font-family="'IBM Plex Mono', monospace" text-anchor="middle">vs every reference</text>
 
         <polygon points="788,488 892,540 788,592 684,540" fill="#e3eef8" stroke="#6b97c6" stroke-width="1.4"/>
-        <text x="788" y="538" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">Same-domain hit</text>
-        <text x="788" y="552" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">≥ 25% identity?</text>
+        <text x="788" y="538" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">Reference with ≥ 500</text>
+        <text x="788" y="552" fill="#283a4c" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">shared columns?</text>
 
         <circle cx="788" cy="632" r="4" fill="#283a4c"/>
 
         <rect x="1096" y="516" width="128" height="48" rx="24" fill="#283a4c" stroke="none"/>
-        <text x="1160" y="538" fill="#ffffff" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">Order</text>
-        <text x="1160" y="552" fill="#93d5c0" font-size="9" font-family="'IBM Plex Mono', monospace" text-anchor="middle">marker search</text>
+        <text x="1160" y="538" fill="#ffffff" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">Phylum to genus</text>
+        <text x="1160" y="552" fill="#93d5c0" font-size="9" font-family="'IBM Plex Mono', monospace" text-anchor="middle">by sibling radii</text>
 
         <rect x="1096" y="608" width="128" height="48" rx="24" fill="#283a4c" stroke="none"/>
         <text x="1160" y="630" fill="#ffffff" font-size="12" font-weight="600" font-family="'Archivo', sans-serif" text-anchor="middle">Unclassified</text>

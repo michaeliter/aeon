@@ -21,6 +21,8 @@ cargo build --release
 ./target/release/aeon --help
 ```
 
+`aeon classify --turboani` needs TurboANI, which the default build leaves out. Build with `cargo build --release --features turboani` to include it.
+
 Input lists contain one genome path or stored genome name per line. FASTA/FASTQ and compressed inputs supported by Needletail are accepted. DNA and amino-acid databases are supported.
 
 Run `aeon COMMAND --help` for the full description of any command and its options. `--threads` defaults to all logical CPUs for every command.
@@ -184,10 +186,11 @@ Both graphs are built with max degree 128 (`--max-degree`), construction beam 51
 
 **Cascade.** Each genome stops at the first step that resolves it:
 
-1. **nt search, then TurboANI when candidates span species.** The genome sketch search proposes the `--candidates` (10) closest reference genomes, each with a sketch-estimated ANI.
-   - **One candidate at or above `--min-sketch-ani` (90%):** if its estimate clears that species' radius by at least 1 point, the genome gets the species without TurboANI.
-   - **Several candidates at or above 90%, or one without that margin:** TurboANI computes their exact ANI and AF, and GTDB-Tk's ANI screen rule decides. The closest reference with AF ≥ `--min_af` (0.5) gives its species if the ANI is within that species' radius (95% unless `--radii` gives another).
-   - **No candidate at or above 90%:** the genome goes to step 2.
+1. **nt search.** The genome sketch search proposes the `--candidates` (10) closest reference genomes, each with a sketch-estimated ANI. GTDB-Tk's ANI screen rule decides: the closest reference gives its species if its ANI is within that species' radius (95% unless `--radii` gives another). Otherwise the genome goes to step 2.
+   - **With `--turboani`** (off by default; needs a build with `--features turboani`), TurboANI checks the species call when the sketch alone cannot settle it:
+     - **One candidate at or above `--min-sketch-ani` (90%):** if its estimate clears that species' radius by at least 1 point, the genome gets the species without TurboANI.
+     - **Several candidates at or above 90%, or one without that margin:** TurboANI computes their exact ANI and AF. The closest reference with AF ≥ `--min_af` (0.5) gives its species if its ANI is within that species' radius.
+     - **No candidate at or above 90%:** the genome goes to step 2.
 2. **FragGeneScanRs, aa search, AAI.**
    - Genes are called with FragGeneScanRs's complete-genome model (`-t complete -w 1`).
    - The proteome sketch search finds the `--aai-candidates` (50) closest reference proteomes. Each sketch Jaccard is converted to an AAI estimate with Mash's formula at k = 7.
@@ -215,8 +218,8 @@ Both graphs are built with max degree 128 (`--max-degree`), construction beam 51
 - **FragGeneScanRs calls query genes in place of Prodigal/pyrodigal.** It is faster, and accurate enough for AAI and marker extraction. It runs as a separate program because it is GPL-3.0 and aeon is MIT. It translates with table 11 only, so `translation_table` is always 11. References use GTDB's precomputed Prodigal proteomes (`--protein-list`) when available; FragGeneScanRs calls their genes only when no proteomes are given.
   - FragGeneScanRs stops calling genes on a contig at its first ambiguous base (N or any other non-ACGT base). aeon therefore gives it each stretch of at least 120 unambiguous bases as a separate sequence, then maps gene IDs and GFF coordinates back to the contigs. Before this, a quarter of the holdout references lost genes this way, and a 4.5 Mb *Arthrobacter* genome with an N run 20 kb into its main contig gave 268 proteins instead of 4,145. Gene calling takes the same time either way.
 - **Species calls use each species' ANI radius**, by default 95%. With GTDB's radii (`--radii sp_clusters_r232.tsv`, or `--gtdbtk-data`) they match GTDB-Tk's ANI screen.
-- **TurboANI runs only when the sketch search cannot settle the species on its own.**
-  - A species call made from the sketch estimate alone reports `closest_genome_af` as `N/A`. Its Jaccard-based estimate already drops with the shared fraction.
+- **Species calls come from the sketch estimate by default.** Its Jaccard-based estimate already drops with the shared fraction, so there is no separate AF check, and `closest_genome_af` is `N/A`. On the holdouts below, the sketch made the same species calls as TurboANI on the training and validation sets. On the independent set it made one more wrong call: a sister species at 94.66% ANI by TurboANI and 95.44% by the sketch. Near the 95% radius the sketch estimate ran 0.4–0.9 points above TurboANI.
+- **`--turboani` runs TurboANI only when the sketch search cannot settle the species on its own.**
   - The 1-point margin sends borderline genomes to TurboANI. These include chimeras whose AF would fail, because the sketch cannot check AF.
 - **AAI comes from the proteome sketch by default.** DIAMOND measures AAI more precisely, but that does not make the calls better, because GTDB does not draw genus and family boundaries by AAI. On the holdouts below, the sketch estimate made as few or fewer wrong calls than DIAMOND, in about a sixth of the time. Sketch estimates run about 2 points above DIAMOND AAI, and fall by about 5 points at 50% completeness, against under 1 for DIAMOND. The margin compares references with each other, so a shift that affects them all alike barely changes the calls. `--diamond-aai` remains for when the AAI values themselves matter.
 - **Genus 65% AAI and family 45% AAI** are the defaults, the genus and family boundaries proposed by Konstantinidis, Rosselló-Móra & Amann ([ISME J 2017](https://doi.org/10.1038/ismej.2017.113)). With the AAI margin below, they made 4 wrong calls in the 104 training and validation queries, and 5 in the 103 independent ones.
@@ -235,7 +238,7 @@ Both graphs are built with max degree 128 (`--max-degree`), construction beam 51
   - `classify/aai/{prefix}.aai_summary.tsv`: every AAI hit. By default these are the sketch candidates' estimates, with `N/A` in the DIAMOND columns. With `--diamond-aai` they carry the SD of the reciprocal-best-hit identities, their count, and the smaller proteome's protein count;
   - `classify/markers/{prefix}.marker_summary.tsv`: each genome's ten best marker matches and every reference tied with the best, with identity, column overlap and whether it is tied.
 - `align/` holds the user MSA only, not the full reference MSA.
-- `classify/ani_screen/{prefix}.ani_screen_unassigned_hits.tsv.gz` lists the TurboANI hits of genomes the ANI screen did not assign, so it covers only genomes whose sketch search found candidates.
+- `classify/ani_screen/{prefix}.ani_screen_unassigned_hits.tsv.gz` lists the ANI hits of genomes the ANI screen did not assign: the candidates' sketch estimates at or above 80%, with AF `N/A`, or with `--turboani` the TurboANI hits.
 - `{prefix}.json` records aeon's steps under GTDB-Tk's four step names, so GTDB-Tk can read it. Gene calling and the marker HMM search count as `identify`; AAI and the marker comparison count as `classify`. Each step's duration is the time spent in it, and its `starts_at` and `ends_at` are its first start and last end.
 
 ```bash
@@ -280,7 +283,7 @@ A genus or family holdout has no reference of its true taxon, so the right answe
 | Proteome sketch (default) | Independent (103) | 50% | 4 | 88 | 11 |
 | `--diamond-aai` | Independent (103) | 50% | 9 | 84 | 10 |
 
-All rows come from full classify runs with the earlier marker step, which gave every marker-tier genome its closest reference's order; the marker results below cover the current step. The partial-genome rows keep a random 70% or 50% of each query in contig-sized pieces (median 15 kb). On the complete independent set, applying the margin over the sketch estimates of every reference, instead of the 50 candidates with the bound on the last one, gave the same counts. Two of the independent set's wrong calls are species calls that GTDB-Tk's ANI screen would make too: the withheld species sits 95.47% and 95.00% ANI from a sister species whose radius is 95%.
+All rows come from full classify runs with the earlier marker step, which gave every marker-tier genome its closest reference's order; the marker results below cover the current step. The partial-genome rows keep a random 70% or 50% of each query in contig-sized pieces (median 15 kb). On the complete independent set, applying the margin over the sketch estimates of every reference, instead of the 50 candidates with the bound on the last one, gave the same counts. Two of the independent set's wrong calls are species calls that GTDB-Tk's ANI screen would make too: the withheld species sits 95.47% and 95.00% ANI from a sister species whose radius is 95%. These runs checked ambiguous species calls with TurboANI, now `--turboani`. With the default sketch-only species calls, the independent set has one more wrong call (6 instead of 5 on complete genomes), and the other sets are unchanged.
 
 The margin table below uses DIAMOND AAI (`--diamond-aai`) over the training and validation sets (104 queries):
 
@@ -321,7 +324,7 @@ The 5-point row comes from full classify runs. The other rows replay the rule ov
   - Voting over every reference above the cutoff was worse still. For species holdouts a median of 12.5 references cleared 65%, only 40% of them from the query's own genus. For genus holdouts a median of 184 references, nearly the whole order, cleared 45%. A strict majority then made 15 wrong calls and left 45 too shallow, and a plurality made 73 wrong calls.
 - **DIAMOND mode:** the default mode gives AAI about 2 points higher than `--sensitive` on the same pairs (median +2.2 and +2.3 on the two sets). It made about the same number of wrong calls under the majority vote (19 against 21) in about a third of the time. This was measured before the gene-calling fix.
 - **Sketch estimates against DIAMOND AAI:** across 1,040 query–reference pairs of the training and validation sets, the sketch estimate ran a median 2.1 points above DIAMOND AAI, and pairs at ≥80% on the sketch were ≥75.2% by DIAMOND. On partial genomes the closest reference's sketch estimate fell by a median 0.7, 2.6 and 5.4 points at 90%, 70% and 50% completeness, and its DIAMOND AAI by 0.04, 0.4 and 0.7. The margin still matters at high AAI: a *Haemophilus* query had references of *Haemophilus_D* and *Rodentibacter* at 83–86% on the sketch (about 83% by DIAMOND), so with its own genus removed, the closest reference alone would give a wrong genus.
-- **Species calls from the sketch alone:** reference genomes cut into 10 kb pieces, keeping 50–90% of them, were all assigned their own species, 24 of 24, with no TurboANI call.
+- **Species calls from the sketch alone:** reference genomes cut into 10 kb pieces, keeping 50–90% of them, were all assigned their own species, 24 of 24, with no TurboANI call (measured with `--turboani`'s 1-point margin).
 
 **Runtime** with 8 threads:
 

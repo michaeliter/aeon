@@ -12,6 +12,8 @@ pub(crate) mod refdata;
 pub(crate) mod refdb;
 pub(crate) mod run_record;
 pub(crate) mod summary;
+#[cfg(feature = "turboani")]
+pub(crate) mod turboani;
 
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet};
@@ -23,8 +25,7 @@ use std::time::Instant;
 
 use crate::classify::aai::{AaiDecision, AaiHit, Lead, compute_aai};
 use crate::classify::ani::{
-    AniDecision, AniHit, Candidate, MIN_SPECIES_RADIUS, Screen, decide, refine_candidates, screen,
-    sketch_ani,
+    AniDecision, AniHit, Candidate, MIN_SPECIES_RADIUS, decide, estimated_hits, sketch_ani,
 };
 use crate::classify::external::{find_program, find_tool};
 use crate::classify::genes::{GeneCaller, TRANSLATION_TABLE};
@@ -64,6 +65,10 @@ pub(crate) struct ClassifyOptions {
     pub(crate) min_af: f64,
     pub(crate) candidates: usize,
     pub(crate) beam_width: usize,
+    /// Re-score ambiguous species candidates with TurboANI instead of
+    /// deciding on their sketch estimates.
+    pub(crate) turboani: bool,
+    #[cfg_attr(not(feature = "turboani"), allow(dead_code))]
     pub(crate) min_sketch_ani: f64,
     pub(crate) genus_aai: f64,
     pub(crate) family_aai: f64,
@@ -223,6 +228,9 @@ impl Stage {
 }
 
 pub(crate) fn classify_genomes(options: &ClassifyOptions) -> Result<(), Box<dyn Error>> {
+    if options.turboani && !cfg!(feature = "turboani") {
+        return Err("--turboani needs aeon built with TurboANI: cargo build --release --features turboani".into());
+    }
     let started = Instant::now();
     let out_dir = PathBuf::from(&options.out_dir);
     fs::create_dir_all(&out_dir)?;
@@ -318,9 +326,9 @@ fn marker_genes_dir(out_dir: &Path) -> PathBuf {
         .join("marker_genes")
 }
 
-/// Screen every query against the nucleotide index: a species from the
-/// sketch alone when the candidates name one species, else TurboANI against
-/// the candidates and GTDB-Tk's radius rule.
+/// Screen every query against the nucleotide index with GTDB-Tk's radius
+/// rule, over the sketch estimates of its candidates or, with `--turboani`,
+/// over TurboANI's ANI and AF when the sketch alone cannot name one species.
 fn run_ani_tier<'a>(
     queries: &'a [QueryGenome],
     db: &ClassifyDb,
@@ -330,50 +338,42 @@ fn run_ani_tier<'a>(
     log: &ClassifyLog,
     record: &mut RunRecord,
 ) -> Result<Vec<QueryResult<'a>>, Box<dyn Error>> {
-    log.info("Running ANI screen with DiskANN candidate search and TurboANI");
+    log.info(if options.turboani {
+        "Running ANI screen with DiskANN candidate search and TurboANI"
+    } else {
+        "Running ANI screen with DiskANN candidate search"
+    });
     let query_paths = queries
         .iter()
         .map(|genome| genome.path.clone())
         .collect::<Vec<_>>();
     let vectors = sketch_from_params(&query_paths, &db.nt.params);
-    // Per query, the sketch-only species hit or the candidates for TurboANI.
-    let (estimated, exact): (Vec<_>, Vec<_>) =
-        search_index(&db.nt, warmup, &vectors, options.candidates, options, log)?
-            .into_iter()
-            .map(|neighbors| {
-                let candidates = neighbors
-                    .into_iter()
-                    .map(|(reference, distance)| Candidate {
-                        reference,
-                        sketch_ani: sketch_ani(distance, db.nt.params.kmer_size),
-                    })
-                    .collect::<Vec<_>>();
-                match screen(
-                    &candidates,
-                    &db.nt.accessions,
-                    &db.data,
-                    options.min_sketch_ani,
-                ) {
-                    Screen::Estimated(hit) => (Some(hit), Vec::new()),
-                    Screen::Exact(references) => (None, references),
-                }
-            })
-            .unzip();
-    let turboani = exact
-        .iter()
-        .filter(|references| !references.is_empty())
-        .count();
-    log.info(format!(
-        "TurboANI checks candidates for {turboani} genome(s); {} matched one species by sketch alone.",
-        estimated.iter().flatten().count()
-    ));
-    let exact_hits = refine_candidates(&query_paths, &exact, &db.nt.paths)?;
+    let candidates = search_index(&db.nt, warmup, &vectors, options.candidates, options, log)?
+        .into_iter()
+        .map(|neighbors| {
+            neighbors
+                .into_iter()
+                .map(|(reference, distance)| Candidate {
+                    reference,
+                    sketch_ani: sketch_ani(distance, db.nt.params.kmer_size),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let all_hits: Vec<Vec<AniHit>> = if options.turboani {
+        #[cfg(feature = "turboani")]
+        {
+            turboani::hits(&query_paths, &candidates, db, options, log)?
+        }
+        #[cfg(not(feature = "turboani"))]
+        unreachable!("--turboani is rejected without the turboani feature")
+    } else {
+        candidates.iter().map(|candidates| estimated_hits(candidates)).collect()
+    };
     let results = queries
         .iter()
-        .zip(estimated)
-        .zip(exact_hits)
-        .map(|((genome, estimated), exact_hits)| {
-            let hits = estimated.map_or(exact_hits, |hit| vec![hit]);
+        .zip(all_hits)
+        .map(|(genome, hits)| {
             let decision = decide(&hits, &db.nt.accessions, &db.data, options.min_af);
             ::log::debug!(
                 "ani genome={} decision={decision:?} hits={}",
@@ -406,7 +406,7 @@ fn run_ani_tier<'a>(
     ));
 
     // The hits of unassigned genomes, kept by GTDB-Tk for its near-miss
-    // warnings; sketch estimates carry no AF and only ever assign species.
+    // warnings; sketch estimates carry no AF.
     let mut unassigned = results
         .iter()
         .filter(|result| !matches!(result.stage, Stage::Species(_)))
@@ -419,13 +419,13 @@ fn run_ani_tier<'a>(
     write_unassigned_hits(
         &path,
         unassigned.iter().flat_map(|result| {
-            result.hits.iter().filter_map(|hit| {
-                Some((
+            result.hits.iter().map(|hit| {
+                (
                     result.genome.id.as_str(),
                     db.nt.accessions[hit.reference as usize].as_str(),
                     hit.ani,
-                    hit.af?,
-                ))
+                    hit.af,
+                )
             })
         }),
     )?;

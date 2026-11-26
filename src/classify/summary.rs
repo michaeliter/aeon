@@ -247,7 +247,7 @@ pub(crate) fn write_ani_summary(path: &Path, rows: &[AniScreenRow]) -> io::Resul
 /// Python's `repr` so they round-trip. GTDB-Tk writes it even when empty.
 pub(crate) fn write_unassigned_hits<'a>(
     path: &Path,
-    hits: impl IntoIterator<Item = (&'a str, &'a str, f64, f64)>,
+    hits: impl IntoIterator<Item = (&'a str, &'a str, f64, Option<f64>)>,
 ) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -259,7 +259,7 @@ pub(crate) fn write_unassigned_hits<'a>(
             output,
             "{user_genome}\t{reference_genome}\t{}\t{}",
             py_float(ani),
-            py_float(af)
+            af.map_or_else(|| NONE_VALUE.to_owned(), py_float)
         )?;
     }
     output.finish()?.flush()
